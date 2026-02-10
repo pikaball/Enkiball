@@ -1,0 +1,2 @@
+[console_scripts]
+enkiball = enkiball.cli:main

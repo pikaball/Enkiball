@@ -1,0 +1,25 @@
+[project]
+name = "enkiball"
+version = "0.1.0"
+description = "A CLI foundation for Enkiball security research agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openai>=1.40.0",
+  "prompt_toolkit>=3.0.47",
+  "rich>=13.7.1",
+  "httpx>=0.27.0",
+]
+
+[project.scripts]
+enkiball = "enkiball.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
