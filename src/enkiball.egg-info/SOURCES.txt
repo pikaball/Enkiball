@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 src/enkiball/__init__.py
+src/enkiball/agent.py
 src/enkiball/cli.py
 src/enkiball/commands.py
 src/enkiball/config.py

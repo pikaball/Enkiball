@@ -5,6 +5,7 @@ import select
 import sys
 import termios
 import threading
+import time
 import tty
 from pathlib import Path
 from typing import Callable
@@ -16,10 +17,9 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 
+from .agent import Enkiball
 from .commands import CommandHandler, SLASH_COMPLETIONS
-from .config import DEFAULT_CONFIG_PATH, ensure_config, load_config
-from .llm import ChatEngine
-from .mcp import MCPManager
+from .config import DEFAULT_CONFIG_PATH
 from .session_store import SessionStore
 
 
@@ -44,9 +44,7 @@ def _build_key_bindings() -> KeyBindings:
 def _derive_session_title(text: str, image_paths: list[str]) -> str:
     compact = " ".join(text.split())
     if compact:
-        if len(compact) <= 48:
-            return compact
-        return f"{compact[:45]}..."
+        return compact[:48] if len(compact) <= 48 else f"{compact[:45]}..."
     if image_paths:
         return f"images-{len(image_paths)}"
     return "untitled"
@@ -94,8 +92,7 @@ class _StreamInputMonitor:
                 return
             if ch == b"\x1b":
                 self._stop_event.set()
-                continue
-            if ch == b"\x03":
+            elif ch == b"\x03":
                 self._stop_event.set()
                 self._exit_event.set()
 
@@ -111,101 +108,247 @@ class _StreamInputMonitor:
         return self._exit_event.is_set()
 
 
-def main() -> None:
-    console = Console()
-    config_path = ensure_config(DEFAULT_CONFIG_PATH)
-    config = load_config(config_path)
-    mcp_manager = MCPManager(config)
-    engine = ChatEngine(config, mcp_manager)
-    session_store = SessionStore()
-    handler = CommandHandler(console, config, mcp_manager, session_store, config_path=config_path)
+class EnkiballCLI:
+    """Reusable CLI runner.
 
-    history_path = Path(".enkiball_history")
-    session = PromptSession(
-        history=FileHistory(str(history_path)),
-        auto_suggest=AutoSuggestFromHistory(),
-        completer=_build_completer(),
-        complete_while_typing=True,
-        multiline=True,
-        key_bindings=_build_key_bindings(),
-    )
+    Lets external code pre-configure an :class:`Enkiball` agent (tools,
+    system prompt, etc.), register custom slash commands, then drop into
+    the interactive REPL.
 
-    console.print("Enkiball CLI ready. Use /help for commands.", style="green")
-    console.print(f"Config: {config_path}", style="cyan")
-    current = session_store.begin_new(initial_messages=engine.export_messages(), persisted=False)
-    console.print(f"Session: {current.session_id} (unsaved)", style="cyan")
-    for msg in mcp_manager.start_enabled():
-        console.print(f"[mcp] {msg}", style="cyan")
+    Example::
 
-    prefill_text: str | None = None
-    while True:
-        prompt_kwargs: dict[str, str] = {}
-        if prefill_text is not None:
-            prompt_kwargs["default"] = prefill_text
-        try:
-            line = session.prompt("you> ", **prompt_kwargs)
-        except KeyboardInterrupt:
-            break
-        except EOFError:
-            break
-        prefill_text = None
+        from enkiball import Enkiball, EnkiballCLI
 
-        text = line.strip()
+        agent = Enkiball()
+        agent.register_tool(my_func, name="scan", description="Scan host",
+                            parameters={...})
 
-        if text.startswith("/"):
-            keep_running = handler.handle(text, engine, session)
-            if handler.pending_input is not None:
-                prefill_text = handler.pending_input
-            if not keep_running:
+        cli = EnkiballCLI(agent)
+
+        def _cmd_status(argv, handler, engine, session):
+            handler.console.print(f"tokens: {engine.token_usage}")
+            return True
+
+        cli.register_command("status", _cmd_status, "Show token usage")
+        cli.run()
+    """
+
+    def __init__(
+        self,
+        agent: Enkiball | None = None,
+        *,
+        console: Console | None = None,
+        session_store: SessionStore | None = None,
+        history_path: Path | None = None,
+        banner: str | None = None,
+        input_transform: Callable[[str, list[str]], str | tuple[str, str | None]] | None = None,
+        turn_lock: object | None = None,
+        on_session_change: Callable[[str], None] | None = None,
+    ) -> None:
+        self.console = console or Console()
+        if agent is None:
+            try:
+                agent = Enkiball(config_path=DEFAULT_CONFIG_PATH)
+            except FileNotFoundError as e:
+                self.console.print(str(e), style="bold red")
+                raise
+        self.agent = agent
+        self.session_store = session_store or SessionStore()
+        self.handler = CommandHandler(
+            self.console,
+            agent._config,
+            agent._mcp,
+            self.session_store,
+            config_path=agent._config_path,
+        )
+        self.history_path = history_path or (
+            Path.home() / ".config" / "enkiball" / "history"
+        )
+        self.banner = banner
+        self.input_transform = input_transform
+        self.turn_lock = turn_lock
+        self.on_session_change = on_session_change
+
+    # -- Extensibility shortcuts --------------------------------------------
+
+    def register_command(
+        self,
+        name: str,
+        handler: Callable[..., bool],
+        help_text: str = "",
+        completions: list[str] | None = None,
+    ) -> None:
+        """Register a custom slash command (delegates to ``CommandHandler``)."""
+        self.handler.register_command(name, handler, help_text, completions)
+
+    def register_tool(self, *args, **kwargs) -> Callable[..., object]:
+        """Register a custom tool on the underlying agent."""
+        return self.agent.register_tool(*args, **kwargs)
+
+    # -- Main loop ----------------------------------------------------------
+
+    def run(self) -> None:
+        agent = self.agent
+        console = self.console
+        handler = self.handler
+        session_store = self.session_store
+
+        session: PromptSession[str] = PromptSession(
+            history=FileHistory(str(self.history_path)),
+            auto_suggest=AutoSuggestFromHistory(),
+            completer=_build_completer(),
+            complete_while_typing=True,
+            multiline=True,
+            key_bindings=_build_key_bindings(),
+        )
+
+        console.print(
+            self.banner or "Enkiball CLI ready. Use /help for commands.",
+            style="green",
+        )
+        console.print(
+            f"Config: {agent._config_path}  Provider: {agent.provider}  Model: {agent.model}",
+            style="cyan",
+        )
+        current = session_store.begin_new(
+            initial_messages=agent.messages, persisted=False
+        )
+        if self.on_session_change:
+            self.on_session_change(current.session_id)
+        console.print(f"Session: {current.session_id} (unsaved)", style="cyan")
+
+        prefill_text: str | None = None
+        while True:
+            prompt_kwargs: dict[str, str] = {}
+            if prefill_text is not None:
+                prompt_kwargs["default"] = prefill_text
+            try:
+                line = session.prompt("you> ", **prompt_kwargs)
+            except KeyboardInterrupt:
                 break
-            continue
+            except EOFError:
+                break
+            prefill_text = None
 
-        if not text and not handler.staged_images:
-            continue
+            text = line.strip()
 
-        images_for_turn = list(handler.staged_images)
+            if text.startswith("/"):
+                before_session_id = session_store.current_session_id
+                keep_running = handler.handle(text, agent._engine, session)
+                after_session_id = session_store.current_session_id
+                if (
+                    self.on_session_change
+                    and after_session_id
+                    and after_session_id != before_session_id
+                ):
+                    self.on_session_change(after_session_id)
+                if handler.pending_input is not None:
+                    prefill_text = handler.pending_input
+                if not keep_running:
+                    break
+                continue
 
-        console.print("assistant> ", style="bold green", end="")
-        def _on_token(token: str) -> None:
-            console.print(token, end="")
-            console.file.flush()
+            if not text and not handler.staged_images:
+                continue
 
-        interrupted = False
-        exit_requested = False
-        try:
-            with _StreamInputMonitor() as monitor:
-                if not session_store.current_session_persisted:
-                    session_store.rename_current(_derive_session_title(text, images_for_turn))
-                engine.stream_reply(
-                    text,
-                    images_for_turn,
-                    _on_token,
-                    lambda event: console.print(f"\n[tool] {event}", style="cyan"),
-                    should_stop=monitor.should_stop,
+            images_for_turn = list(handler.staged_images)
+            llm_text = text
+            system_context: str | None = None
+            if self.input_transform:
+                transformed = self.input_transform(text, images_for_turn)
+                if isinstance(transformed, tuple):
+                    llm_text, system_context = transformed
+                else:
+                    llm_text = transformed
+
+            thinking_active = agent._engine.show_thinking
+            if thinking_active:
+                console.print("[thinking] ", style="dim magenta", end="")
+
+            def _on_thinking(tok: str) -> None:
+                console.print(tok, end="", style="dim magenta")
+                console.file.flush()
+
+            def _on_token(token: str) -> None:
+                console.print(token, end="")
+                console.file.flush()
+
+            def _on_retry(event: object) -> None:
+                attempt = getattr(event, "attempt", "?")
+                max_retries = getattr(event, "max_retries", "?")
+                delay = getattr(event, "delay_seconds", "?")
+                next_retry_at = getattr(event, "next_retry_at", 0.0)
+                next_time = time.strftime("%H:%M:%S", time.localtime(next_retry_at))
+                error = getattr(event, "error", "")
+                console.print(
+                    f"\n[retry {attempt}/{max_retries}] next retry in {delay}s "
+                    f"at {next_time}: {error}",
+                    style="bold yellow",
                 )
-                interrupted = monitor.interrupted
-                exit_requested = monitor.exit_requested
 
-            handler.staged_images.clear()
-            if interrupted:
+            console.print("assistant> ", style="bold green", end="")
+
+            interrupted = False
+            exit_requested = False
+            try:
+                with _StreamInputMonitor() as monitor:
+                    if not session_store.current_session_persisted:
+                        session_store.rename_current(
+                            _derive_session_title(text, images_for_turn)
+                        )
+                    if self.turn_lock is None:
+                        agent._engine.stream_reply(
+                            llm_text,
+                            images_for_turn,
+                            _on_token,
+                            lambda event: console.print(f"\n[tool] {event}", style="cyan"),
+                            on_thinking=_on_thinking if thinking_active else None,
+                            on_retry=_on_retry,
+                            system_context=system_context,
+                            should_stop=monitor.should_stop,
+                        )
+                    else:
+                        with self.turn_lock:
+                            agent._engine.stream_reply(
+                                llm_text,
+                                images_for_turn,
+                                _on_token,
+                                lambda event: console.print(f"\n[tool] {event}", style="cyan"),
+                                on_thinking=_on_thinking if thinking_active else None,
+                                on_retry=_on_retry,
+                                system_context=system_context,
+                                should_stop=monitor.should_stop,
+                            )
+                    interrupted = monitor.interrupted
+                    exit_requested = monitor.exit_requested
+
+                handler.staged_images.clear()
+                if interrupted:
+                    console.print("\n[interrupted]", style="bold yellow")
+                session_store.save_current_messages(agent.messages)
+                console.print("")
+                if exit_requested:
+                    break
+            except KeyboardInterrupt:
                 console.print("\n[interrupted]", style="bold yellow")
-            session_store.save_current_messages(engine.export_messages())
-            console.print("")
-            if exit_requested:
+                handler.staged_images.clear()
+                session_store.save_current_messages(agent.messages)
                 break
-        except KeyboardInterrupt:
-            console.print("\n[interrupted]", style="bold yellow")
-            handler.staged_images.clear()
-            session_store.save_current_messages(engine.export_messages())
-            break
-        except Exception as e:  # noqa: BLE001
-            console.print("")
-            console.print(f"LLM error: {e}", style="bold red")
-            session_store.save_current_messages(engine.export_messages())
+            except Exception as e:  # noqa: BLE001
+                console.print("")
+                console.print(f"LLM error: {e}", style="bold red")
+                session_store.save_current_messages(agent.messages)
 
-    session_store.save_current_messages(engine.export_messages())
-    for msg in mcp_manager.stop_all():
-        console.print(f"[mcp] {msg}", style="cyan")
+        session_store.save_current_messages(agent.messages)
+        agent.shutdown()
+
+
+def main() -> None:
+    try:
+        cli = EnkiballCLI()
+    except FileNotFoundError:
+        raise SystemExit(1) from None
+    cli.run()
 
 
 if __name__ == "__main__":

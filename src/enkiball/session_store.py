@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SESSION_DIR = Path("data/sessions")
-EXPORT_DIR = Path("data/exports")
+_CONFIG_BASE = Path.home() / ".config" / "enkiball"
+SESSION_DIR = _CONFIG_BASE / "sessions"
+EXPORT_DIR = _CONFIG_BASE / "exports"
 
 
 def _now_iso() -> str:
@@ -48,7 +49,9 @@ class SessionRecord:
 
 
 class SessionStore:
-    def __init__(self, base_dir: Path = SESSION_DIR, export_dir: Path = EXPORT_DIR) -> None:
+    def __init__(
+        self, base_dir: Path = SESSION_DIR, export_dir: Path = EXPORT_DIR
+    ) -> None:
         self.base_dir = base_dir
         self.export_dir = export_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -110,9 +113,19 @@ class SessionStore:
         out.sort(key=lambda s: s.updated_at, reverse=True)
         return out
 
-    def create(self, name: str | None = None, initial_messages: list[dict[str, Any]] | None = None) -> SessionRecord:
-        display_name = name.strip() if name else f"session-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-        return self.begin_new(name=display_name, initial_messages=initial_messages, persisted=True)
+    def create(
+        self,
+        name: str | None = None,
+        initial_messages: list[dict[str, Any]] | None = None,
+    ) -> SessionRecord:
+        display_name = (
+            name.strip()
+            if name
+            else f"session-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        )
+        return self.begin_new(
+            name=display_name, initial_messages=initial_messages, persisted=True
+        )
 
     def load(self, session_id: str) -> SessionRecord:
         fp = self._path(session_id)
@@ -124,7 +137,10 @@ class SessionStore:
     def save(self, record: SessionRecord) -> None:
         record.updated_at = _now_iso()
         fp = self._path(record.session_id)
-        fp.write_text(json.dumps(record.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        fp.write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def rename_current(self, name: str) -> bool:
         cleaned = name.strip()
@@ -145,7 +161,9 @@ class SessionStore:
         self.save(record)
         return True
 
-    def save_messages(self, session_id: str, messages: list[dict[str, Any]]) -> SessionRecord:
+    def save_messages(
+        self, session_id: str, messages: list[dict[str, Any]]
+    ) -> SessionRecord:
         if self._path(session_id).exists():
             record = self.load(session_id)
         else:
@@ -163,11 +181,17 @@ class SessionStore:
             self.current_session_name = record.name
         return record
 
-    def save_current_messages(self, messages: list[dict[str, Any]], force: bool = False) -> SessionRecord | None:
+    def save_current_messages(
+        self, messages: list[dict[str, Any]], force: bool = False
+    ) -> SessionRecord | None:
         sid = self.current_session_id
         if not sid:
             return None
-        if not force and not self.current_session_persisted and not self.has_user_turn(messages):
+        if (
+            not force
+            and not self.current_session_persisted
+            and not self.has_user_turn(messages)
+        ):
             return None
         return self.save_messages(sid, messages)
 

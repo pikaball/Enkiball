@@ -1,113 +1,64 @@
-# 安全研究agent - Enkiball
+# Enkiball
 
-Enkiball是一个专注于安全研究任务的agent，其核心设计理念是在巨量上下文中，让llm像人类一样认知和调度任务。
+Enkiball 是一个面向安全研究的 agent 框架，同时提供 CLI 交互界面和 Python 库 API。
 
-## 总体架构
+设计目标：在大规模上下文中让 LLM 像人类一样认知和调度任务。当前仓库提供稳定的基座层，上层 Task Controller / SubAgent 调度机制将在此基础上构建。
 
-三个核心组件： Task Controller, main agent, subagent
-
-Task Controller维护task结构，一个task结构如下所示：
-
-```
-Task
-    Task_id
-    Parent，如果是main task则置为0, 是subtask则指main task，如果是subtask,则不开放`Subtasks`字段
-    Target, 对需要完成的任务的准确全面描述，包括要达成什么样的目标，以及完成任务采用什么思路进行
-    Context, 为了完成这个任务所需要的上下文，不应嵌入过长内容，有文件引用应直接写文件名而不是填充文件内容，长度限制在512B以内
-    Subtasks, 即为完成这这个任务而建立的subtask的Task_id和对应描述
-    Process，当前任务的进度，发现，成果，以及能证明成果的分析链/证据链，长度限制在2048B以内
-    Status，分为空白(Blank)，执行中（processing），挂起(Suspend: because waiting for task_xxx/ because failed)，结束(Done)
-```
-
-## 基本交互范式与逻辑
-
-一个session在任何时刻和一个main task绑定，session创建时自动建立一个空白task, 用户也可以手动切换task, 但对当前会话中的main agent无感，用户和main agent进行交互，纯cli交互，流式输出。
-
-main agent具有对task controller的完全操作权限，用户可以输入要求，main agent进行思考分析，然后通过用工具封装的task controller来编辑当前任务，Task的每个结构（Target, Context, Subtasks, Process, Status）都有独立的工具进行编辑，这是为了task结构永远不被破坏。
-
-main agent本身被要求必须用subagent来完成任务，当main agent分析完任务时，可以在main task中建立subtask, 并异步启动一个subagent来执行subtask，subagent则不被允许创建另一个subagent，任何创建subagent的需求最终都由main agent来执行。subagent本身可以编辑自己的task内容，但不开放对Subtasks字段的编辑工具。
-
-main agent可以完全操作subagent, 就像人类操作main agent一样，可以与其对话，可以掐断输出，可以压缩history
-
-当前main task的Status不为Blank时，后台启动监察循环，在每一次监察循环中，main agent查看subtasks的状态，对每一个subtask对应的subagent进行如下操作：
-
-0. 如果subtask是结束状态，或已经被标记为失败的尝试，则跳过
-1. 从task controller获取subtask的完整内容，检查当前subagent的工作流是否偏离了subtask的目标
-2. 检查subagent的输出和思考内容，如果发现方向发生了偏离，则中止并与其对话进行提醒
-3. 允许编辑和压缩subagent的history，确保其注意力集中，压缩的原则是保守的，去除无关内容，保留任何可能有用的信息。可压缩的内容比如：subagent尝试执行命令，但执行环境有一些问题，subagent进行了修复，然后执行成功，此时这个修复过程应从history中删掉以防止注意力偏移
-4. 评价当前subagent的未来预期，如果判定其难以完成任务，则可以继续将这个subtask细分成多个subtask, 或者创建新的subtask用于尝试另外的思路；如果subagent连续3次被评价为继续下去没有完成任务的可能，则subagent被标记为挂起（失败的尝试）并停止其执行。
-5. 更新main task
-
-监察循环的交互不占用用户对话的上下文，两者完全依赖task Controller来进行信息交互
-
-## 当前可用基础框架（已实现）
-
-目前仓库已经提供一个可运行的 CLI 基座，满足以下能力：
-
-1. 交互式终端界面（`prompt_toolkit`）：
-   - 支持方向键历史导航
-   - 支持 Tab 自动补全
-   - 支持命令历史建议
-2. 普通输入直连 LLM，对话采用流式输出（`openai` SDK）
-3. `/xxx` 特殊命令系统：
-   - 模型切换
-   - 会话管理（创建、切换、导出）
-   - MCP 开关管理 + MCP 进程启停
-4. 工具系统（Tool Call）：
-   - `read_file`
-   - `write_file`
-   - `run_command`
-   - 这些工具不暴露为用户命令，而是由 LLM 在对话中按需自动调用
-5. MCP 采用配置文件驱动（`config/agent.json`）：
-   - 支持 local(`command` + `args`) 和 remote(`url`) 两类 server
-   - 用户可手动编辑 `enabled` 字段开关 server
-   - 也可在 CLI 内通过 `/mcp` 交互面板逐个开关（启用时会立即尝试启动）
-6. 会话存储：
-   - 每次启动默认创建一个新的“未保存会话”，不会续接上次会话
-   - 首次真实对话发生后，自动用首条输入生成会话标题并保存到本地 `data/sessions/*.json`
-   - 后续每轮对话会自动保存
-   - 支持在 CLI 内切换 session
-   - 支持完整对话导出为 markdown
-
-## 启动方式
+## 安装
 
 ```bash
-uv sync
-cp .env.example .env
-# .env
-# API_KEY=your_key
-# BASE_URL=https://your-api-base/v1
-uv run enkiball
+pip install -e .
 ```
 
-如果你希望安装为可直接执行的系统命令（无需 `uv run`）：
+安装后 `enkiball` 命令全局可用，可在任意目录下启动。
+
+## 配置
+
+配置文件位于 `~/.config/enkiball/enki.json`，首次运行前需手动创建：
 
 ```bash
-uv tool install --editable .
-enkiball
+mkdir -p ~/.config/enkiball
 ```
-
-`BASE_URL` 为可选项；若不填则使用官方默认地址。  
-`agent.json` 只保留模型、采样参数和 MCP 配置，例如：
 
 ```json
 {
-  "llm": {
-    "provider": "openai",
-    "model": "gpt-4.1-mini",
-    "temperature": 0.2,
-    "max_tokens": 2048
+  "system_prompt": "You are Enkiball, a practical assistant for security research tasks.",
+  "auto_compact": {
+    "enabled": false,
+    "threshold_ratio": 0.7
+  },
+  "providers": {
+    "ollama": {
+      "api_key": "123",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "models": {
+        "qwen3.5:9b": {
+          "temperature": 1,
+          "max_tokens": 2048
+        }
+      }
+    },
+    "openai": {
+      "api_key": "sk-xxx",
+      "base_url": "https://api.openai.com/v1",
+      "models": {
+        "gpt-4o": {
+          "temperature": 0.2,
+          "max_tokens": 4096
+        }
+      }
+    }
   },
   "mcp": {
     "servers": {
-      "local-example": {
-        "enabled": true,
+      "ssh-mcp": {
+        "enabled": false,
         "command": "node",
-        "args": ["/path/to/local-mcp-server.js"],
+        "args": ["/path/to/ssh-mcp-server/dist/index.js"],
         "transport": "jsonl"
       },
-      "remote-example": {
-        "enabled": true,
+      "remote-mcp": {
+        "enabled": false,
         "type": "streamable-http",
         "url": "http://127.0.0.1:12306/mcp"
       }
@@ -116,63 +67,371 @@ enkiball
 }
 ```
 
-## CLI 命令
+说明：
 
-```text
-/help
-/exit
-/model
-/model <name>
-/revert [n]
-/image add <path...>
-/image list
-/image remove <index>
-/image clear
-/image help
-/session
-/session list
-/session current
-/session new [name]
-/session use <id|index>
-/session rename <name>
-/session export [path]
-/session help
-/mcp
-/mcp list
-/mcp enable <name|index>
-/mcp disable <name|index>
-/mcp toggle <name|index>
-/mcp start <name|index>
-/mcp stop <name|index>
-/mcp status
-/mcp help
-/mcp path
+- `system_prompt` — 自定义系统提示词，省略则使用内置默认值
+- `auto_compact.threshold_ratio` — 自动压缩触发比例，默认 `0.7`；按 `models.<name>.max_tokens * threshold_ratio` 计算 compact 触发点
+- `providers` — 多 provider 支持，每个 provider 直接写 `api_key` 和 `base_url`
+- `models` — dict 格式，key 为模型名，value 为该模型的参数（`temperature`、`max_tokens` 等）；这里的 `max_tokens` 是模型端点单次请求允许/生成相关参数，不是 compact 阈值
+- 未在 config 中定义的模型也可使用（通过 `/v1/models` 端点自动发现），使用默认参数
+- 当前选中的 provider 和 model 保存在 `~/.config/enkiball/state.json`（运行时状态，与配置分离）
+- `mcp.servers` — MCP 服务器配置，支持 Stdio（jsonl/content-length）、SSE、Streamable HTTP 三种传输
+
+所有持久化数据（会话历史、导出、命令历史）存储在 `~/.config/enkiball/` 下。
+
+## CLI 使用
+
+```bash
+enkiball
 ```
 
-## 图片发送
+普通输入直接发送给 LLM，支持流式输出。按 `Ctrl+J` 换行，`Enter` 发送。`Esc` 中断当前输出。
 
-支持在同一条用户消息中混合发送文本和图片：
+### 命令列表
 
-```text
-/image add ./screenshots/a.png ./screenshots/b.jpg
-you> 请结合这两张图分析页面中的安全风险
+```
+/help                      帮助
+/exit                      退出
+/model [name]              查看或切换模型（无参数时显示可用模型列表，含远程发现）
+/provider                  查看当前 provider
+/provider list             列出所有 provider 及其模型
+/provider switch <name>    切换 provider
+/compact                   压缩历史（摘要后续只发摘要给 LLM，完整历史仍保留）
+/autocompact [on|off]      查看或切换自动压缩
+/revert [n]                撤回最近 n 轮对话，自动恢复输入和图片
+/thinking                  开关 thinking/reasoning 输出
+/tokens                    查看累计 token 用量
+/image add <path...>       挂载图片
+/image list                查看已挂载图片
+/image remove <index>      移除一张图片
+/image clear               清空挂载图片
+/session                   进入 session 交互面板
+/session list              列出所有会话
+/session current            当前会话信息
+/session new [name]        新建会话
+/session use <id|index>    切换会话（屏幕恢复历史）
+/session rename <name>     重命名当前会话
+/session export [path]     导出会话为 markdown
+/session fork <turn>       从第 N 轮用户输入处 fork 新会话
+/mcp                       进入 MCP 交互面板
+/mcp list                  列出 MCP 服务器
+/mcp enable <name|index>   启用并启动
+/mcp disable <name|index>  禁用并停止
+/mcp start <name|index>    启动进程
+/mcp stop <name|index>     停止进程
+/mcp status                查看运行状态
 ```
 
-只发图片也可以：
+## 库 API
 
-```text
-/image add ./capture.png
-you> 
+```python
+from enkiball import Enkiball
+
+with Enkiball() as agent:
+    # 基本对话
+    result = agent.chat("scan open ports on localhost")
+    print(result)
+
+    # 流式输出
+    for token in agent.stream("explain the results"):
+        print(token, end="", flush=True)
+
+    # 带图片
+    result = agent.chat("what is in this screenshot?", images=["screen.png"])
+
+    # Provider / 模型管理
+    print(agent.providers)
+    agent.switch_provider("openai")
+    agent.switch_model("gpt-4o")
+    print(agent.list_models())            # config + 远程发现
+    print(agent.list_models(remote=False)) # 仅 config 定义
+
+    # Compact（压缩历史）
+    summary = agent.compact()                          # 使用默认摘要 prompt
+    summary = agent.compact(prompt="只保留安全发现")     # 自定义摘要 prompt
+
+    # MCP 控制
+    agent.mcp_start("ssh-mcp")
+    agent.mcp_stop("ssh-mcp")
+
+    # Token 统计
+    print(agent.token_usage)
+
+    # Thinking 输出
+    agent.show_thinking = True
+
+    # 历史管理
+    agent.revert(2)
+    forked_msgs = agent.fork_at_turn(3)
+
+    # 自定义 system prompt（覆盖 config）
+    agent.system_prompt = "You are a pentesting assistant."
 ```
 
-辅助命令：
+配置文件路径可通过构造参数覆盖：
 
-- `/image list` 查看已挂载图片
-- `/image remove <index>` 删除一个挂载图片
-- `/image clear` 清空挂载图片
-- `/revert [n]` 撤回后会恢复该轮图片挂载，便于编辑重发
+```python
+agent = Enkiball(config_path="/path/to/custom/enki.json")
+```
 
-## 工程文档
+### 异步 API
 
-- 架构说明：`docs/ARCHITECTURE.md`
-- 开发路线图：`docs/ROADMAP.md`
+所有核心对话方法都提供异步版本（基于 `AsyncOpenAI`），工具调用通过 `asyncio.to_thread` 在线程池中执行，不阻塞事件循环：
+
+```python
+import asyncio
+from enkiball import Enkiball
+
+async def main():
+    with Enkiball() as agent:
+        # 异步 chat：一次性返回完整结果
+        result = await agent.achat("scan open ports on localhost")
+        print(result)
+
+        # 异步流式输出（tokens only）
+        async for token in agent.astream("explain the results"):
+            print(token, end="", flush=True)
+
+        # 异步流式事件（token / thinking / tool / done）
+        async for ev in agent.astream_events("analyze this"):
+            if ev["type"] == "token":
+                print(ev["data"], end="", flush=True)
+            elif ev["type"] == "thinking":
+                print(f"\n[thinking] {ev['data']}")
+            elif ev["type"] == "tool":
+                print(f"\n[tool] {ev['data']}")
+            elif ev["type"] == "done":
+                result = ev["data"]   # ChatResult
+
+        # 异步 compact
+        summary = await agent.acompact()
+
+asyncio.run(main())
+```
+
+同步与异步共享同一个 `ChatEngine` 和消息历史，可以混用。
+
+### 实时 capture
+
+`agent.capture()` 是**同步、线程安全**的快照方法，任何时刻调用都会立即返回当前流式输出已累积的内容（不会等待流结束）。
+
+最常见的用法是 **fire-and-poll**：用 `chat_in_background()` 在后台线程发起任务，主线程循环 capture：
+
+```python
+from enkiball import Enkiball
+import time
+
+agent = Enkiball()
+
+# 先来一轮正常对话
+print(agent.chat("who are you?"))
+
+# 后台发起一个长任务，立即返回 Future
+fut = agent.chat_in_background("list all tools you can see")
+
+# 主线程轮询实时输出
+while not fut.done():
+    time.sleep(0.5)
+    snap = agent.capture()
+    print(f"[{len(snap.content)} chars] {snap.content[-80:]}")
+
+result = fut.result()   # ChatResult
+print("final:", result.content)
+```
+
+> 注意：`agent.achat(...)` 是 coroutine，必须在 `async` 上下文里 `await`。如果你只是想在同步代码里"发起后台任务 + 轮询"，用 `chat_in_background()`。
+
+也可以自己开线程：
+
+```python
+import threading
+threading.Thread(target=lambda: agent.chat("task"), daemon=True).start()
+while agent.capture().in_progress:
+    time.sleep(0.5)
+    print(agent.capture().content)
+```
+
+异步场景下 capture 同样可用（从任何协程或线程调用）：
+
+```python
+async def main():
+    task = asyncio.create_task(agent.achat("long task"))
+    while not task.done():
+        await asyncio.sleep(0.5)
+        print(agent.capture().content)
+```
+
+`LiveSnapshot` 字段：`content` / `thinking` / `tool_events` / `in_progress` / `started_at` / `updated_at` / `elapsed`。
+
+辅助方法 `agent.wait(timeout=None)` 阻塞直到当前流结束。
+
+运行中的任务可用 `agent.interrupt()` 轻量掐断（别名 `agent.cancel()`）。它只设置停止标记，不等待、不释放额外资源；当前 stream loop 会在下一个 chunk/循环点观察到标记并关闭流：
+
+```python
+fut = agent.chat_in_background("very long task")
+time.sleep(2)
+agent.interrupt()
+partial = agent.capture().content
+result = fut.result()   # partial ChatResult
+```
+
+### 自定义工具
+
+LLM 可调用的工具支持运行时注册，函数签名 `func(args: dict) -> str | dict | list`：
+
+```python
+from enkiball import Enkiball
+
+agent = Enkiball()
+
+# 装饰器形式
+@agent.register_tool(
+    name="ping",
+    description="Ping a host once",
+    parameters={
+        "type": "object",
+        "properties": {"host": {"type": "string"}},
+        "required": ["host"],
+    },
+)
+def ping(args):
+    import subprocess
+    return subprocess.check_output(["ping", "-c1", args["host"]]).decode()
+
+# 直接调用形式
+def scan(args):
+    return {"ports": [22, 80, 443]}     # dict 会被自动 JSON 编码
+
+agent.register_tool(scan, description="Scan ports",
+                    parameters={"type": "object", "properties": {}})
+
+# 也可以传完整 OpenAI schema
+agent.register_tool(my_func, schema={"type": "function", "function": {...}})
+
+print(agent.list_custom_tools())
+agent.unregister_tool("ping")
+```
+
+返回值约定：
+- 返回 `str` → 原样发给 LLM
+- 返回 `dict` / `list` → 自动包装为 `{"ok": true, "result": ...}` 后 JSON 编码
+- 抛出异常 → 自动捕获为 `{"ok": false, "error": "..."}` 发给 LLM
+
+### CLI 作为库使用 + 自定义命令
+
+`EnkiballCLI` 把交互式 CLI 封装成可嵌入的类。可以预先注册工具/命令再启动 REPL，用于构建特化 agent：
+
+```python
+from enkiball import Enkiball, EnkiballCLI
+
+agent = Enkiball()
+
+# 注册业务工具
+@agent.register_tool(name="recon", description="Recon a target",
+                     parameters={"type": "object",
+                                 "properties": {"target": {"type": "string"}},
+                                 "required": ["target"]})
+def recon(args):
+    return f"recon results for {args['target']}: ..."
+
+cli = EnkiballCLI(agent, banner="MyPentestAgent v1.0 — /help for commands")
+
+# 注册自定义斜杠命令
+def cmd_target(argv, handler, engine, session):
+    """/target <host>  - set the active target host"""
+    if len(argv) < 2:
+        handler.console.print("usage: /target <host>", style="yellow")
+        return True
+    engine.messages.append({
+        "role": "system",
+        "content": f"Active target: {argv[1]}",
+    })
+    handler.console.print(f"target set: {argv[1]}", style="green")
+    return True   # True = keep CLI running, False = exit
+
+cli.register_command(
+    "target", cmd_target,
+    help_text="Set the active target host",
+    completions=["help"],   # 补全建议
+)
+
+cli.run()
+```
+
+命令处理函数签名：`(argv, handler, engine, session) -> bool`
+- `argv` — `shlex.split` 后的列表，`argv[0]` 是命令本身
+- `handler` — `CommandHandler` 实例（可访问 `console`、`config`、`session_store`、`staged_images` 等）
+- `engine` — `ChatEngine`（消息、tokens、模型）
+- `session` — prompt_toolkit `PromptSession`，可用于子 REPL（参考 `/mcp`、`/session`）
+- 返回 `True` 继续运行，`False` 退出 CLI
+
+`pyproject.toml` 中的 `enkiball` 入口仍指向内置 `cli:main`，等价于 `EnkiballCLI().run()`。
+
+## 内置工具
+
+LLM 在对话中按需自动调用，不暴露为用户命令：
+
+- `read_file` — 读取文件内容
+- `write_file` — 写入文件
+- `run_command` — 执行 shell 命令
+
+## 项目结构
+
+```
+src/enkiball/
+├── __init__.py          包导出（Enkiball, ChatResult, TokenUsage, ...）
+├── agent.py             核心库 API 类
+├── config.py            配置加载、provider/model 管理
+├── llm.py               ChatEngine，LLM 交互引擎
+├── cli.py               CLI 入口
+├── commands.py          斜杠命令处理
+├── session_store.py     会话持久化
+├── llm_tools.py         本地工具 schema 和分发
+├── tools.py             read_file/write_file/run_command 实现
+├── mcp.py               MCPManager
+├── mcp_client.py        MCP 传输客户端（Stdio/SSE/Streamable HTTP）
+└── task_controller.py   占位（Phase 2）
+```
+
+## 架构设计（规划中）
+
+----
+
+初版设想（2026.01）
+
+三个核心组件：Task Controller、Main Agent、SubAgent。
+
+Task Controller 维护结构化任务树，每个 Task 包含 Target、Context、Subtasks、Process、Status。Main Agent 通过工具操作 Task Controller 来分解和调度任务，SubAgent 异步执行子任务。监察循环独立于用户对话上下文运行，通过 Task Controller 进行信息交互。
+
+-----
+
+2026.4.18
+
+先明确webhack几个高层次的设计。
+
+其一是任务和状态的思维悬浮，这是通用agent的能力方面。通过外部server保存任务（任务树）和状态（考虑是否需要状态服务器）来模拟悬浮状态，但是不指望AI完全自觉地查看server，这是因为AI往往意识不到已经输出了多长的信息，llm会倾向于将当前的最近上下文进一步展开，所以实践来看最好是硬性的注入。
+考虑一下注入的方式，最简单的实现是每次交互时在输入的开头注入，但是这样在单轮长context的场景下效果会很差。另一种也许可行的方式是监测输出长度，到达阈值后直接interrupt，然后注入悬浮信息和continue指令。
+
+有必要吗……？supervisor本身也可以充当悬浮的角色做监察循环，随时中断executors并发送修正指令。
+
+感觉还是有必要，设想这样的场景：executor0完成了请求规范解析工作，executor1随后被分配了参数fuzz任务，但executor1执行的过程中发现了一些参数上的限制，需要executor0继续进一步解析，因为executor0才有这个任务的上下文，他最合适。此时选择有二：一是等待supervisor监测，然后supervisor来继续给executor0发指令，在之后的循环里再交给executor1；二是直接用ACP/A2A协议跟executor0通信。显然后者是效率更好的，那要达成后者的效果，executor1就必须要能把控全局状态，知道executor0的存在，所以悬浮信息向executor的注入应该仍然是有必要的。
+
+否定二，不利于系统状态一致性。
+
+那么在意识到supervisor后再回过头来看注入的方式。感觉这样也许可以：每次executor交互时注入悬浮状态，并且在supervisor的监察循环里，如果判定当前agent已经偏离方向，那么强制打断并注入后continue。
+
+如果偏离方向应该直接结束偏离方向的executor并提取有价值信息，新开一个继续跑。
+
+其二是人机协同，这是黑盒web测试的特化能力方面。因为让现在的ai不好测web站点的重要限制就是业务逻辑，各种认证和交互都刚需现实人类身份，而且不能放心让ai做一切操作，需要人类来决定风险程度是否可以进行某一种操作。首先最容易想到的是开一个带窗口的playwright，agent操作觉得需要被确认的时候给人发信号，人在浏览器里认证或点击或告诉ai可以做。这里的问题是敏感操作本身是不可规则化识别的，而且也需要能always allow某一种操作，不然人类交互没完没了了。感觉这个没有最终解，只能尽可能地让ai多意识到这些东西。
+
+可以让ai请求的同时给出匹配规则，人类同意规则后加入白名单。
+
+人机协同的另一层是人类随时可以和agent交流工作进度，这当然也是supervisor实现的，supervisor实时提取全局状态和executor进度来输出报告，并从人类输入下发任务给executors而不必中断当前流。
+
+supervisor这个角色不打算设计为一个单纯的对话流，而是有个循环在跑一些固定的异步任务，用户跟supervisor的交互和这个循环是独立的，同时还支持单次对话不污染对话流，大概是提供一个命令如/btw <prompt>。
+
+固定的任务：
+
+- 对每个executor，审查其当前进度有没有偏离任务目标，有没有去做一些在其他地方已经得到最终确定结果的重复事情
+- 维护进度文档，处理更改请求，这个文档同时也是状态图，给目标做状态建模，必须要有严格的格式约束，不能写太多“接下来在做什么”“已经完成了什么”之类的内容，因为这些是可以从task server拿的，状态图就应该专注于业务逻辑和站点信息，还有人类给的附加信息如账户凭证
+- 维护任务树，标记已经完成或宣告失败的任务，写入新的子任务并分配executor；对已经完成的任务，附加报告信息，给状态图提交更改请求
