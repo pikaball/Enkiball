@@ -13,6 +13,21 @@ from urllib.parse import urljoin
 import httpx
 
 
+def _parse_sse_event_lines(lines: list[str]) -> tuple[str, str] | None:
+    if not lines:
+        return None
+    event_type = "message"
+    data_parts: list[str] = []
+    for line in lines:
+        if line.startswith("event:"):
+            event_type = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            data_parts.append(line.split(":", 1)[1].lstrip())
+    if not data_parts:
+        return None
+    return event_type, "\n".join(data_parts)
+
+
 class MCPClient(ABC):
     def __init__(self, name: str) -> None:
         self.name = name
@@ -348,18 +363,10 @@ class SSEMCPClient(MCPClient):
             self.running = False
 
     def _process_sse_event(self, lines: list[str]) -> None:
-        event_type = "message"
-        data_parts: list[str] = []
-        for line in lines:
-            if line.startswith("event:"):
-                event_type = line.split(":", 1)[1].strip()
-                continue
-            if line.startswith("data:"):
-                data_parts.append(line.split(":", 1)[1].lstrip())
-
-        if not data_parts:
+        parsed = _parse_sse_event_lines(lines)
+        if not parsed:
             return
-        data_str = "\n".join(data_parts)
+        event_type, data_str = parsed
 
         if event_type == "endpoint":
             if "://" in data_str:
@@ -407,22 +414,6 @@ class StreamableHTTPMCPClient(MCPClient):
         self.session_id: str | None = None
         self.client = httpx.Client(timeout=60.0, headers=headers or {})
 
-    @staticmethod
-    def _parse_sse_message_lines(lines: list[str]) -> tuple[str, str] | None:
-        if not lines:
-            return None
-        event_type = "message"
-        data_parts: list[str] = []
-        for line in lines:
-            if line.startswith("event:"):
-                event_type = line.split(":", 1)[1].strip()
-                continue
-            if line.startswith("data:"):
-                data_parts.append(line.split(":", 1)[1].lstrip())
-        if not data_parts:
-            return None
-        return event_type, "\n".join(data_parts)
-
     def _send_payload(self, payload: dict[str, Any]) -> None:
         raise NotImplementedError("StreamableHTTPMCPClient uses HTTP request-response directly")
 
@@ -463,7 +454,7 @@ class StreamableHTTPMCPClient(MCPClient):
             block: list[str] = []
             for line in resp.iter_lines():
                 if line == "":
-                    parsed = self._parse_sse_message_lines(block)
+                    parsed = _parse_sse_event_lines(block)
                     block = []
                     if not parsed:
                         continue
@@ -480,7 +471,7 @@ class StreamableHTTPMCPClient(MCPClient):
                     block.append(line)
 
             if block:
-                parsed = self._parse_sse_message_lines(block)
+                parsed = _parse_sse_event_lines(block)
                 if parsed and parsed[0] == "message":
                     try:
                         msg = json.loads(parsed[1])

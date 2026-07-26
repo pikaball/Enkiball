@@ -49,9 +49,16 @@ class SessionRecord:
 
 
 class SessionStore:
-    def __init__(
-        self, base_dir: Path = SESSION_DIR, export_dir: Path = EXPORT_DIR
-    ) -> None:
+    def __init__(self) -> None:
+        self._init_paths(SESSION_DIR, EXPORT_DIR)
+
+    @classmethod
+    def _from_paths(cls, base_dir: Path, export_dir: Path) -> SessionStore:
+        store = cls.__new__(cls)
+        store._init_paths(base_dir, export_dir)
+        return store
+
+    def _init_paths(self, base_dir: Path, export_dir: Path) -> None:
         self.base_dir = base_dir
         self.export_dir = export_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .tools import read_file, run_command, write_file
+from .sandbox import Sandbox
+from .tools import edit_file, read_file, write_file
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -45,6 +46,37 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "edit",
+            "description": (
+                "Replace exact text in an existing UTF-8 file. old_text must match "
+                "exactly once unless replace_all is true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to target file."},
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text to replace, including whitespace.",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text; use an empty string to delete.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence instead of requiring a unique match.",
+                        "default": False,
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": "Run a shell command and capture exit_code/stdout/stderr.",
             "parameters": {
@@ -67,26 +99,50 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 
-def dispatch_tool(name: str, args: dict[str, Any]) -> str:
+def dispatch_tool(name: str, args: dict[str, Any], sandbox: Sandbox | None = None) -> str:
+    sandbox = sandbox or Sandbox()
     try:
         if name == "read_file":
-            content = read_file(str(args["path"]))
+            target = sandbox.resolve_path(str(args["path"]), "read")
+            content = read_file(str(target))
             # Keep tool payload bounded for model context hygiene.
             if len(content) > 20000:
                 content = content[:20000] + "\n...[truncated]"
             return json.dumps({"ok": True, "content": content}, ensure_ascii=False)
 
         if name == "write_file":
+            target_path = sandbox.resolve_path(str(args["path"]), "write")
             target = write_file(
-                path=str(args["path"]),
+                path=str(target_path),
                 content=str(args["content"]),
                 append=bool(args.get("append", False)),
             )
             return json.dumps({"ok": True, "path": target}, ensure_ascii=False)
 
+        if name == "edit":
+            for field in ("path", "old_text", "new_text"):
+                if not isinstance(args.get(field), str):
+                    raise TypeError(f"{field} must be a string")
+            replace_all = args.get("replace_all", False)
+            if not isinstance(replace_all, bool):
+                raise TypeError("replace_all must be a boolean")
+            target_path = sandbox.resolve_path(args["path"], "edit")
+            target, replacements = edit_file(
+                path=str(target_path),
+                old_text=args["old_text"],
+                new_text=args["new_text"],
+                replace_all=replace_all,
+            )
+            return json.dumps(
+                {"ok": True, "path": target, "replacements": replacements},
+                ensure_ascii=False,
+            )
+
         if name == "run_command":
             timeout_sec = int(args.get("timeout_sec", 120))
-            code, out, err = run_command(command=str(args["command"]), timeout_sec=timeout_sec)
+            code, out, err = sandbox.run(
+                command=str(args["command"]), timeout_sec=timeout_sec
+            )
             if len(out) > 12000:
                 out = out[:12000] + "\n...[truncated]"
             if len(err) > 12000:

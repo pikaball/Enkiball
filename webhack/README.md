@@ -17,7 +17,10 @@ WebHack is a specialized agent layer on top of Enkiball. It implements the orche
 
 - `workspace.py` - durable task tree, JSON state graph, human notes, event log, floating context construction
 - `executor.py` - executor lifecycle, read-only executor context, background execution, capture, interrupt, task assignment
-- `supervisor.py` - foreground supervisor tools, stateless watchdog tick, CLI command handlers
+- `supervisor.py` - public `WebHackSupervisor` facade: session binding, foreground context injection, loop lifecycle, task stop/shutdown helpers
+- `loop.py` - stateless watchdog tick jobs: review finished tasks, audit running tasks, maintain state graph
+- `tools.py` - foreground/read-only Enkiball tool registration and tool handlers
+- `commands.py` - interactive CLI command handlers and command registration
 - `prompts.py` - foreground supervisor, executor, review, active-audit, and state-maintenance prompts
 - `main.py` - runnable CLI entry for WebHack
 

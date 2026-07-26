@@ -76,6 +76,7 @@ from .llm import (
     TokenUsage,
 )
 from .mcp import MCPManager
+from .sandbox import ApprovalHandler, Sandbox
 from .session_store import SessionRecord, SessionStore
 
 
@@ -90,6 +91,29 @@ class ChatResult:
 
     def __str__(self) -> str:
         return self.content
+
+
+class _ChatResultCollector:
+    def __init__(self, on_tool_event: Callable[[str], None] | None = None) -> None:
+        self.tool_calls: list[dict[str, Any]] = []
+        self.thinking_parts: list[str] = []
+        self.on_tool_event = on_tool_event
+
+    def on_tool(self, event: str) -> None:
+        self.tool_calls.append({"raw": event})
+        if self.on_tool_event:
+            self.on_tool_event(event)
+
+    def on_thinking(self, text: str) -> None:
+        self.thinking_parts.append(text)
+
+    def result(self, content: str, interrupted: bool = False) -> ChatResult:
+        return ChatResult(
+            content=content,
+            tool_calls=self.tool_calls,
+            thinking="".join(self.thinking_parts),
+            interrupted=interrupted,
+        )
 
 
 class Enkiball:
@@ -108,6 +132,16 @@ class Enkiball:
     on_tool_event : callable | None
         Optional callback ``(event_str) -> None`` fired before each tool
         execution.  Useful for logging / auditing.
+    session_dir : str | Path | None
+        Directory for persisted session JSON files. This is the only public
+        way to customize session storage location.
+    cwd : str | Path | None
+        Working directory available to built-in file and command tools.
+    dir_permissions : list[str | Path] | None
+        Additional directories available to built-in tools.
+    approval : bool
+        Allow an interactive frontend to request access outside configured
+        directories. Without a frontend, access is denied.
     """
 
     def __init__(
@@ -117,24 +151,47 @@ class Enkiball:
         auto_start_mcp: bool = True,
         extra_tools: list[dict[str, Any]] | None = None,
         on_tool_event: Callable[[str], None] | None = None,
+        session_dir: str | Path | None = None,
+        cwd: str | Path | None = None,
+        dir_permissions: list[str | Path] | None = None,
+        approval: bool = False,
     ) -> None:
         self._config_path = Path(config_path)
         ensure_config(self._config_path)
         self._config = load_config(self._config_path)
 
+        self._sandbox = Sandbox(cwd, dir_permissions, approval)
         self._mcp = MCPManager(self._config)
-        self._engine = ChatEngine(self._config, self._mcp)
+        self._engine = ChatEngine(self._config, self._mcp, self._sandbox)
         self._on_tool_event = on_tool_event
-        self._session_store: SessionStore | None = None
+        self._session_store = self._build_session_store(session_dir)
 
         if extra_tools:
-            self._engine._extra_tools = extra_tools
+            self._engine.set_extra_tools(extra_tools)
 
         if system_prompt is not None:
-            self._engine.messages[0]["content"] = system_prompt
+            self._engine.set_system_prompt(system_prompt)
 
         if auto_start_mcp:
             self._mcp.start_enabled()
+
+    @property
+    def cwd(self) -> Path:
+        return self._sandbox.cwd
+
+    @property
+    def dir_permissions(self) -> tuple[Path, ...]:
+        return self._sandbox.allowed_directories
+
+    def _set_approval_handler(self, handler: ApprovalHandler | None) -> None:
+        self._sandbox.set_approval_handler(handler)
+
+    @staticmethod
+    def _build_session_store(session_dir: str | Path | None) -> SessionStore:
+        if session_dir is None:
+            return SessionStore()
+        base_dir = Path(session_dir).expanduser().resolve()
+        return SessionStore._from_paths(base_dir, base_dir.parent / "exports")
 
     # ========================================================================
     # Custom tools
@@ -208,14 +265,7 @@ class Enkiball:
                 }
                 tool_name_eff = tool_name
 
-            # Replace any existing schema/handler with the same name
-            self._engine._extra_tools = [
-                s
-                for s in self._engine._extra_tools
-                if s.get("function", {}).get("name") != tool_name_eff
-            ]
-            self._engine._extra_tools.append(full_schema)
-            self._engine._tool_handlers[tool_name_eff] = fn  # type: ignore[assignment]
+            self._engine.register_tool(tool_name_eff, full_schema, fn)
             return fn
 
         if func is None:
@@ -225,18 +275,11 @@ class Enkiball:
 
     def unregister_tool(self, name: str) -> bool:
         """Remove a previously registered custom tool.  Returns True if found."""
-        existed = name in self._engine._tool_handlers
-        self._engine._tool_handlers.pop(name, None)
-        self._engine._extra_tools = [
-            s
-            for s in self._engine._extra_tools
-            if s.get("function", {}).get("name") != name
-        ]
-        return existed
+        return self._engine.unregister_tool(name)
 
     def list_custom_tools(self) -> list[str]:
         """Return names of registered custom tools."""
-        return list(self._engine._tool_handlers.keys())
+        return self._engine.list_custom_tools()
 
     # ========================================================================
     # Configuration & Provider management
@@ -303,15 +346,11 @@ class Enkiball:
 
     @property
     def system_prompt(self) -> str:
-        first = self._engine.messages[0] if self._engine.messages else {}
-        return str(first.get("content", ""))
+        return self._engine.system_prompt
 
     @system_prompt.setter
     def system_prompt(self, prompt: str) -> None:
-        if self._engine.messages and self._engine.messages[0].get("role") == "system":
-            self._engine.messages[0]["content"] = prompt
-        else:
-            self._engine.messages.insert(0, {"role": "system", "content": prompt})
+        self._engine.set_system_prompt(prompt)
 
     # ========================================================================
     # Thinking output toggle
@@ -506,34 +545,20 @@ class Enkiball:
         should_stop: Callable[[], bool] | None = None,
     ) -> ChatResult:
         """Send *message* and block until the full reply is collected."""
-        tool_calls_log: list[dict[str, Any]] = []
-        thinking_parts: list[str] = []
-
-        def _on_tool(event: str) -> None:
-            tool_calls_log.append({"raw": event})
-            if self._on_tool_event:
-                self._on_tool_event(event)
-
-        def _on_thinking(text: str) -> None:
-            thinking_parts.append(text)
+        collector = _ChatResultCollector(self._on_tool_event)
 
         content = self._engine.stream_reply(
             user_input=message,
             image_paths=images,
             on_token=lambda _: None,
-            on_tool_event=_on_tool,
-            on_thinking=_on_thinking,
+            on_tool_event=collector.on_tool,
+            on_thinking=collector.on_thinking,
             on_retry=on_retry,
             system_context=system_context,
             should_stop=should_stop,
         )
         interrupted = should_stop() if should_stop else False
-        return ChatResult(
-            content=content,
-            tool_calls=tool_calls_log,
-            thinking="".join(thinking_parts),
-            interrupted=interrupted,
-        )
+        return collector.result(content, interrupted=interrupted)
 
     def stream(
         self,
@@ -550,22 +575,13 @@ class Enkiball:
         :class:`ChatResult`.
         """
         tokens: list[str] = []
-        tool_calls_log: list[dict[str, Any]] = []
-        thinking_parts: list[str] = []
+        collector = _ChatResultCollector(self._on_tool_event)
         _q: queue.Queue[str] = queue.Queue()
         _sentinel = object()
 
         def _on_token(tok: str) -> None:
             _q.put(tok)
             tokens.append(tok)
-
-        def _on_tool(event: str) -> None:
-            tool_calls_log.append({"raw": event})
-            if self._on_tool_event:
-                self._on_tool_event(event)
-
-        def _on_thinking(text: str) -> None:
-            thinking_parts.append(text)
 
         result_box: list[str] = []
         exc_box: list[Exception] = []
@@ -577,8 +593,8 @@ class Enkiball:
                     user_input=message,
                     image_paths=images,
                     on_token=_on_token,
-                    on_tool_event=_on_tool,
-                    on_thinking=_on_thinking,
+                    on_tool_event=collector.on_tool,
+                    on_thinking=collector.on_thinking,
                     on_retry=on_retry,
                     system_context=system_context,
                     should_stop=should_stop,
@@ -604,12 +620,7 @@ class Enkiball:
             raise exc_box[0]
 
         content = result_box[0] if result_box else "".join(tokens)
-        return ChatResult(
-            content=content,
-            tool_calls=tool_calls_log,
-            thinking="".join(thinking_parts),
-            interrupted=interrupted_box[0],
-        )
+        return collector.result(content, interrupted=interrupted_box[0])
 
     # ========================================================================
     # Async conversation API
@@ -625,34 +636,20 @@ class Enkiball:
         should_stop: Callable[[], bool] | None = None,
     ) -> ChatResult:
         """Async version of :meth:`chat`.  Collects the full reply then returns."""
-        tool_calls_log: list[dict[str, Any]] = []
-        thinking_parts: list[str] = []
-
-        def _on_tool(event: str) -> None:
-            tool_calls_log.append({"raw": event})
-            if self._on_tool_event:
-                self._on_tool_event(event)
-
-        def _on_thinking(text: str) -> None:
-            thinking_parts.append(text)
+        collector = _ChatResultCollector(self._on_tool_event)
 
         content = await self._engine.astream_reply(
             user_input=message,
             image_paths=images,
             on_token=lambda _: None,
-            on_tool_event=_on_tool,
-            on_thinking=_on_thinking,
+            on_tool_event=collector.on_tool,
+            on_thinking=collector.on_thinking,
             on_retry=on_retry,
             system_context=system_context,
             should_stop=should_stop,
         )
         interrupted = should_stop() if should_stop else False
-        return ChatResult(
-            content=content,
-            tool_calls=tool_calls_log,
-            thinking="".join(thinking_parts),
-            interrupted=interrupted,
-        )
+        return collector.result(content, interrupted=interrupted)
 
     async def astream(
         self,
@@ -675,21 +672,12 @@ class Enkiball:
         via :attr:`history`.  To capture them live, use
         :meth:`astream_events` instead.
         """
-        tool_calls_log: list[dict[str, Any]] = []
-        thinking_parts: list[str] = []
+        collector = _ChatResultCollector(self._on_tool_event)
         q: asyncio.Queue[str | object] = asyncio.Queue()
         sentinel: object = object()
 
         async def _on_token(tok: str) -> None:
             await q.put(tok)
-
-        def _on_tool(event: str) -> None:
-            tool_calls_log.append({"raw": event})
-            if self._on_tool_event:
-                self._on_tool_event(event)
-
-        def _on_thinking(text: str) -> None:
-            thinking_parts.append(text)
 
         async def _run() -> None:
             try:
@@ -697,8 +685,8 @@ class Enkiball:
                     user_input=message,
                     image_paths=images,
                     on_token=_on_token,
-                    on_tool_event=_on_tool,
-                    on_thinking=_on_thinking,
+                    on_tool_event=collector.on_tool,
+                    on_thinking=collector.on_thinking,
                     on_retry=on_retry,
                     system_context=system_context,
                     should_stop=should_stop,
@@ -746,8 +734,7 @@ class Enkiball:
         Use this when you need live access to thinking/tool events, not just
         content tokens.
         """
-        tool_calls_log: list[dict[str, Any]] = []
-        thinking_parts: list[str] = []
+        collector = _ChatResultCollector(self._on_tool_event)
         tokens: list[str] = []
         q: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
         sentinel: object = object()
@@ -757,13 +744,11 @@ class Enkiball:
             await q.put({"type": "token", "data": tok})
 
         async def _on_tool(event: str) -> None:
-            tool_calls_log.append({"raw": event})
-            if self._on_tool_event:
-                self._on_tool_event(event)
+            collector.on_tool(event)
             await q.put({"type": "tool", "data": event})
 
         async def _on_thinking(text: str) -> None:
-            thinking_parts.append(text)
+            collector.on_thinking(text)
             await q.put({"type": "thinking", "data": text})
 
         async def _on_retry(event: RetryEvent) -> None:
@@ -810,12 +795,7 @@ class Enkiball:
         interrupted = bool(should_stop and should_stop())
         yield {
             "type": "done",
-            "data": ChatResult(
-                content=content,
-                tool_calls=tool_calls_log,
-                thinking="".join(thinking_parts),
-                interrupted=interrupted,
-            ),
+            "data": collector.result(content, interrupted=interrupted),
         }
 
     async def acompact(
@@ -929,26 +909,16 @@ class Enkiball:
     # Session management (optional – requires explicit init)
     # ========================================================================
 
-    def init_session_store(
-        self,
-        base_dir: str | Path = "data/sessions",
-        export_dir: str | Path = "data/exports",
-    ) -> SessionStore:
-        """Initialize session persistence. Returns the SessionStore."""
-        self._session_store = SessionStore(
-            base_dir=Path(base_dir),
-            export_dir=Path(export_dir),
-        )
+    def init_session_store(self) -> SessionStore:
+        """Return the session store initialized by the constructor."""
         return self._session_store
 
     @property
-    def session_store(self) -> SessionStore | None:
+    def session_store(self) -> SessionStore:
         return self._session_store
 
     def save_session(self, name: str | None = None) -> SessionRecord | None:
         """Save current conversation to a session file."""
-        if not self._session_store:
-            return None
         if not self._session_store.current_session_id:
             self._session_store.begin_new(
                 name=name,
@@ -959,10 +929,6 @@ class Enkiball:
 
     def load_session(self, session_id: str) -> SessionRecord:
         """Load a session and restore its messages into the engine."""
-        if not self._session_store:
-            raise RuntimeError(
-                "Session store not initialized. Call init_session_store() first."
-            )
         record = self._session_store.load(session_id)
         self._session_store.switch_to(record)
         self._engine.load_messages(record.messages)
@@ -970,8 +936,6 @@ class Enkiball:
 
     def list_sessions(self) -> list[SessionRecord]:
         """List all persisted sessions."""
-        if not self._session_store:
-            return []
         return self._session_store.list_sessions()
 
     # ========================================================================

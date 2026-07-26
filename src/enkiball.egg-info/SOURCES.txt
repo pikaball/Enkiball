@@ -3,12 +3,15 @@ pyproject.toml
 src/enkiball/__init__.py
 src/enkiball/agent.py
 src/enkiball/cli.py
+src/enkiball/cli_renderer.py
 src/enkiball/commands.py
 src/enkiball/config.py
 src/enkiball/llm.py
 src/enkiball/llm_tools.py
 src/enkiball/mcp.py
 src/enkiball/mcp_client.py
+src/enkiball/message_codec.py
+src/enkiball/sandbox.py
 src/enkiball/session_store.py
 src/enkiball/tools.py
 src/enkiball.egg-info/PKG-INFO
@@ -17,3 +20,6 @@ src/enkiball.egg-info/dependency_links.txt
 src/enkiball.egg-info/entry_points.txt
 src/enkiball.egg-info/requires.txt
 src/enkiball.egg-info/top_level.txt
+tests/test_cli_renderer.py
+tests/test_edit_tool.py
+tests/test_sandbox.py

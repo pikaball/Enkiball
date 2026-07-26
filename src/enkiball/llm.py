@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import mimetypes
-import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -23,7 +22,14 @@ from .config import (
     set_active_model,
 )
 from .llm_tools import TOOL_SCHEMAS, dispatch_tool
+from .message_codec import (
+    build_user_content,
+    default_messages,
+    extract_user_content,
+    prepare_messages_for_api,
+)
 from .mcp import MCPManager
+from .sandbox import Sandbox
 
 
 SYSTEM_PROMPT = (
@@ -41,14 +47,10 @@ DEFAULT_COMPACT_PROMPT = (
 )
 
 DEFAULT_AUTO_COMPACT_THRESHOLD_RATIO = 0.7
-DEFAULT_ENDPOINT_MAX_TOKENS = 1_000_000
+DEFAULT_ENDPOINT_MAX_TOKENS = 300000
+TOOL_CALL_LIMIT = 256
 MAX_REQUEST_RETRIES = 10
 REQUEST_RETRY_DELAYS = (3, 5, 10, 30, 60, 120, 180)
-
-
-def _default_messages() -> list[dict[str, Any]]:
-    return [{"role": "system", "content": SYSTEM_PROMPT}]
-
 
 @dataclass
 class TokenUsage:
@@ -126,10 +128,14 @@ class LiveSnapshot:
 
 class ChatEngine:
     def __init__(
-        self, config: dict[str, Any], mcp_manager: MCPManager | None = None
+        self,
+        config: dict[str, Any],
+        mcp_manager: MCPManager | None = None,
+        sandbox: Sandbox | None = None,
     ) -> None:
         self.config = config
         self.mcp_manager = mcp_manager
+        self.sandbox = sandbox or Sandbox()
         # Use system prompt from config if set, otherwise use default
         prompt = get_system_prompt(config) or SYSTEM_PROMPT
         self._system_prompt = prompt
@@ -151,7 +157,7 @@ class ChatEngine:
         self.auto_compact_prompt: str | None = compact_cfg.get("prompt") or None
         self._extra_tools: list[dict[str, Any]] = []
         # Custom tool handlers: name -> callable(args_dict) -> str
-        self._tool_handlers: dict[str, Callable[[dict[str, Any]], str]] = {}
+        self._tool_handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
         self.compact_index: int = 0
 
         # Live streaming buffer — updated incrementally during stream_reply /
@@ -356,8 +362,56 @@ class ChatEngine:
             tools.extend(self.mcp_manager.get_tools())
         return tools
 
+    @staticmethod
+    def _tool_schema_name(schema: dict[str, Any], fallback: str = "") -> str:
+        if schema.get("type") == "function":
+            fn_block = schema.get("function", {})
+            if isinstance(fn_block, dict):
+                return str(fn_block.get("name", fallback))
+        return fallback
+
+    def set_extra_tools(self, schemas: list[dict[str, Any]]) -> None:
+        self._extra_tools = list(schemas)
+
+    def register_tool(
+        self,
+        name: str,
+        schema: dict[str, Any],
+        handler: Callable[[dict[str, Any]], Any],
+    ) -> str:
+        tool_name = self._tool_schema_name(schema, name)
+        self.unregister_tool(tool_name)
+        self._extra_tools.append(schema)
+        self._tool_handlers[tool_name] = handler
+        return tool_name
+
+    def unregister_tool(self, name: str) -> bool:
+        existed = name in self._tool_handlers
+        self._tool_handlers.pop(name, None)
+        self._extra_tools = [
+            schema
+            for schema in self._extra_tools
+            if self._tool_schema_name(schema) != name
+        ]
+        return existed
+
+    def list_custom_tools(self) -> list[str]:
+        return list(self._tool_handlers.keys())
+
+    @property
+    def system_prompt(self) -> str:
+        first = self.messages[0] if self.messages else {}
+        return str(first.get("content", self._system_prompt))
+
+    def set_system_prompt(self, prompt: str) -> None:
+        self._system_prompt = prompt
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = prompt
+            return
+        self.messages.insert(0, {"role": "system", "content": prompt})
+
     def reset_messages(self) -> None:
-        self.messages = [{"role": "system", "content": self._system_prompt}]
+        self.messages = default_messages(self._system_prompt)
         self.compact_index = 0
 
     def load_messages(self, messages: list[dict[str, Any]]) -> None:
@@ -368,7 +422,7 @@ class ChatEngine:
         ):
             self.messages = messages
         else:
-            self.messages = _default_messages() + messages
+            self.messages = default_messages(self._system_prompt) + messages
         # Scan for the last compact marker to restore compact_index
         self.compact_index = 0
         for i, msg in enumerate(self.messages):
@@ -390,91 +444,8 @@ class ChatEngine:
         target.write_bytes(raw)
         return str(target)
 
-    @staticmethod
-    def _extract_user_content(content: Any) -> tuple[str, list[str]]:
-        if isinstance(content, str):
-            return content, []
-        if not isinstance(content, list):
-            return str(content), []
-        texts: list[str] = []
-        images: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            part_type = item.get("type")
-            if part_type == "text":
-                texts.append(str(item.get("text", "")))
-            elif part_type == "input_image":
-                path = item.get("path")
-                if isinstance(path, str) and path:
-                    images.append(path)
-        return "".join(texts), images
-
-    @staticmethod
-    def _build_user_content(
-        user_text: str, image_paths: list[str]
-    ) -> str | list[dict[str, Any]]:
-        normalized = [str(Path(p).expanduser().resolve()) for p in image_paths]
-        if not normalized:
-            return user_text
-        parts: list[dict[str, Any]] = []
-        if user_text:
-            parts.append({"type": "text", "text": user_text})
-        for path in normalized:
-            parts.append({"type": "input_image", "path": path})
-        return parts
-
-    @staticmethod
-    def _image_path_to_data_url(path: str) -> str:
-        fp = Path(path).expanduser().resolve()
-        if not fp.exists():
-            raise FileNotFoundError(f"Image not found: {fp}")
-        if not fp.is_file():
-            raise IsADirectoryError(f"Not a file: {fp}")
-        mime, _ = mimetypes.guess_type(str(fp))
-        if not mime:
-            mime = "application/octet-stream"
-        payload = base64.b64encode(fp.read_bytes()).decode("ascii")
-        return f"data:{mime};base64,{payload}"
-
-    @classmethod
-    def _prepare_content_for_api(cls, content: Any) -> Any:
-        if not isinstance(content, list):
-            return content
-        out: list[dict[str, Any]] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = part.get("type")
-            if part_type == "input_image":
-                path = part.get("path")
-                if not isinstance(path, str) or not path:
-                    continue
-                out.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": cls._image_path_to_data_url(path)},
-                    }
-                )
-            elif part_type == "text":
-                out.append({"type": "text", "text": str(part.get("text", ""))})
-            else:
-                out.append(part)
-        return out
-
     def _prepare_messages_for_api(self) -> list[dict[str, Any]]:
-        # Only send messages from compact_index onwards to the LLM
-        source = self.messages[self.compact_index :]
-        source = self._drop_orphan_tool_call_messages(source)
-        prepared: list[dict[str, Any]] = []
-        for msg in source:
-            item = dict(msg)
-            # Strip internal metadata keys
-            item.pop("_compact", None)
-            item.pop("_usage", None)
-            item["content"] = self._prepare_content_for_api(item.get("content", ""))
-            prepared.append(item)
-        return prepared
+        return prepare_messages_for_api(self.messages[self.compact_index :])
 
     @staticmethod
     def _prepare_history_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -484,72 +455,7 @@ class ChatEngine:
         lists (compact) and preserves provider-required keys like
         reasoning_content.
         """
-        prepared: list[dict[str, Any]] = []
-        for msg in ChatEngine._drop_orphan_tool_call_messages(messages):
-            item = dict(msg)
-            item.pop("_compact", None)
-            item.pop("_usage", None)
-            item["content"] = ChatEngine._prepare_content_for_api(item.get("content", ""))
-            prepared.append(item)
-        return prepared
-
-    @staticmethod
-    def _drop_orphan_tool_call_messages(
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Remove incomplete assistant/tool-call groups before API replay.
-
-        OpenAI-compatible APIs require every assistant message containing
-        ``tool_calls`` to be immediately followed by one tool message for each
-        ``tool_call_id``.  If an earlier run was interrupted or a session was
-        saved mid-turn, history can contain an orphan assistant tool-call
-        message.  Rather than failing every future request, drop that incomplete
-        assistant message and any partial following tool messages.
-        """
-        out: list[dict[str, Any]] = []
-        i = 0
-        while i < len(messages):
-            msg = messages[i]
-            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
-                # Stray tool messages without a valid preceding assistant
-                # tool_call are also invalid for replay.
-                if msg.get("role") != "tool":
-                    out.append(msg)
-                i += 1
-                continue
-
-            tool_calls = msg.get("tool_calls") or []
-            expected_ids = [
-                str(tc.get("id", ""))
-                for tc in tool_calls
-                if isinstance(tc, dict) and tc.get("id")
-            ]
-            if not expected_ids:
-                # Malformed tool_calls block. Drop it instead of replaying an
-                # invalid assistant message.
-                i += 1
-                continue
-
-            group = [msg]
-            j = i + 1
-            found: set[str] = set()
-            valid = True
-            while j < len(messages) and messages[j].get("role") == "tool":
-                tool_msg = messages[j]
-                tool_call_id = str(tool_msg.get("tool_call_id", ""))
-                if tool_call_id not in expected_ids or tool_call_id in found:
-                    valid = False
-                else:
-                    found.add(tool_call_id)
-                    group.append(tool_msg)
-                j += 1
-
-            if valid and found == set(expected_ids):
-                out.extend(group)
-            # If invalid/incomplete, drop assistant and all immediately
-            # following tool messages in that group.
-            i = j
-        return out
+        return prepare_messages_for_api(messages)
 
     def revert_user_turns(self, steps: int = 1) -> tuple[int, str | None, list[str]]:
         if steps < 1:
@@ -567,10 +473,10 @@ class ChatEngine:
                 break
             removed_user = self.messages[user_idx].get("content", "")
             self.messages = self.messages[:user_idx]
-            prefill, restored_images = self._extract_user_content(removed_user)
+            prefill, restored_images = extract_user_content(removed_user)
             reverted += 1
         if not self.messages:
-            self.messages = _default_messages()
+            self.messages = default_messages(self._system_prompt)
         return reverted, prefill, restored_images
 
     def fork_at_turn(self, user_turn_index: int) -> list[dict[str, Any]]:
@@ -646,7 +552,7 @@ class ChatEngine:
                 return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
         if not name.startswith("mcp__"):
-            return dispatch_tool(name, args)
+            return dispatch_tool(name, args, self.sandbox)
         if not self.mcp_manager:
             return json.dumps(
                 {"ok": False, "error": "MCP manager not initialized"},
@@ -785,7 +691,7 @@ class ChatEngine:
             "model": self.model,
             "messages": temp_msgs,
             "temperature": model_params.get("temperature", 0.2),
-            "max_tokens": model_params.get("max_tokens", 65536),
+            "max_tokens": model_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -856,7 +762,7 @@ class ChatEngine:
         system_context: str | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
-        content = self._build_user_content(user_input, image_paths or [])
+        content = build_user_content(user_input, image_paths or [])
         if system_context:
             self.messages.append({"role": "system", "content": system_context})
         self.messages.append({"role": "user", "content": content})
@@ -882,7 +788,7 @@ class ChatEngine:
                 on_tool_event(ev)
 
         try:
-            for _ in range(64):
+            for _ in range(TOOL_CALL_LIMIT):
                 if self._should_stop(should_stop):
                     return ""
                 current_tools = self._get_tools()
@@ -895,7 +801,7 @@ class ChatEngine:
                     "model": self.model,
                     "messages": self._prepare_messages_for_api(),
                     "temperature": llm_params.get("temperature", 1),
-                    "max_tokens": llm_params.get("max_tokens", 1000000),
+                    "max_tokens": llm_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
                     "stream": True,
                     "stream_options": {"include_usage": True},
                 }
@@ -1084,7 +990,7 @@ class ChatEngine:
             "model": self.model,
             "messages": temp_msgs,
             "temperature": model_params.get("temperature", 0.2),
-            "max_tokens": model_params.get("max_tokens", 65536),
+            "max_tokens": model_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -1167,7 +1073,7 @@ class ChatEngine:
     ) -> str:
         """Async counterpart of :meth:`stream_reply`.  Callbacks may be
         either plain functions or coroutine functions."""
-        content = self._build_user_content(user_input, image_paths or [])
+        content = build_user_content(user_input, image_paths or [])
         if system_context:
             self.messages.append({"role": "system", "content": system_context})
         self.messages.append({"role": "user", "content": content})
@@ -1198,7 +1104,7 @@ class ChatEngine:
             await _maybe_await(on_tool_event, ev)
 
         try:
-            for _ in range(64):
+            for _ in range(TOOL_CALL_LIMIT):
                 if self._should_stop(should_stop):
                     return ""
                 current_tools = self._get_tools()
@@ -1211,7 +1117,7 @@ class ChatEngine:
                     "model": self.model,
                     "messages": self._prepare_messages_for_api(),
                     "temperature": llm_params.get("temperature", 0.2),
-                    "max_tokens": llm_params.get("max_tokens", 65536),
+                    "max_tokens": llm_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
                     "stream": True,
                     "stream_options": {"include_usage": True},
                 }
