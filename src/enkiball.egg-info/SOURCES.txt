@@ -11,6 +11,7 @@ src/enkiball/llm_tools.py
 src/enkiball/mcp.py
 src/enkiball/mcp_client.py
 src/enkiball/message_codec.py
+src/enkiball/persistence.py
 src/enkiball/sandbox.py
 src/enkiball/session_store.py
 src/enkiball/tools.py
@@ -22,4 +23,8 @@ src/enkiball.egg-info/requires.txt
 src/enkiball.egg-info/top_level.txt
 tests/test_cli_renderer.py
 tests/test_edit_tool.py
+tests/test_foundation.py
+tests/test_mcp_sse.py
+tests/test_persistence.py
 tests/test_sandbox.py
+tests/test_session_history.py

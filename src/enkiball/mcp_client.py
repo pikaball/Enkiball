@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from queue import Empty, Queue
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -26,6 +26,14 @@ def _parse_sse_event_lines(lines: list[str]) -> tuple[str, str] | None:
     if not data_parts:
         return None
     return event_type, "\n".join(data_parts)
+
+
+def _url_origin(url: str) -> tuple[str, str | None, int | None]:
+    parsed = urlsplit(url)
+    default_ports = {"http": 80, "https": 443}
+    scheme = parsed.scheme.lower()
+    port = parsed.port if parsed.port is not None else default_ports.get(scheme)
+    return scheme, parsed.hostname, port
 
 
 class MCPClient(ABC):
@@ -369,10 +377,10 @@ class SSEMCPClient(MCPClient):
         event_type, data_str = parsed
 
         if event_type == "endpoint":
-            if "://" in data_str:
-                self.post_url = data_str
-            else:
-                self.post_url = urljoin(self.url, data_str)
+            post_url = urljoin(self.url, data_str)
+            if _url_origin(post_url) != _url_origin(self.url):
+                raise ValueError("MCP SSE endpoint must use the same origin as the SSE URL")
+            self.post_url = post_url
             self._endpoint_ready.set()
             return
 

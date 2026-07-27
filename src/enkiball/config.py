@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from .persistence import atomic_write_json
+
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "enkiball" / "enki.json"
 DEFAULT_STATE_PATH = Path.home() / ".config" / "enkiball" / "state.json"
 
@@ -30,10 +32,7 @@ def load_state(path: Path = DEFAULT_STATE_PATH) -> dict[str, Any]:
 
 def save_state(state: dict[str, Any], path: Path = DEFAULT_STATE_PATH) -> None:
     """Persist the runtime state (active_provider, active_model, etc.)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    atomic_write_json(path, state)
 
 
 # -- Load / save -------------------------------------------------------------
@@ -84,16 +83,16 @@ def _migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
             provider_entry["models"] = {model: model_params}
 
         new: dict[str, Any] = {
-            "providers": {provider_name: provider_entry},
-            # active_provider/active_model will be migrated to state.json
-            # by load_config after _migrate_config runs
-            "active_provider": provider_name,
-            "active_model": model,
+            key: value for key, value in raw.items() if key != "llm"
         }
-        if "mcp" in raw:
-            new["mcp"] = raw["mcp"]
-        if "system_prompt" in raw:
-            new["system_prompt"] = raw["system_prompt"]
+        new.update(
+            {
+                "providers": {provider_name: provider_entry},
+                # These fields are moved to state.json by load_config.
+                "active_provider": provider_name,
+                "active_model": model,
+            }
+        )
         return new
 
     # Migrate models from list to dict if needed
@@ -143,10 +142,7 @@ def load_config(
 
 
 def save_config(config: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    atomic_write_json(path, config)
 
 
 # -- Provider helpers --------------------------------------------------------
@@ -204,14 +200,16 @@ def set_active_model(
 
 
 def get_model_params(
-    config: dict[str, Any], model: str | None = None
+    config: dict[str, Any],
+    model: str | None = None,
+    state_path: Path = DEFAULT_STATE_PATH,
 ) -> dict[str, Any]:
     """Return per-model parameters (temperature, max_tokens, etc.) for the given model.
 
     Falls back to empty dict for models not defined in config (e.g. remote-only).
     """
-    model = model or get_active_model(config)
-    provider_name = get_active_provider(config)
+    model = model or get_active_model(config, state_path)
+    provider_name = get_active_provider(config, state_path)
     prov = config.get("providers", {}).get(provider_name, {})
     models = prov.get("models", {})
     if isinstance(models, dict):
@@ -219,12 +217,14 @@ def get_model_params(
     return {}
 
 
-def resolve_provider_credentials(config: dict[str, Any]) -> tuple[str, str]:
+def resolve_provider_credentials(
+    config: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH
+) -> tuple[str, str]:
     """Return (api_key, base_url) for the active provider.
 
     Reads directly from the provider entry in config — no env vars.
     """
-    provider_name = get_active_provider(config)
+    provider_name = get_active_provider(config, state_path)
     prov = config.get("providers", {}).get(provider_name, {})
     api_key = str(prov.get("api_key", "")).strip()
     base_url = str(prov.get("base_url", "")).strip()
@@ -285,12 +285,13 @@ def get_provider_models(
     *,
     remote: bool = True,
     timeout: float = 5.0,
+    state_path: Path = DEFAULT_STATE_PATH,
 ) -> list[str]:
     """Return merged model list for a provider: config-defined + remote.
 
     Config-defined models appear first, followed by remote-only models sorted.
     """
-    name = provider_name or get_active_provider(config)
+    name = provider_name or get_active_provider(config, state_path)
     prov = config.get("providers", {}).get(name, {})
     models = prov.get("models", {})
     config_models: list[str] = (

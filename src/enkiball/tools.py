@@ -5,6 +5,13 @@ import stat
 import tempfile
 from pathlib import Path
 
+MAX_FILE_BYTES = 10_000_000
+
+
+def _check_file_size(target: Path) -> None:
+    if target.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError(f"File exceeds {MAX_FILE_BYTES} byte limit: {target}")
+
 
 def read_file(path: str) -> str:
     target = Path(path).expanduser().resolve()
@@ -12,11 +19,16 @@ def read_file(path: str) -> str:
         raise FileNotFoundError(f"File not found: {target}")
     if not target.is_file():
         raise IsADirectoryError(f"Not a file: {target}")
+    _check_file_size(target)
     return target.read_text(encoding="utf-8")
 
 
 def write_file(path: str, content: str, append: bool = False) -> str:
     target = Path(path).expanduser().resolve()
+    content_size = len(content.encode("utf-8"))
+    existing_size = target.stat().st_size if append and target.exists() else 0
+    if existing_size + content_size > MAX_FILE_BYTES:
+        raise ValueError(f"Write exceeds {MAX_FILE_BYTES} byte limit: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if append else "w"
     with target.open(mode, encoding="utf-8") as f:
@@ -35,6 +47,7 @@ def edit_file(
         raise FileNotFoundError(f"File not found: {target}")
     if not target.is_file():
         raise IsADirectoryError(f"Not a file: {target}")
+    _check_file_size(target)
     if old_text == "":
         raise ValueError("old_text must not be empty")
     if old_text == new_text:

@@ -7,8 +7,8 @@ import unittest
 from pathlib import Path
 
 from enkiball.llm_tools import TOOL_SCHEMAS, dispatch_tool
-from enkiball.sandbox import Sandbox
-from enkiball.tools import edit_file
+from enkiball.sandbox import Sandbox, TurnInterrupted
+from enkiball.tools import MAX_FILE_BYTES, edit_file, read_file, write_file
 
 
 class EditFileTests(unittest.TestCase):
@@ -69,6 +69,18 @@ class EditFileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be different"):
             edit_file(str(self.path), "content", "content")
 
+    def test_file_tools_reject_oversized_content(self) -> None:
+        self.path.write_bytes(b"x" * (MAX_FILE_BYTES + 1))
+
+        with self.assertRaisesRegex(ValueError, "byte limit"):
+            read_file(str(self.path))
+        with self.assertRaisesRegex(ValueError, "byte limit"):
+            edit_file(str(self.path), "x", "y")
+
+    def test_write_rejects_result_over_size_limit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "byte limit"):
+            write_file(str(self.path), "x" * (MAX_FILE_BYTES + 1))
+
 
 class EditDispatchTests(unittest.TestCase):
     def test_schema_is_registered_once(self) -> None:
@@ -120,6 +132,19 @@ class EditDispatchTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("path must be a string", result["error"])
+
+    def test_dispatch_does_not_serialize_turn_interrupt(self) -> None:
+        sandbox = Sandbox(cwd=Path.cwd(), approval=True)
+        sandbox.set_approval_handler(
+            lambda path, operation: (_ for _ in ()).throw(TurnInterrupted())
+        )
+
+        with self.assertRaises(TurnInterrupted):
+            dispatch_tool(
+                "read_file",
+                {"path": "/definitely/outside/workspace"},
+                sandbox,
+            )
 
 
 if __name__ == "__main__":

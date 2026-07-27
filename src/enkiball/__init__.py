@@ -11,19 +11,21 @@ Public API::
 
 from .agent import ChatResult, Enkiball
 from .cli import EnkiballCLI
-from .commands import CommandHandler
-from .llm import DEFAULT_COMPACT_PROMPT, LiveSnapshot, RetryEvent, TokenUsage
+from .commands import CommandContext, CommandHandler
+from .llm import DEFAULT_COMPACT_PROMPT, LiveSnapshot, RetryEvent, TokenUsage, TurnContext
 from .session_store import SessionRecord, SessionStore
 
 __all__ = [
     "Enkiball",
     "EnkiballCLI",
     "CommandHandler",
+    "CommandContext",
     "ChatResult",
     "LiveSnapshot",
     "RetryEvent",
     "DEFAULT_COMPACT_PROMPT",
     "TokenUsage",
+    "TurnContext",
     "SessionRecord",
     "SessionStore",
 ]

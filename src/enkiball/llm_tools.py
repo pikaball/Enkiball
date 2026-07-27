@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
-from .sandbox import Sandbox
+from .sandbox import Sandbox, TurnInterrupted
 from .tools import edit_file, read_file, write_file
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -90,6 +91,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "maximum": 600,
                         "default": 120,
                     },
+                    "privilleged": {
+                        "type": "boolean",
+                        "description": (
+                            "Request one-time approval to run directly on the host "
+                            "without sandbox isolation."
+                        ),
+                        "default": False,
+                    },
                 },
                 "required": ["command"],
                 "additionalProperties": False,
@@ -99,11 +108,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 
-def dispatch_tool(name: str, args: dict[str, Any], sandbox: Sandbox | None = None) -> str:
+def dispatch_tool(
+    name: str,
+    args: dict[str, Any],
+    sandbox: Sandbox | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str:
     sandbox = sandbox or Sandbox()
     try:
+        if not isinstance(args, dict):
+            raise TypeError("tool arguments must be an object")
         if name == "read_file":
-            target = sandbox.resolve_path(str(args["path"]), "read")
+            path = args.get("path")
+            if not isinstance(path, str):
+                raise TypeError("path must be a string")
+            target = sandbox.resolve_path(path, "read")
             content = read_file(str(target))
             # Keep tool payload bounded for model context hygiene.
             if len(content) > 20000:
@@ -111,11 +130,20 @@ def dispatch_tool(name: str, args: dict[str, Any], sandbox: Sandbox | None = Non
             return json.dumps({"ok": True, "content": content}, ensure_ascii=False)
 
         if name == "write_file":
-            target_path = sandbox.resolve_path(str(args["path"]), "write")
+            path = args.get("path")
+            content_arg = args.get("content")
+            append = args.get("append", False)
+            if not isinstance(path, str):
+                raise TypeError("path must be a string")
+            if not isinstance(content_arg, str):
+                raise TypeError("content must be a string")
+            if not isinstance(append, bool):
+                raise TypeError("append must be a boolean")
+            target_path = sandbox.resolve_path(path, "write")
             target = write_file(
                 path=str(target_path),
-                content=str(args["content"]),
-                append=bool(args.get("append", False)),
+                content=content_arg,
+                append=append,
             )
             return json.dumps({"ok": True, "path": target}, ensure_ascii=False)
 
@@ -139,9 +167,20 @@ def dispatch_tool(name: str, args: dict[str, Any], sandbox: Sandbox | None = Non
             )
 
         if name == "run_command":
-            timeout_sec = int(args.get("timeout_sec", 120))
+            command = args.get("command")
+            timeout_sec = args.get("timeout_sec", 120)
+            privileged = args.get("privilleged", False)
+            if not isinstance(command, str):
+                raise TypeError("command must be a string")
+            if isinstance(timeout_sec, bool) or not isinstance(timeout_sec, int):
+                raise TypeError("timeout_sec must be an integer")
+            if not isinstance(privileged, bool):
+                raise TypeError("privilleged must be a boolean")
             code, out, err = sandbox.run(
-                command=str(args["command"]), timeout_sec=timeout_sec
+                command=command,
+                timeout_sec=timeout_sec,
+                privileged=privileged,
+                cancel_event=cancel_event,
             )
             if len(out) > 12000:
                 out = out[:12000] + "\n...[truncated]"
@@ -151,6 +190,8 @@ def dispatch_tool(name: str, args: dict[str, Any], sandbox: Sandbox | None = Non
                 {"ok": True, "exit_code": code, "stdout": out, "stderr": err},
                 ensure_ascii=False,
             )
+    except TurnInterrupted:
+        raise
     except Exception as e:  # noqa: BLE001
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 

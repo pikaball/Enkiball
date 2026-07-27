@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+
+from .persistence import atomic_write_json
 
 _CONFIG_BASE = Path.home() / ".config" / "enkiball"
 SESSION_DIR = _CONFIG_BASE / "sessions"
 EXPORT_DIR = _CONFIG_BASE / "exports"
+_SESSION_ID_PATTERN = re.compile(r"^[\w-]+$")
 
 
 def _now_iso() -> str:
@@ -76,13 +81,7 @@ class SessionStore:
 
     def _generate_session_id(self, display_name: str) -> str:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        base_id = f"{ts}-{_safe_name(display_name)}"
-        session_id = base_id
-        suffix = 1
-        while self._path(session_id).exists():
-            suffix += 1
-            session_id = f"{base_id}-{suffix}"
-        return session_id
+        return f"{ts}-{_safe_name(display_name)}-{uuid4().hex[:8]}"
 
     def begin_new(
         self,
@@ -107,7 +106,15 @@ class SessionStore:
         return record
 
     def _path(self, session_id: str) -> Path:
-        return self.base_dir / f"{session_id}.json"
+        if not isinstance(session_id, str) or not _SESSION_ID_PATTERN.fullmatch(
+            session_id
+        ):
+            raise ValueError(f"invalid session id: {session_id!r}")
+        base_dir = self.base_dir.resolve()
+        path = (base_dir / f"{session_id}.json").resolve()
+        if path.parent != base_dir:
+            raise ValueError(f"session path escapes session directory: {session_id!r}")
+        return path
 
     def list_sessions(self) -> list[SessionRecord]:
         out: list[SessionRecord] = []
@@ -144,10 +151,7 @@ class SessionStore:
     def save(self, record: SessionRecord) -> None:
         record.updated_at = _now_iso()
         fp = self._path(record.session_id)
-        fp.write_text(
-            json.dumps(record.to_dict(), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(fp, record.to_dict())
 
     def rename_current(self, name: str) -> bool:
         cleaned = name.strip()

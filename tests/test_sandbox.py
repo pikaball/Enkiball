@@ -5,11 +5,22 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from enkiball.cli import _parse_args
+from prompt_toolkit import PromptSession
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
+
+from enkiball.cli import (
+    _build_approval_key_bindings,
+    _parse_args,
+    _prompt_approval,
+    main,
+)
 from enkiball.llm import ChatEngine
 from enkiball.llm_tools import dispatch_tool
 from enkiball.sandbox import (
@@ -17,6 +28,7 @@ from enkiball.sandbox import (
     PermissionDeniedError,
     Sandbox,
     SandboxUnavailableError,
+    TurnInterrupted,
 )
 
 
@@ -66,6 +78,39 @@ class DirectoryPermissionTests(unittest.TestCase):
 
         self.assertEqual(requests, [(Path(self.external.name), "write")])
 
+    def test_approve_once_does_not_grant_directory_for_session(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, approval=True)
+        sandbox.set_approval_handler(lambda path, operation: "once")
+        first = Path(self.external.name) / "first.txt"
+
+        sandbox.resolve_path(first, "read")
+        sandbox.set_approval_handler(lambda path, operation: "deny")
+
+        with self.assertRaises(PermissionDeniedError):
+            sandbox.resolve_path(Path(self.external.name) / "second.txt", "read")
+
+    def test_read_approval_does_not_grant_write_access(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, approval=True)
+        sandbox.set_approval_handler(lambda path, operation: "always")
+        target = Path(self.external.name) / "file.txt"
+
+        sandbox.resolve_path(target, "read")
+        sandbox.set_approval_handler(lambda path, operation: "deny")
+
+        self.assertIn(Path(self.external.name), sandbox.read_only_directories)
+        with self.assertRaises(PermissionDeniedError):
+            sandbox.resolve_path(target, "write")
+
+    def test_write_approval_also_grants_read_access(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, approval=True)
+        sandbox.set_approval_handler(lambda path, operation: "always")
+        target = Path(self.external.name) / "file.txt"
+
+        sandbox.resolve_path(target, "write")
+        sandbox.set_approval_handler(lambda path, operation: "deny")
+
+        self.assertEqual(sandbox.resolve_path(target, "read"), target)
+
     def test_approval_without_frontend_fails_closed(self) -> None:
         sandbox = Sandbox(cwd=self.workspace.name, approval=True)
 
@@ -98,10 +143,22 @@ class DirectoryPermissionTests(unittest.TestCase):
 
 
 class CliPermissionTests(unittest.TestCase):
+    def _approval_from_input(self, data: str) -> str:
+        with create_pipe_input() as pipe_input:
+            session: PromptSession[str] = PromptSession(
+                multiline=False,
+                key_bindings=_build_approval_key_bindings(),
+                input=pipe_input,
+                output=DummyOutput(),
+            )
+            pipe_input.send_text(data)
+            return _prompt_approval(session)
+
     def test_cli_defaults_to_interactive_approval(self) -> None:
         args = _parse_args(["--cwd", "."])
 
         self.assertFalse(args.no_approval)
+        self.assertFalse(args.privilleged)
         self.assertEqual(args.dir_permission, [])
 
     def test_cli_accepts_repeated_directory_permissions(self) -> None:
@@ -117,6 +174,55 @@ class CliPermissionTests(unittest.TestCase):
 
         self.assertEqual(args.dir_permission, ["/first", "/second"])
         self.assertTrue(args.no_approval)
+
+    def test_cli_accepts_privilleged_mode(self) -> None:
+        args = _parse_args(["--privilleged"])
+
+        self.assertTrue(args.privilleged)
+
+    def test_cli_privilleged_mode_disables_sandbox_and_allows_root(self) -> None:
+        with patch("enkiball.cli.Enkiball") as agent_class:
+            with patch("enkiball.cli.EnkiballCLI") as cli_class:
+                main(["--cwd", ".", "--privilleged"])
+
+        kwargs = agent_class.call_args.kwargs
+        self.assertFalse(kwargs["sandbox"])
+        self.assertEqual(kwargs["dir_permissions"], [Path.cwd().anchor])
+        cli_class.return_value.run.assert_called_once_with()
+
+    def test_escape_immediately_interrupts_approval(self) -> None:
+        with self.assertRaises(TurnInterrupted):
+            self._approval_from_input("\x1b")
+
+    def test_approval_numeric_choices(self) -> None:
+        self.assertEqual(self._approval_from_input("1\n"), "once")
+        self.assertEqual(self._approval_from_input("2\n"), "always")
+        self.assertEqual(self._approval_from_input("3\n"), "deny")
+
+    def test_privileged_approval_only_allows_once_or_deny(self) -> None:
+        with create_pipe_input() as pipe_input:
+            session: PromptSession[str] = PromptSession(
+                multiline=False,
+                key_bindings=_build_approval_key_bindings(),
+                input=pipe_input,
+                output=DummyOutput(),
+            )
+            pipe_input.send_text("1\n")
+            self.assertEqual(_prompt_approval(session, privileged=True), "once")
+
+        with create_pipe_input() as pipe_input:
+            session = PromptSession(
+                multiline=False,
+                key_bindings=_build_approval_key_bindings(),
+                input=pipe_input,
+                output=DummyOutput(),
+            )
+            pipe_input.send_text("2\n")
+            self.assertEqual(_prompt_approval(session, privileged=True), "deny")
+
+    def test_control_c_keeps_prompt_toolkit_default_behavior(self) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            self._approval_from_input("\x03")
 
 
 @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is not installed")
@@ -158,6 +264,19 @@ class ExecSandboxTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stdout, "visible")
 
+    def test_read_only_directory_is_mounted_read_only(self) -> None:
+        secret = Path(self.external.name) / "data.txt"
+        secret.write_text("visible", encoding="utf-8")
+        sandbox = Sandbox(self.workspace.name, approval=True)
+        sandbox.set_approval_handler(lambda path, operation: "always")
+        sandbox.resolve_path(secret, "read")
+
+        code, stdout, _ = sandbox.run(f"cat {secret}; printf changed > {secret}")
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "visible")
+        self.assertEqual(secret.read_text(encoding="utf-8"), "visible")
+
     def test_network_is_unavailable(self) -> None:
         code, _, _ = self.sandbox.run(
             "python3 -c 'import socket; socket.create_connection((\"1.1.1.1\", 80), 1)'"
@@ -190,6 +309,139 @@ class ExecSandboxTests(unittest.TestCase):
         with patch("enkiball.sandbox.shutil.which", return_value=None):
             with self.assertRaises(SandboxUnavailableError):
                 self.sandbox.run("true")
+
+
+class HostExecTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workspace = tempfile.TemporaryDirectory()
+        self.external = tempfile.TemporaryDirectory()
+        self.addCleanup(self.workspace.cleanup)
+        self.addCleanup(self.external.cleanup)
+
+    def test_disabled_sandbox_runs_on_host_without_bubblewrap(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, sandbox=False)
+        target = Path(self.external.name) / "host.txt"
+
+        with patch.dict(os.environ, {"ENKIBALL_HOST_TEST": "inherited"}):
+            with patch(
+                "enkiball.sandbox.Sandbox._build_bwrap_command",
+                side_effect=AssertionError("bubblewrap must not be used"),
+            ):
+                code, stdout, stderr = sandbox.run(
+                    f"printf %s \"$ENKIBALL_HOST_TEST\"; printf host > {target}"
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, "inherited")
+        self.assertEqual(stderr, "")
+        self.assertEqual(target.read_text(encoding="utf-8"), "host")
+
+    def test_privileged_command_requires_one_time_approval(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, approval=True)
+        decisions = iter(("once", "deny"))
+        requests: list[tuple[Path, str]] = []
+        sandbox.set_approval_handler(
+            lambda path, operation: requests.append((path, operation))
+            or next(decisions)
+        )
+
+        code, stdout, _ = sandbox.run("printf first", privileged=True)
+        with self.assertRaises(PermissionDeniedError):
+            sandbox.run("printf second", privileged=True)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, "first")
+        self.assertEqual(
+            requests,
+            [
+                (Path(self.workspace.name), "privileged command"),
+                (Path(self.workspace.name), "privileged command"),
+            ],
+        )
+
+    def test_privileged_command_without_frontend_is_denied(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, approval=True)
+
+        with self.assertRaises(PermissionDeniedError):
+            sandbox.run("true", privileged=True)
+
+    def test_privileged_command_does_not_accept_always(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, approval=True)
+        sandbox.set_approval_handler(lambda path, operation: "always")
+
+        with self.assertRaises(PermissionDeniedError):
+            sandbox.run("true", privileged=True)
+
+    def test_dispatch_passes_privileged_flag(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name)
+        with patch.object(
+            sandbox,
+            "run",
+            return_value=(0, "ok", ""),
+        ) as run:
+            result = json.loads(
+                dispatch_tool(
+                    "run_command",
+                    {"command": "true", "privilleged": True},
+                    sandbox,
+                )
+            )
+
+        self.assertTrue(result["ok"])
+        run.assert_called_once_with(
+            command="true",
+            timeout_sec=120,
+            privileged=True,
+            cancel_event=None,
+        )
+
+    def test_cancel_event_kills_running_command(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, sandbox=False)
+        cancel_event = threading.Event()
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                sandbox.run("sleep 30", cancel_event=cancel_event)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        time.sleep(0.2)
+        cancel_event.set()
+        thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TurnInterrupted)
+
+    def test_dispatch_rejects_implicit_argument_coercion(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, sandbox=False)
+        cases = (
+            ("read_file", {"path": None}, "path must be a string"),
+            (
+                "write_file",
+                {"path": "x", "content": None},
+                "content must be a string",
+            ),
+            (
+                "write_file",
+                {"path": "x", "content": "x", "append": "false"},
+                "append must be a boolean",
+            ),
+            (
+                "run_command",
+                {"command": "true", "timeout_sec": "1"},
+                "timeout_sec must be an integer",
+            ),
+        )
+
+        for name, args, error in cases:
+            with self.subTest(name=name, args=args):
+                result = json.loads(dispatch_tool(name, args, sandbox))
+                self.assertFalse(result["ok"])
+                self.assertIn(error, result["error"])
 
 
 if __name__ == "__main__":

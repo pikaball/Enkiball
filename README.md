@@ -165,9 +165,11 @@ enkiball
 enkiball --cwd /path/to/project --dir-permission /path/to/shared
 ```
 
-CLI 默认在工具请求访问授权目录之外时询问用户，并在同意后授权该目录到当前进程结束。使用 `--no-approval` 可改为静默拒绝。`--dir-permission` 可以重复传入。
+CLI 默认在工具请求访问授权目录之外时提供 `once`、`always`、`deny` 三个选项。`once` 只放行当前请求，`always` 将目录授权到当前进程结束，`deny` 拒绝；按 `Esc` 会中断当前 LLM turn 并返回输入提示。使用 `--no-approval` 可改为静默拒绝。`--dir-permission` 可以重复传入。
 
 普通输入直接发送给 LLM，支持流式输出。按 `Ctrl+J` 换行，`Enter` 发送。`Esc` 中断当前输出。
+
+使用 `/session use` 或 `/session fork` 恢复历史时，CLI 会按实时对话相同的样式重绘 user、assistant、Markdown 表格和工具调用；历史 tool result 不会整段回显。
 
 ### 命令列表
 
@@ -268,18 +270,22 @@ agent = Enkiball(
     cwd=None,
     dir_permissions=None,
     approval=False,
+    sandbox=True,
+    state_path="~/.config/enkiball/state.json",
 )
 ```
 
 - `config_path` — 配置文件路径，默认 `~/.config/enkiball/enki.json`。
 - `system_prompt` — 覆盖配置文件中的 system prompt。
 - `auto_start_mcp` — 初始化时是否启动配置中 `enabled=true` 的 MCP server。
-- `extra_tools` — 直接注入的 OpenAI function tool schema 列表。
+- `extra_tools` — 保留兼容参数；非空值会拒绝。自定义工具必须通过 `register_tool()` 同时注册 schema 和 handler。
 - `on_tool_event` — 工具调用事件回调，签名为 `(event: str) -> None`。
 - `session_dir` — session JSON 文件存储目录。session 存储位置只允许通过这个构造参数自定义。
 - `cwd` — 内置文件和命令工具的工作目录，默认是创建 agent 时的当前目录。
 - `dir_permissions` — 内置工具可以额外访问的目录列表；相对路径以 `cwd` 为基准。
-- `approval` — 是否允许交互前端处理越界目录审批。API 没有绑定交互前端时仍会静默拒绝；CLI 默认绑定 yes/no 询问。
+- `approval` — 是否允许交互前端处理越界目录审批。API 没有绑定交互前端时仍会静默拒绝；CLI 提供 `once`、`always`、`deny` 三选项。
+- `sandbox` — 是否启用命令沙箱，默认 `True`；设为 `False` 时 `run_command` 直接继承宿主环境执行。
+- `state_path` — active provider/model 的独立状态文件。不同 harness 可传不同路径隔离运行状态。
 
 `Enkiball` 支持 context manager。退出 `with` 块时会调用 `shutdown()` 停止后台 executor 和 MCP server。
 
@@ -667,12 +673,14 @@ agent.unregister_tool("ping")
 - 返回 `dict` / `list` → 自动包装为 `{"ok": true, "result": ...}` 后 JSON 编码
 - 抛出异常 → 自动捕获为 `{"ok": false, "error": "..."}` 发给 LLM
 
+工具名不能覆盖内置工具或 `mcp__` 前缀；重复注册会直接报错。一个 `Enkiball` 同时只运行一个 chat/compact operation，并发启动会 fail fast。`interrupt()` 会停止流式响应，并终止正在执行的 `run_command` 进程组。
+
 ## CLI 嵌入和自定义命令
 
 `EnkiballCLI` 可以作为库使用。外部代码可以传入预配置的 `Enkiball`、注册工具、注册 slash command，然后启动 REPL。
 
 ```python
-from enkiball import Enkiball, EnkiballCLI
+from enkiball import CommandContext, Enkiball, EnkiballCLI
 
 agent = Enkiball()
 
@@ -687,16 +695,18 @@ def recon(args):
 cli = EnkiballCLI(agent, banner="MyPentestAgent v1.0 - /help for commands")
 
 # 注册自定义斜杠命令
-def cmd_target(argv, handler, engine, session):
+def cmd_target(argv, context: CommandContext):
     """/target <host>  - set the active target host"""
     if len(argv) < 2:
-        handler.console.print("usage: /target <host>", style="yellow")
+        context.console.print("usage: /target <host>", style="yellow")
         return True
-    engine.messages.append({
+    messages = context.agent.messages
+    messages.append({
         "role": "system",
         "content": f"Active target: {argv[1]}",
     })
-    handler.console.print(f"target set: {argv[1]}", style="green")
+    context.agent.load_messages(messages)
+    context.console.print(f"target set: {argv[1]}", style="green")
     return True   # True = keep CLI running, False = exit
 
 cli.register_command(
@@ -708,11 +718,12 @@ cli.register_command(
 cli.run()
 ```
 
-命令处理函数签名：`(argv, handler, engine, session) -> bool`
+命令处理函数签名：`(argv, context: CommandContext) -> bool`。旧的 `(argv, handler, engine, session)` 四参数形式仍兼容。
 - `argv` — `shlex.split` 后的列表，`argv[0]` 是命令本身
-- `handler` — `CommandHandler` 实例（可访问 `console`、`config`、`session_store`、`staged_images` 等）
-- `engine` — `ChatEngine`（消息、tokens、模型）
-- `session` — prompt_toolkit `PromptSession`，可用于子 REPL（参考 `/mcp`、`/session`）
+- `context.agent` — 当前 `Enkiball` 实例
+- `context.console` — Rich `Console`
+- `context.session_store` — 当前 `SessionStore`
+- `context.prompt_session` — prompt_toolkit `PromptSession`
 - 返回 `True` 继续运行，`False` 退出 CLI
 
 `pyproject.toml` 中的 `enkiball` 入口仍指向内置 `cli:main`，等价于 `EnkiballCLI().run()`。
@@ -736,9 +747,11 @@ LLM 在对话中可以按需调用以下内置工具。这些工具是模型工�
 - `read_file` — 读取 UTF-8 文本文件。
 - `write_file` — 写入或追加 UTF-8 文本文件。
 - `edit` — 精确替换现有 UTF-8 文本文件中的唯一匹配，支持 `replace_all`。
-- `run_command` — 在 Linux bubblewrap 沙箱中执行 shell 命令并返回 exit code、stdout、stderr。
+- `run_command` — 执行 shell 命令并返回 exit code、stdout、stderr；默认使用 Linux bubblewrap 沙箱。可用 `privilleged=true` 请求一次性宿主执行审批。
 
-文件工具只能访问 `cwd` 和 `dir_permissions`。命令工具使用相同目录作为可写根目录，其他宿主路径不可见，网络默认隔离，环境变量经过清理，超时会终止整个进程组。当前 exec 沙箱要求 Linux 和 `bubblewrap`；后端不可用时拒绝执行，不会退化为宿主 shell。
+文件工具只能访问 `cwd` 和 `dir_permissions`，单文件读写/edit 上限为 10 MB。命令工具使用相同目录作为可写根目录，其他宿主路径不可见，网络默认隔离，环境变量经过清理，超时或 turn interrupt 会终止整个进程组。交互式 `read + always` 只授予只读目录并以 `--ro-bind` 挂载；write/edit 授权才允许写入。当前 exec 沙箱要求 Linux 和 `bubblewrap`；后端不可用时拒绝执行，不会自动退化为宿主 shell。`sandbox=False` 会显式关闭命令沙箱。沙箱启用时，`privilleged=true` 每次都只提供 `allow once` 或 `deny`，通过后该命令直接在宿主环境执行。
+
+CLI 的 `--privilleged` 模式会显式关闭命令沙箱，并允许文件工具读写任意绝对路径。该模式是启动级授权，不再逐条审批命令。
 
 工具 schema 和分发逻辑位于 `src/enkiball/llm_tools.py`，文件实现位于 `src/enkiball/tools.py`，权限和命令沙箱位于 `src/enkiball/sandbox.py`。
 

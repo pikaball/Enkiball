@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shlex
+import inspect
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -8,6 +10,7 @@ from rich.console import Console
 
 from .config import (
     DEFAULT_CONFIG_PATH,
+    DEFAULT_STATE_PATH,
     get_active_model,
     get_active_provider,
     get_provider_models,
@@ -25,6 +28,15 @@ if TYPE_CHECKING:
     from prompt_toolkit import PromptSession
 
     from .llm import ChatEngine
+    from .agent import Enkiball
+
+
+@dataclass(frozen=True)
+class CommandContext:
+    agent: "Enkiball"
+    console: Console
+    session_store: SessionStore
+    prompt_session: "PromptSession[str]"
 
 MCP_ACTIONS = ("list", "enable", "disable", "start", "stop", "status", "path", "help")
 SESSION_ACTIONS = ("list", "current", "new", "use", "rename", "export", "fork", "help")
@@ -68,6 +80,7 @@ SLASH_COMPLETIONS = [
     "/session fork",
     "/session help",
 ]
+BUILTIN_COMMANDS = {item.split()[0] for item in SLASH_COMPLETIONS}
 
 HELP_TEXT = """\
 Slash commands:
@@ -148,33 +161,32 @@ class CommandHandler:
         mcp_manager: MCPManager,
         session_store: SessionStore,
         config_path: Path = DEFAULT_CONFIG_PATH,
+        state_path: Path = DEFAULT_STATE_PATH,
+        agent: "Enkiball | None" = None,
     ):
         self.console = console
         self.config = config
         self.mcp_manager = mcp_manager
         self.session_store = session_store
         self.config_path = config_path
+        self.state_path = state_path
+        self.agent = agent
+        self.completions = list(SLASH_COMPLETIONS)
         self.pending_input: str | None = None
+        self.pending_history_replay: bool = False
         self.last_raw_line: str = ""
         self.staged_images: list[str] = []
         # Custom command registry: "/foo" -> (handler, help_text)
         #   handler signature: (argv, self, engine, session) -> bool (True = keep running)
-        self._custom_commands: dict[
-            str,
-            tuple[
-                Callable[[list[str], "CommandHandler", "ChatEngine", "PromptSession[str]"], bool],
-                str,
-            ],
-        ] = {}
+        self._custom_commands: dict[str, tuple[Callable[..., bool], str, bool]] = {}
+        self._command_completions: dict[str, list[str]] = {}
 
     # -- Extensibility -------------------------------------------------------
 
     def register_command(
         self,
         name: str,
-        handler: Callable[
-            [list[str], "CommandHandler", "ChatEngine", "PromptSession[str]"], bool
-        ],
+        handler: Callable[..., bool],
         help_text: str = "",
         completions: list[str] | None = None,
     ) -> None:
@@ -193,23 +205,40 @@ class CommandHandler:
             Extra completions to add (e.g. subcommand suggestions).
         """
         key = name if name.startswith("/") else f"/{name}"
-        self._custom_commands[key] = (handler, help_text)
-        if key not in SLASH_COMPLETIONS:
-            SLASH_COMPLETIONS.append(key)
+        if key in BUILTIN_COMMANDS:
+            raise ValueError(f"reserved command name: {key}")
+        if key in self._custom_commands:
+            raise ValueError(f"command already registered: {key}")
+        parameter_count = len(inspect.signature(handler).parameters)
+        if parameter_count not in (2, 4):
+            raise TypeError("command handler must accept (argv, context) or legacy four arguments")
+        uses_context = parameter_count == 2
+        self._custom_commands[key] = (handler, help_text, uses_context)
+        added = [key]
+        if key not in self.completions:
+            self.completions.append(key)
         if completions:
             for c in completions:
                 full = c if c.startswith("/") else f"{key} {c}"
-                if full not in SLASH_COMPLETIONS:
-                    SLASH_COMPLETIONS.append(full)
+                added.append(full)
+                if full not in self.completions:
+                    self.completions.append(full)
+        self._command_completions[key] = added
 
     def unregister_command(self, name: str) -> bool:
         key = name if name.startswith("/") else f"/{name}"
         existed = key in self._custom_commands
         self._custom_commands.pop(key, None)
+        for completion in self._command_completions.pop(key, []):
+            if completion not in SLASH_COMPLETIONS:
+                try:
+                    self.completions.remove(completion)
+                except ValueError:
+                    pass
         return existed
 
     def list_custom_commands(self) -> dict[str, str]:
-        return {k: h[1] for k, h in self._custom_commands.items()}
+        return {k: value[1] for k, value in self._custom_commands.items()}
 
     def handle(
         self, raw_line: str, engine: ChatEngine, session: PromptSession[str]
@@ -230,7 +259,7 @@ class CommandHandler:
             self.console.print(HELP_TEXT)
             if self._custom_commands:
                 self.console.print("Custom commands:", style="bold")
-                for k, (_, ht) in self._custom_commands.items():
+                for k, (_, ht, _) in self._custom_commands.items():
                     self.console.print(f"  {k:26} {ht}")
             return True
         if cmd == "/exit":
@@ -258,8 +287,18 @@ class CommandHandler:
 
         # Custom user-registered commands
         if cmd in self._custom_commands:
-            fn, _ = self._custom_commands[cmd]
+            fn, _, uses_context = self._custom_commands[cmd]
             try:
+                if uses_context:
+                    if self.agent is None:
+                        raise RuntimeError("command context requires an Enkiball agent")
+                    context = CommandContext(
+                        agent=self.agent,
+                        console=self.console,
+                        session_store=self.session_store,
+                        prompt_session=session,
+                    )
+                    return bool(fn(argv, context))
                 return bool(fn(argv, self, engine, session))
             except Exception as e:  # noqa: BLE001
                 self.console.print(
@@ -275,19 +314,24 @@ class CommandHandler:
     def _model(self, argv: list[str], engine: ChatEngine) -> bool:
         if len(argv) == 1:
             self.console.print(
-                f"provider: {get_active_provider(self.config)}  model: {engine.model}",
+                f"provider: {get_active_provider(self.config, self.state_path)}  model: {engine.model}",
                 style="cyan",
             )
             # Show available models (config + remote)
             self.console.print("fetching models...", style="dim")
-            models = get_provider_models(self.config, remote=True, timeout=5.0)
+            models = get_provider_models(
+                self.config,
+                remote=True,
+                timeout=5.0,
+                state_path=self.state_path,
+            )
             if models:
                 self.console.print(f"available: {', '.join(models)}", style="dim")
             else:
                 self.console.print("no models found", style="yellow")
             return True
         new_model = argv[1]
-        set_active_model(self.config, new_model)
+        set_active_model(self.config, new_model, self.state_path)
         self.console.print(f"model switched to: {engine.model}", style="green")
         return True
 
@@ -296,16 +340,22 @@ class CommandHandler:
     def _provider(self, argv: list[str]) -> bool:
         if len(argv) == 1:
             self.console.print(
-                f"active provider: {get_active_provider(self.config)}",
+                f"active provider: {get_active_provider(self.config, self.state_path)}",
                 style="cyan",
             )
             return True
         sub = argv[1]
         if sub == "list":
             for name, prov in get_providers(self.config).items():
-                active = "*" if name == get_active_provider(self.config) else " "
+                active = (
+                    "*" if name == get_active_provider(self.config, self.state_path) else " "
+                )
                 models = get_provider_models(
-                    self.config, provider_name=name, remote=True, timeout=3.0
+                    self.config,
+                    provider_name=name,
+                    remote=True,
+                    timeout=3.0,
+                    state_path=self.state_path,
                 )
                 models_str = ", ".join(models) if models else "(none)"
                 base = prov.get("base_url", "")
@@ -320,9 +370,9 @@ class CommandHandler:
                 )
                 return True
             target = argv[2]
-            if set_active_provider(self.config, target):
+            if set_active_provider(self.config, target, self.state_path):
                 self.console.print(
-                    f"switched to {target}, model={get_active_model(self.config)}",
+                    f"switched to {target}, model={get_active_model(self.config, self.state_path)}",
                     style="green",
                 )
             else:
@@ -643,33 +693,6 @@ class CommandHandler:
     def _save_current_session(self, engine: ChatEngine) -> None:
         self.session_store.save_current_messages(engine.export_messages())
 
-    def _replay_session(self, engine: ChatEngine) -> None:
-        """Print the loaded session's conversation history on screen."""
-        for msg in engine.messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                continue
-            if role == "tool":
-                continue
-            if not isinstance(content, str):
-                import json as _json
-
-                content = _json.dumps(content, ensure_ascii=False)
-            if role == "user":
-                self.console.print(f"you> {content}", style="dim")
-            elif role == "assistant":
-                tc = msg.get("tool_calls")
-                if tc:
-                    names = ", ".join(
-                        c.get("function", {}).get("name", "?")
-                        for c in tc
-                        if isinstance(c, dict)
-                    )
-                    self.console.print(f"assistant> [tool: {names}]", style="dim cyan")
-                if content:
-                    self.console.print(f"assistant> {content}", style="dim green")
-
     def _session_action(self, action: str, args: list[str], engine: ChatEngine) -> None:
         if action == "list":
             self._print_session_list()
@@ -716,10 +739,8 @@ class CommandHandler:
             self.session_store.switch_to(record)
             engine.load_messages(record.messages)
             self.staged_images.clear()
+            self.pending_history_replay = True
             self.console.print(f"switched session: {record.session_id}", style="green")
-            self.console.print("--- session history ---", style="dim")
-            self._replay_session(engine)
-            self.console.print("--- end of history ---", style="dim")
             return
         if action == "rename":
             sid = self.session_store.current_session_id
@@ -772,6 +793,7 @@ class CommandHandler:
                 persisted=True,
             )
             self.staged_images.clear()
+            self.pending_history_replay = True
             self.console.print(
                 f"forked to new session: {created.session_id}", style="green"
             )

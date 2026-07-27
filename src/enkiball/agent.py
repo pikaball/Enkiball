@@ -53,6 +53,7 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Generator
 
 from .config import (
     DEFAULT_CONFIG_PATH,
+    DEFAULT_STATE_PATH,
     ensure_config,
     get_active_model,
     get_active_provider,
@@ -64,8 +65,6 @@ from .config import (
     set_active_provider,
     set_mcp_enabled,
     list_mcp_servers,
-    load_state,
-    save_state,
 )
 from .llm import (
     ChatEngine,
@@ -123,6 +122,9 @@ class Enkiball:
     ----------
     config_path : str | Path
         Path to ``agent.json``.  Defaults to ``config/agent.json``.
+    state_path : str | Path
+        Path for active provider/model state. Defaults to the shared Enkiball
+        state file.
     system_prompt : str | None
         Override the default system prompt.
     auto_start_mcp : bool
@@ -142,6 +144,9 @@ class Enkiball:
     approval : bool
         Allow an interactive frontend to request access outside configured
         directories. Without a frontend, access is denied.
+    sandbox : bool
+        Use the command sandbox. When false, commands run directly in the host
+        environment. Defaults to true.
     """
 
     def __init__(
@@ -155,14 +160,19 @@ class Enkiball:
         cwd: str | Path | None = None,
         dir_permissions: list[str | Path] | None = None,
         approval: bool = False,
+        sandbox: bool = True,
+        state_path: str | Path = DEFAULT_STATE_PATH,
     ) -> None:
         self._config_path = Path(config_path)
+        self._state_path = Path(state_path)
         ensure_config(self._config_path)
-        self._config = load_config(self._config_path)
+        self._config = load_config(self._config_path, self._state_path)
 
-        self._sandbox = Sandbox(cwd, dir_permissions, approval)
+        self._sandbox = Sandbox(cwd, dir_permissions, approval, sandbox)
         self._mcp = MCPManager(self._config)
-        self._engine = ChatEngine(self._config, self._mcp, self._sandbox)
+        self._engine = ChatEngine(
+            self._config, self._mcp, self._sandbox, state_path=self._state_path
+        )
         self._on_tool_event = on_tool_event
         self._session_store = self._build_session_store(session_dir)
 
@@ -301,26 +311,26 @@ class Enkiball:
     @property
     def provider(self) -> str:
         """Name of the active provider."""
-        return get_active_provider(self._config)
+        return get_active_provider(self._config, self._state_path)
 
     @property
     def providers(self) -> dict[str, dict[str, Any]]:
-        """All configured providers and their settings (secrets stripped)."""
-        return get_providers(self._config)
+        """Return a copy of all configured providers and their settings."""
+        return json.loads(json.dumps(get_providers(self._config)))
 
     def switch_provider(self, name: str, save: bool = True) -> bool:
         """Switch to a different provider.  Returns False if not found.
 
         The selection is always persisted to ``state.json``.
         """
-        return set_active_provider(self._config, name)
+        return set_active_provider(self._config, name, self._state_path)
 
     def switch_model(self, model: str, save: bool = True) -> None:
         """Switch model (within current provider).
 
         The selection is always persisted to ``state.json``.
         """
-        set_active_model(self._config, model)
+        set_active_model(self._config, model, self._state_path)
 
     def list_models(
         self,
@@ -338,6 +348,7 @@ class Enkiball:
             provider_name=provider_name,
             remote=remote,
             timeout=timeout,
+            state_path=self._state_path,
         )
 
     def refresh_models(self, timeout: float = 5.0) -> list[str]:
@@ -557,8 +568,7 @@ class Enkiball:
             system_context=system_context,
             should_stop=should_stop,
         )
-        interrupted = should_stop() if should_stop else False
-        return collector.result(content, interrupted=interrupted)
+        return collector.result(content, interrupted=self._engine.interrupted())
 
     def stream(
         self,
@@ -585,7 +595,10 @@ class Enkiball:
 
         result_box: list[str] = []
         exc_box: list[Exception] = []
-        interrupted_box: list[bool] = [False]
+        abandon_event = threading.Event()
+
+        def _should_stop() -> bool:
+            return abandon_event.is_set() or bool(should_stop and should_stop())
 
         def _worker() -> None:
             try:
@@ -597,10 +610,9 @@ class Enkiball:
                     on_thinking=collector.on_thinking,
                     on_retry=on_retry,
                     system_context=system_context,
-                    should_stop=should_stop,
+                    should_stop=_should_stop,
                 )
                 result_box.append(r)
-                interrupted_box[0] = bool(should_stop and should_stop())
             except Exception as e:
                 exc_box.append(e)
             finally:
@@ -609,18 +621,23 @@ class Enkiball:
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
-        while True:
-            item = _q.get()
-            if item is _sentinel:
-                break
-            yield item  # type: ignore[misc]
-
-        t.join()
+        completed = False
+        try:
+            while True:
+                item = _q.get()
+                if item is _sentinel:
+                    completed = True
+                    break
+                yield item  # type: ignore[misc]
+        finally:
+            if not completed:
+                abandon_event.set()
+            t.join()
         if exc_box:
             raise exc_box[0]
 
         content = result_box[0] if result_box else "".join(tokens)
-        return collector.result(content, interrupted=interrupted_box[0])
+        return collector.result(content, interrupted=self._engine.interrupted())
 
     # ========================================================================
     # Async conversation API
@@ -648,8 +665,7 @@ class Enkiball:
             system_context=system_context,
             should_stop=should_stop,
         )
-        interrupted = should_stop() if should_stop else False
-        return collector.result(content, interrupted=interrupted)
+        return collector.result(content, interrupted=self._engine.interrupted())
 
     async def astream(
         self,
@@ -703,7 +719,7 @@ class Enkiball:
                 yield item  # type: ignore[misc]
         finally:
             if not task.done():
-                task.cancel()
+                self._engine.interrupt()
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -781,7 +797,7 @@ class Enkiball:
                 yield item  # type: ignore[misc]
         finally:
             if not task.done():
-                task.cancel()
+                self._engine.interrupt()
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -792,7 +808,7 @@ class Enkiball:
                     raise exc
 
         content = result_box[0] if result_box else "".join(tokens)
-        interrupted = bool(should_stop and should_stop())
+        interrupted = self._engine.interrupted()
         yield {
             "type": "done",
             "data": collector.result(content, interrupted=interrupted),
@@ -882,7 +898,10 @@ class Enkiball:
         ok = set_mcp_enabled(self._config, name, True)
         if not ok:
             return False
-        self._mcp.start(name)
+        started, _ = self._mcp.start(name)
+        if not started:
+            set_mcp_enabled(self._config, name, False)
+            return False
         if save:
             save_config(self._config, self._config_path)
         return True
@@ -944,9 +963,10 @@ class Enkiball:
 
     def shutdown(self) -> list[str]:
         """Stop all MCP servers and release resources."""
+        self.interrupt()
         ex = getattr(self, "_bg_exec", None)
         if ex is not None:
-            ex.shutdown(wait=False, cancel_futures=True)
+            ex.shutdown(wait=True, cancel_futures=True)
             self._bg_exec = None
         return self._mcp.stop_all()
 
