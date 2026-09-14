@@ -1,33 +1,21 @@
 from __future__ import annotations
 
-import shlex
+import ast
 import inspect
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from rich.console import Console
 
-from .config import (
-    DEFAULT_CONFIG_PATH,
-    DEFAULT_STATE_PATH,
-    get_active_model,
-    get_active_provider,
-    get_provider_models,
-    get_providers,
-    list_mcp_servers,
-    save_config,
-    set_active_model,
-    set_active_provider,
-    set_mcp_enabled,
-)
-from .mcp import MCPManager
+from .config import list_mcp_servers
+from .message_codec import extract_user_content
 from .session_store import SessionStore
 
 if TYPE_CHECKING:
     from prompt_toolkit import PromptSession
 
-    from .llm import ChatEngine
     from .agent import Enkiball
 
 
@@ -37,10 +25,12 @@ class CommandContext:
     console: Console
     session_store: SessionStore
     prompt_session: "PromptSession[str]"
+    should_stop: Callable[[], bool] | None = None
 
 MCP_ACTIONS = ("list", "enable", "disable", "start", "stop", "status", "path", "help")
 SESSION_ACTIONS = ("list", "current", "new", "use", "rename", "export", "fork", "help")
 IMAGE_ACTIONS = ("add", "list", "remove", "clear", "help")
+NOTICE_ACTIONS = ("show", "add")
 SLASH_COMPLETIONS = [
     "/help",
     "/exit",
@@ -55,13 +45,17 @@ SLASH_COMPLETIONS = [
     "/revert",
     "/thinking",
     "/tokens",
+    "/btw",
+    "/debug",
+    "/notice",
+    "/notice show",
+    "/notice add",
     "/image",
     "/image add",
     "/image list",
     "/image remove",
     "/image clear",
     "/image help",
-    "/mcp",
     "/mcp list",
     "/mcp enable",
     "/mcp disable",
@@ -70,7 +64,6 @@ SLASH_COMPLETIONS = [
     "/mcp status",
     "/mcp path",
     "/mcp help",
-    "/session",
     "/session list",
     "/session current",
     "/session new",
@@ -95,11 +88,14 @@ Slash commands:
   /revert [n]                Revert last n user turns and edit/resend
   /thinking                  Toggle thinking/reasoning output
   /tokens                    Show accumulated token usage
+  /btw <prompt...>           Ask a one-off question without changing history
+  /debug <python>            Execute Python in the CLI process
+  /notice show               Show queued system notices
+  /notice add <message>      Queue a notice for the next tool result
   /image add <path...>       Stage one or more images for next user message
   /image list                Show staged images
   /image remove <index>      Remove one staged image
   /image clear               Clear all staged images
-  /session                   Enter interactive session panel
   /session list              List sessions
   /session current           Show current session
   /session new [name]        Create and switch to a new unsaved session
@@ -107,7 +103,6 @@ Slash commands:
   /session rename <name>     Rename current session
   /session export [path]     Export current full dialogue to markdown
   /session fork <turn>       Fork a new session from user turn N
-  /mcp                       Enter interactive MCP panel
   /mcp list                  List MCP servers
   /mcp enable <name|index>   Enable and start MCP server
   /mcp disable <name|index>  Disable and stop MCP server
@@ -127,29 +122,27 @@ Image commands:
 """
 
 MCP_HELP = """\
-MCP panel commands:
-  list
-  enable <name|index>
-  disable <name|index>
-  start <name|index>
-  stop <name|index>
-  status
-  path
-  help
-  back
+MCP commands:
+  /mcp list
+  /mcp enable <name|index>
+  /mcp disable <name|index>
+  /mcp start <name|index>
+  /mcp stop <name|index>
+  /mcp status
+  /mcp path
+  /mcp help
 """
 
 SESSION_HELP = """\
-Session panel commands:
-  list
-  current
-  new [name]
-  use <id|index>
-  rename <name>
-  export [path]
-  fork <turn>        Fork from user turn N
-  help
-  back
+Session commands:
+  /session list
+  /session current
+  /session new [name]
+  /session use <id|index>
+  /session rename <name>
+  /session export [path]
+  /session fork <turn>        Fork from user turn N
+  /session help
 """
 
 
@@ -157,29 +150,30 @@ class CommandHandler:
     def __init__(
         self,
         console: Console,
-        config: dict[str, Any],
-        mcp_manager: MCPManager,
-        session_store: SessionStore,
-        config_path: Path = DEFAULT_CONFIG_PATH,
-        state_path: Path = DEFAULT_STATE_PATH,
-        agent: "Enkiball | None" = None,
+        agent: "Enkiball",
+        debug_scope: dict[str, Any] | None = None,
+        btw_context: Callable[[], str] | None = None,
     ):
         self.console = console
-        self.config = config
-        self.mcp_manager = mcp_manager
-        self.session_store = session_store
-        self.config_path = config_path
-        self.state_path = state_path
         self.agent = agent
+        self.session_store = agent.session_store
+        self.debug_scope = debug_scope if debug_scope is not None else {}
+        self.btw_context = btw_context
         self.completions = list(SLASH_COMPLETIONS)
         self.pending_input: str | None = None
         self.pending_history_replay: bool = False
         self.last_raw_line: str = ""
+        self._should_stop: Callable[[], bool] | None = None
         self.staged_images: list[str] = []
-        # Custom command registry: "/foo" -> (handler, help_text)
-        #   handler signature: (argv, self, engine, session) -> bool (True = keep running)
-        self._custom_commands: dict[str, tuple[Callable[..., bool], str, bool]] = {}
+        self._custom_commands: dict[str, tuple[Callable[..., bool], str]] = {}
         self._command_completions: dict[str, list[str]] = {}
+
+    def set_stop_callback(self, callback: Callable[[], bool] | None) -> None:
+        """Set the active CLI cancellation callback for long-running commands."""
+        self._should_stop = callback
+
+    def should_stop(self) -> bool:
+        return bool(self._should_stop and self._should_stop())
 
     # -- Extensibility -------------------------------------------------------
 
@@ -197,8 +191,8 @@ class CommandHandler:
         name : str
             Command name with or without leading slash, e.g. ``"foo"`` or ``"/foo"``.
         handler : callable
-            ``(argv, handler, engine, session) -> bool``.  Return True to keep
-            the CLI running, False to exit.  ``argv[0]`` is the command itself.
+            ``(argv, context) -> bool``. Return True to keep the CLI running,
+            False to exit. ``argv[0]`` is the command itself.
         help_text : str
             Shown in /help.
         completions : list[str] | None
@@ -210,10 +204,9 @@ class CommandHandler:
         if key in self._custom_commands:
             raise ValueError(f"command already registered: {key}")
         parameter_count = len(inspect.signature(handler).parameters)
-        if parameter_count not in (2, 4):
-            raise TypeError("command handler must accept (argv, context) or legacy four arguments")
-        uses_context = parameter_count == 2
-        self._custom_commands[key] = (handler, help_text, uses_context)
+        if parameter_count != 2:
+            raise TypeError("command handler must accept (argv, context)")
+        self._custom_commands[key] = (handler, help_text)
         added = [key]
         if key not in self.completions:
             self.completions.append(key)
@@ -240,11 +233,15 @@ class CommandHandler:
     def list_custom_commands(self) -> dict[str, str]:
         return {k: value[1] for k, value in self._custom_commands.items()}
 
-    def handle(
-        self, raw_line: str, engine: ChatEngine, session: PromptSession[str]
-    ) -> bool:
+    def handle(self, raw_line: str, session: PromptSession[str]) -> bool:
         self.pending_input = None
         self.last_raw_line = raw_line
+        if raw_line == "/debug" or (
+            raw_line.startswith("/debug")
+            and len(raw_line) > len("/debug")
+            and raw_line[len("/debug")].isspace()
+        ):
+            return self._debug(raw_line[len("/debug"):].lstrip())
         try:
             argv = shlex.split(raw_line)
         except ValueError as e:
@@ -259,47 +256,48 @@ class CommandHandler:
             self.console.print(HELP_TEXT)
             if self._custom_commands:
                 self.console.print("Custom commands:", style="bold")
-                for k, (_, ht, _) in self._custom_commands.items():
+                for k, (_, ht) in self._custom_commands.items():
                     self.console.print(f"  {k:26} {ht}")
             return True
         if cmd == "/exit":
             return False
         if cmd == "/model":
-            return self._model(argv, engine)
+            return self._model(argv)
         if cmd == "/provider":
             return self._provider(argv)
         if cmd == "/compact":
-            return self._compact(engine)
+            return self._compact()
         if cmd == "/autocompact":
-            return self._autocompact(argv, engine)
+            return self._autocompact(argv)
         if cmd == "/revert":
-            return self._revert(argv, engine)
+            return self._revert(argv)
         if cmd == "/thinking":
-            return self._thinking(engine)
+            return self._thinking()
         if cmd == "/tokens":
-            return self._tokens(engine)
+            return self._tokens()
+        if cmd == "/btw":
+            return self._btw(argv)
+        if cmd == "/notice":
+            return self._notice(argv)
         if cmd == "/image":
             return self._image(argv)
         if cmd == "/session":
-            return self._session(argv, session, engine)
+            return self._session(argv)
         if cmd == "/mcp":
-            return self._mcp(argv, session)
+            return self._mcp(argv)
 
         # Custom user-registered commands
         if cmd in self._custom_commands:
-            fn, _, uses_context = self._custom_commands[cmd]
+            fn, _ = self._custom_commands[cmd]
             try:
-                if uses_context:
-                    if self.agent is None:
-                        raise RuntimeError("command context requires an Enkiball agent")
-                    context = CommandContext(
-                        agent=self.agent,
-                        console=self.console,
-                        session_store=self.session_store,
-                        prompt_session=session,
-                    )
-                    return bool(fn(argv, context))
-                return bool(fn(argv, self, engine, session))
+                context = CommandContext(
+                    agent=self.agent,
+                    console=self.console,
+                    session_store=self.session_store,
+                    prompt_session=session,
+                    should_stop=self.should_stop,
+                )
+                return bool(fn(argv, context))
             except Exception as e:  # noqa: BLE001
                 self.console.print(
                     f"error in custom command {cmd}: {e}", style="bold red"
@@ -309,30 +307,83 @@ class CommandHandler:
         self.console.print(f"unknown command: {cmd}", style="bold yellow")
         return True
 
+    def _btw(self, argv: list[str]) -> bool:
+        if len(argv) < 2:
+            self.console.print("usage: /btw <prompt...>", style="yellow")
+            return True
+        try:
+            result = self.agent.btw(
+                " ".join(argv[1:]),
+                system_context=self.btw_context() if self.btw_context else None,
+                should_stop=self.should_stop,
+            )
+            if result.content:
+                self.console.print(result.content)
+            if result.interrupted:
+                self.console.print("[interrupted]", style="bold yellow")
+        except Exception as exc:  # noqa: BLE001
+            self.console.print(f"btw error: {exc}", style="bold red")
+        return True
+
+    # -- /debug -------------------------------------------------------------
+
+    def _debug(self, code: str) -> bool:
+        if not code:
+            self.console.print("usage: /debug <python>", style="yellow")
+            self.console.print("locals: " + ", ".join(self.debug_scope), style="dim")
+            return True
+
+        try:
+            module = ast.parse(code, filename="<enkiball-debug>", mode="exec")
+            result: Any = None
+            has_result = bool(module.body and isinstance(module.body[-1], ast.Expr))
+            if has_result:
+                statements = ast.Module(
+                    body=module.body[:-1], type_ignores=module.type_ignores
+                )
+                if statements.body:
+                    exec(  # noqa: S102
+                        compile(statements, "<enkiball-debug>", "exec"),
+                        self.debug_scope,
+                        self.debug_scope,
+                    )
+                expression = ast.Expression(module.body[-1].value)
+                result = eval(  # noqa: S307
+                    compile(expression, "<enkiball-debug>", "eval"),
+                    self.debug_scope,
+                    self.debug_scope,
+                )
+            else:
+                exec(  # noqa: S102
+                    compile(module, "<enkiball-debug>", "exec"),
+                    self.debug_scope,
+                    self.debug_scope,
+                )
+            if has_result:
+                self.console.print(repr(result), markup=False)
+        except Exception as exc:  # noqa: BLE001
+            self.console.print(f"debug error: {exc!r}", style="bold red")
+        return True
+
     # -- /model --------------------------------------------------------------
 
-    def _model(self, argv: list[str], engine: ChatEngine) -> bool:
+    def _model(self, argv: list[str]) -> bool:
         if len(argv) == 1:
             self.console.print(
-                f"provider: {get_active_provider(self.config, self.state_path)}  model: {engine.model}",
+                f"provider: {self.agent.provider}  model: {self.agent.model}",
                 style="cyan",
             )
             # Show available models (config + remote)
             self.console.print("fetching models...", style="dim")
-            models = get_provider_models(
-                self.config,
-                remote=True,
-                timeout=5.0,
-                state_path=self.state_path,
-            )
+            models = self.agent.list_models(remote=True, timeout=5.0)
             if models:
                 self.console.print(f"available: {', '.join(models)}", style="dim")
             else:
                 self.console.print("no models found", style="yellow")
             return True
         new_model = argv[1]
-        set_active_model(self.config, new_model, self.state_path)
-        self.console.print(f"model switched to: {engine.model}", style="green")
+        self.agent.switch_model(new_model)
+        self.console.print(f"model switched to: {self.agent.model}", style="green")
         return True
 
     # -- /provider -----------------------------------------------------------
@@ -340,22 +391,16 @@ class CommandHandler:
     def _provider(self, argv: list[str]) -> bool:
         if len(argv) == 1:
             self.console.print(
-                f"active provider: {get_active_provider(self.config, self.state_path)}",
+                f"active provider: {self.agent.provider}",
                 style="cyan",
             )
             return True
         sub = argv[1]
         if sub == "list":
-            for name, prov in get_providers(self.config).items():
-                active = (
-                    "*" if name == get_active_provider(self.config, self.state_path) else " "
-                )
-                models = get_provider_models(
-                    self.config,
-                    provider_name=name,
-                    remote=True,
-                    timeout=3.0,
-                    state_path=self.state_path,
+            for name, prov in self.agent.providers.items():
+                active = "*" if name == self.agent.provider else " "
+                models = self.agent.list_models(
+                    provider_name=name, remote=True, timeout=3.0
                 )
                 models_str = ", ".join(models) if models else "(none)"
                 base = prov.get("base_url", "")
@@ -370,9 +415,9 @@ class CommandHandler:
                 )
                 return True
             target = argv[2]
-            if set_active_provider(self.config, target, self.state_path):
+            if self.agent.switch_provider(target):
                 self.console.print(
-                    f"switched to {target}, model={get_active_model(self.config, self.state_path)}",
+                    f"switched to {target}, model={self.agent.model}",
                     style="green",
                 )
             else:
@@ -383,40 +428,39 @@ class CommandHandler:
 
     # -- /compact ------------------------------------------------------------
 
-    def _compact(self, engine: ChatEngine) -> bool:
-        msg_count = len(engine.messages)
+    def _compact(self) -> bool:
+        msg_count = len(self.agent.messages)
         if msg_count <= 2:
             self.console.print("not enough history to compact", style="yellow")
             return True
         self.console.print("compacting conversation...", style="cyan")
-        summary = engine.compact(
+        summary = self.agent.compact(
             on_token=lambda tok: self.console.print(tok, end="", highlight=False),
+            should_stop=self.should_stop,
         )
         self.console.print()  # newline after streamed summary
-        before = msg_count
-        after = len(engine.messages) - engine.compact_index
         self.console.print(
-            f"compact done. {before} messages in history, "
-            f"{after} messages will be sent to LLM.",
+            f"compact done. {msg_count} messages retained in history.",
             style="green",
         )
-        self._save_current_session(engine)
+        self._save_current_session()
         return True
 
     # -- /autocompact --------------------------------------------------------
 
-    def _autocompact(self, argv: list[str], engine: ChatEngine) -> bool:
+    def _autocompact(self, argv: list[str]) -> bool:
         if len(argv) == 1:
             self.console.print(
-                f"auto_compact={engine.auto_compact_enabled} "
-                f"threshold_ratio={engine.auto_compact_threshold_ratio} "
-                f"effective_threshold_tokens={engine._auto_compact_effective_threshold_tokens()}",
+                f"auto_compact={self.agent.auto_compact_enabled} "
+                f"threshold_ratio={self.agent.auto_compact_threshold_ratio} "
+                "effective_threshold_tokens="
+                f"{self.agent.auto_compact_effective_threshold_tokens}",
                 style="cyan",
             )
             return True
         if len(argv) == 2 and argv[1] in {"on", "off"}:
-            engine.auto_compact_enabled = argv[1] == "on"
-            state = "enabled" if engine.auto_compact_enabled else "disabled"
+            self.agent.auto_compact_enabled = argv[1] == "on"
+            state = "enabled" if self.agent.auto_compact_enabled else "disabled"
             self.console.print(f"auto_compact {state}", style="green")
             return True
         self.console.print("usage: /autocompact [on|off]", style="bold yellow")
@@ -424,7 +468,7 @@ class CommandHandler:
 
     # -- /revert -------------------------------------------------------------
 
-    def _revert(self, argv: list[str], engine: ChatEngine) -> bool:
+    def _revert(self, argv: list[str]) -> bool:
         if len(argv) > 2:
             self.console.print("usage: /revert [n]", style="bold yellow")
             return True
@@ -438,13 +482,22 @@ class CommandHandler:
                 return True
             steps = int(argv[1])
 
-        reverted, reverted_input, reverted_images = engine.revert_user_turns(steps)
+        user_messages = [
+            message for message in self.agent.messages if message.get("role") == "user"
+        ]
+        restored_content = (
+            user_messages[-min(steps, len(user_messages))].get("content", "")
+            if user_messages
+            else ""
+        )
+        reverted_input, reverted_images = extract_user_content(restored_content)
+        reverted = self.agent.revert(steps)
         if reverted == 0:
             self.console.print("no user turn to revert", style="yellow")
             return True
         self.pending_input = reverted_input or ""
         self.staged_images = list(reverted_images)
-        self._save_current_session(engine)
+        self._save_current_session()
 
         # Visual feedback: clear reverted output
         self.console.print(f"--- reverted {reverted} turn(s) ---", style="bold yellow")
@@ -458,19 +511,48 @@ class CommandHandler:
 
     # -- /thinking -----------------------------------------------------------
 
-    def _thinking(self, engine: ChatEngine) -> bool:
-        engine.show_thinking = not engine.show_thinking
-        state = "ON" if engine.show_thinking else "OFF"
+    def _thinking(self) -> bool:
+        self.agent.show_thinking = not self.agent.show_thinking
+        state = "ON" if self.agent.show_thinking else "OFF"
         self.console.print(f"thinking output: {state}", style="cyan")
         return True
 
     # -- /tokens -------------------------------------------------------------
 
-    def _tokens(self, engine: ChatEngine) -> bool:
-        u = engine.token_usage
+    def _tokens(self) -> bool:
+        u = self.agent.token_usage
         self.console.print(
             f"prompt={u.prompt_tokens}  completion={u.completion_tokens}  total={u.total_tokens}",
             style="cyan",
+        )
+        return True
+
+    # -- /notice ------------------------------------------------------------
+
+    def _notice(self, argv: list[str]) -> bool:
+        if self.agent is None:
+            self.console.print("notice queue unavailable", style="bold red")
+            return True
+        if len(argv) == 2 and argv[1] == "show":
+            notice_queue = self.agent.notice_queue
+            snapshot = getattr(notice_queue, "snapshot", None)
+            notices = snapshot() if callable(snapshot) else list(notice_queue)
+            if not notices:
+                self.console.print("no queued notices", style="yellow")
+                return True
+            for index, notice in enumerate(notices, start=1):
+                self.console.print(f"{index:2d}. {notice}", markup=False)
+            return True
+        if len(argv) >= 3 and argv[1] == "add":
+            notice = " ".join(argv[2:])
+            self.agent.notice_queue.append(notice)
+            self.console.print(
+                f"queued notices: {len(self.agent.notice_queue)}", style="green"
+            )
+            return True
+        self.console.print(
+            f"usage: /notice [{'|'.join(NOTICE_ACTIONS)}] [message]",
+            style="bold yellow",
         )
         return True
 
@@ -550,7 +632,7 @@ class CommandHandler:
     # -- /mcp ----------------------------------------------------------------
 
     def _resolve_mcp_target(self, raw: str) -> str | None:
-        servers = list_mcp_servers(self.config)
+        servers = list_mcp_servers(self.agent.config)
         if raw.isdigit():
             idx = int(raw) - 1
             names = list(servers.keys())
@@ -562,29 +644,25 @@ class CommandHandler:
         return None
 
     def _print_mcp_list(self) -> None:
-        servers = list_mcp_servers(self.config)
+        servers = list_mcp_servers(self.agent.config)
         if not servers:
             self.console.print("no MCP servers in config", style="yellow")
             return
-        status_map = self.mcp_manager.status()
+        status_map = self.agent.mcp.status()
         for i, (name, item) in enumerate(servers.items(), start=1):
             enabled = "ON " if item.get("enabled") else "OFF"
             run = status_map.get(name, "STOPPED")
             self.console.print(f"{i:2d}. {name:16} enabled={enabled} runtime={run}")
 
     def _set_mcp_enabled(self, target: str, enabled: bool) -> None:
-        ok = set_mcp_enabled(self.config, target, enabled)
-        if not ok:
-            self.console.print(f"unknown MCP server: {target}", style="bold red")
-            return
-        save_config(self.config, self.config_path)
         if enabled:
-            started, msg = self.mcp_manager.start(target)
-            self.console.print(f"MCP {target} enabled=True", style="green")
-            self.console.print(msg, style=("green" if started else "bold red"))
+            ok = self.agent.mcp_enable(target, save=True)
         else:
-            self.mcp_manager.stop(target)
-            self.console.print(f"MCP {target} enabled=False, stopped", style="green")
+            ok = self.agent.mcp_disable(target, save=True)
+        if not ok:
+            self.console.print(f"failed to set MCP {target} enabled={enabled}", style="bold red")
+            return
+        self.console.print(f"MCP {target} enabled={enabled}", style="green")
 
     def _mcp_action(self, action: str, raw_target: str | None) -> None:
         if action in {"enable", "disable", "start", "stop"} and not raw_target:
@@ -605,20 +683,20 @@ class CommandHandler:
                 self._set_mcp_enabled(target, False)
                 return
             if action == "start":
-                ok, msg = self.mcp_manager.start(target)
+                ok, msg = self.agent.mcp.start(target)
                 self.console.print(msg, style=("green" if ok else "bold red"))
                 return
             if action == "stop":
-                ok, msg = self.mcp_manager.stop(target)
+                ok, msg = self.agent.mcp.stop(target)
                 self.console.print(msg, style=("green" if ok else "bold red"))
                 return
 
         if action == "status":
-            for name, status in self.mcp_manager.status().items():
+            for name, status in self.agent.mcp.status().items():
                 self.console.print(f"{name:16} {status}")
             return
         if action == "path":
-            self.console.print(str(self.config_path), style="cyan")
+            self.console.print(str(self.agent.config_path), style="cyan")
             return
         if action == "list":
             self._print_mcp_list()
@@ -629,35 +707,13 @@ class CommandHandler:
 
         self.console.print("unknown mcp action", style="bold yellow")
 
-    def _mcp_interactive(self, session: PromptSession[str]) -> bool:
-        self.console.print(
-            "Enter MCP panel. Type `help` for commands, `back` to leave.", style="cyan"
-        )
-        self._print_mcp_list()
-        while True:
-            try:
-                line = session.prompt("mcp> ")
-            except KeyboardInterrupt:
-                return True  # exit sub-panel, stay in main CLI
-            except EOFError:
-                return True
-            text = line.strip()
-            if not text:
-                continue
-            if text in {"back", "exit", "quit"}:
-                return True
-            try:
-                argv = shlex.split(text)
-            except ValueError as e:
-                self.console.print(f"command parse error: {e}", style="bold red")
-                continue
-            action = argv[0]
-            target = argv[1] if len(argv) >= 2 else None
-            self._mcp_action(action, target)
-
-    def _mcp(self, argv: list[str], session: PromptSession[str]) -> bool:
+    def _mcp(self, argv: list[str]) -> bool:
         if len(argv) == 1:
-            return self._mcp_interactive(session)
+            self.console.print(
+                f"usage: /mcp [{'|'.join(MCP_ACTIONS)}]",
+                style="bold yellow",
+            )
+            return True
         sub = argv[1]
         if sub in {"list", "status", "path", "help"}:
             self._mcp_action(sub, None)
@@ -690,10 +746,10 @@ class CommandHandler:
                 f"{idx:2d}. {mark} {item.session_id:30} name={item.name} updated={item.updated_at}"
             )
 
-    def _save_current_session(self, engine: ChatEngine) -> None:
-        self.session_store.save_current_messages(engine.export_messages())
+    def _save_current_session(self) -> None:
+        self.session_store.save_current_messages(self.agent.messages)
 
-    def _session_action(self, action: str, args: list[str], engine: ChatEngine) -> None:
+    def _session_action(self, action: str, args: list[str]) -> None:
         if action == "list":
             self._print_session_list()
             return
@@ -713,11 +769,11 @@ class CommandHandler:
             return
         if action == "new":
             name = " ".join(args).strip() if args else None
-            self._save_current_session(engine)
-            engine.reset_messages()
+            self._save_current_session()
+            self.agent.reset()
             created = self.session_store.begin_new(
                 name=name,
-                initial_messages=engine.export_messages(),
+                initial_messages=self.agent.messages,
                 persisted=False,
             )
             self.staged_images.clear()
@@ -734,10 +790,10 @@ class CommandHandler:
             if not resolved:
                 self.console.print(f"unknown session: {args[0]}", style="bold red")
                 return
-            self._save_current_session(engine)
+            self._save_current_session()
             record = self.session_store.load(resolved)
             self.session_store.switch_to(record)
-            engine.load_messages(record.messages)
+            self.agent.load_messages(record.messages)
             self.staged_images.clear()
             self.pending_history_replay = True
             self.console.print(f"switched session: {record.session_id}", style="green")
@@ -764,12 +820,12 @@ class CommandHandler:
             if not sid:
                 self.console.print("no current session", style="yellow")
                 return
-            if not SessionStore.has_user_turn(engine.export_messages()):
+            if not SessionStore.has_user_turn(self.agent.messages):
                 self.console.print(
                     "current session has no dialogue yet", style="yellow"
                 )
                 return
-            self._save_current_session(engine)
+            self._save_current_session()
             out = self.session_store.export_session(
                 sid, out_path=args[0] if args else None
             )
@@ -780,16 +836,16 @@ class CommandHandler:
                 self.console.print("usage: fork <turn_number>", style="bold yellow")
                 return
             turn = int(args[0])
-            forked_msgs = engine.fork_at_turn(turn)
+            forked_msgs = self.agent.fork_at_turn(turn)
             if not forked_msgs or not SessionStore.has_user_turn(forked_msgs):
                 self.console.print(f"no user turn {turn} found", style="bold red")
                 return
-            self._save_current_session(engine)
-            engine.load_messages(forked_msgs)
+            self._save_current_session()
+            self.agent.load_messages(forked_msgs)
             fork_name = f"fork-turn{turn}"
             created = self.session_store.begin_new(
                 name=fork_name,
-                initial_messages=engine.export_messages(),
+                initial_messages=self.agent.messages,
                 persisted=True,
             )
             self.staged_images.clear()
@@ -801,44 +857,18 @@ class CommandHandler:
 
         self.console.print("unknown session action", style="bold yellow")
 
-    def _session_interactive(
-        self, session: PromptSession[str], engine: ChatEngine
-    ) -> bool:
-        self.console.print(
-            "Enter session panel. Type `help` for commands, `back` to leave.",
-            style="cyan",
-        )
-        self._print_session_list()
-        while True:
-            try:
-                line = session.prompt("session> ")
-            except KeyboardInterrupt:
-                return True  # exit sub-panel, stay in main CLI
-            except EOFError:
-                return True
-            text = line.strip()
-            if not text:
-                continue
-            if text in {"back", "exit", "quit"}:
-                return True
-            try:
-                argv = shlex.split(text)
-            except ValueError as e:
-                self.console.print(f"command parse error: {e}", style="bold red")
-                continue
-            action = argv[0]
-            self._session_action(action, argv[1:], engine)
-
-    def _session(
-        self, argv: list[str], session: PromptSession[str], engine: ChatEngine
-    ) -> bool:
+    def _session(self, argv: list[str]) -> bool:
         if len(argv) == 1:
-            return self._session_interactive(session, engine)
+            self.console.print(
+                f"usage: /session [{'|'.join(SESSION_ACTIONS)}]",
+                style="bold yellow",
+            )
+            return True
         action = argv[1]
         if action not in SESSION_ACTIONS:
             self.console.print(
                 f"usage: /session [{'|'.join(SESSION_ACTIONS)}]", style="bold yellow"
             )
             return True
-        self._session_action(action, argv[2:], engine)
+        self._session_action(action, argv[2:])
         return True

@@ -119,6 +119,8 @@ def _migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
 def load_config(
     path: Path = DEFAULT_CONFIG_PATH,
     state_path: Path = DEFAULT_STATE_PATH,
+    *,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ensure_config(path)
     with path.open("r", encoding="utf-8") as f:
@@ -127,7 +129,7 @@ def load_config(
 
     # Migrate active_provider / active_model from config to state file
     migrated = False
-    state = load_state(state_path)
+    state = load_state(state_path) if state is None else state
     for key in ("active_provider", "active_model"):
         if key in config:
             if key not in state:
@@ -153,9 +155,10 @@ def get_providers(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def get_active_provider(
-    config: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH
+    config: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
 ) -> str:
-    state = load_state(state_path)
+    state = load_state(state_path) if state is None else state
     name = str(state.get("active_provider", ""))
     if name and name in config.get("providers", {}):
         return name
@@ -165,9 +168,10 @@ def get_active_provider(
 
 
 def get_active_model(
-    config: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH
+    config: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
 ) -> str:
-    state = load_state(state_path)
+    state = load_state(state_path) if state is None else state
     return str(state.get("active_model", ""))
 
 
@@ -175,10 +179,11 @@ def set_active_provider(
     config: dict[str, Any],
     name: str,
     state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
 ) -> bool:
     if name not in config.get("providers", {}):
         return False
-    state = load_state(state_path)
+    state = load_state(state_path) if state is None else state
     state["active_provider"] = name
     prov = config["providers"][name]
     models = prov.get("models", {})
@@ -193,8 +198,9 @@ def set_active_model(
     config: dict[str, Any],
     model: str,
     state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
 ) -> None:
-    state = load_state(state_path)
+    state = load_state(state_path) if state is None else state
     state["active_model"] = model
     save_state(state, state_path)
 
@@ -203,13 +209,14 @@ def get_model_params(
     config: dict[str, Any],
     model: str | None = None,
     state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return per-model parameters (temperature, max_tokens, etc.) for the given model.
 
     Falls back to empty dict for models not defined in config (e.g. remote-only).
     """
-    model = model or get_active_model(config, state_path)
-    provider_name = get_active_provider(config, state_path)
+    model = model or get_active_model(config, state_path, state=state)
+    provider_name = get_active_provider(config, state_path, state=state)
     prov = config.get("providers", {}).get(provider_name, {})
     models = prov.get("models", {})
     if isinstance(models, dict):
@@ -218,13 +225,14 @@ def get_model_params(
 
 
 def resolve_provider_credentials(
-    config: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH
+    config: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Return (api_key, base_url) for the active provider.
 
     Reads directly from the provider entry in config — no env vars.
     """
-    provider_name = get_active_provider(config, state_path)
+    provider_name = get_active_provider(config, state_path, state=state)
     prov = config.get("providers", {}).get(provider_name, {})
     api_key = str(prov.get("api_key", "")).strip()
     base_url = str(prov.get("base_url", "")).strip()
@@ -286,12 +294,13 @@ def get_provider_models(
     remote: bool = True,
     timeout: float = 5.0,
     state_path: Path = DEFAULT_STATE_PATH,
+    state: dict[str, Any] | None = None,
 ) -> list[str]:
     """Return merged model list for a provider: config-defined + remote.
 
     Config-defined models appear first, followed by remote-only models sorted.
     """
-    name = provider_name or get_active_provider(config, state_path)
+    name = provider_name or get_active_provider(config, state_path, state=state)
     prov = config.get("providers", {}).get(name, {})
     models = prov.get("models", {})
     config_models: list[str] = (

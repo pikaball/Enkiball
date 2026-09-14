@@ -13,12 +13,32 @@ class MCPManager:
     def _servers(self) -> dict[str, dict[str, Any]]:
         return self.config.get("mcp", {}).get("servers", {})
 
+    @staticmethod
+    def _environment(item: dict[str, Any]) -> dict[str, str]:
+        """Return configured stdio environment with backwards compatibility."""
+        legacy = item.get("env", {})
+        current = item.get("environment", {})
+        if legacy is None:
+            legacy = {}
+        if current is None:
+            current = {}
+        if not isinstance(legacy, dict) or not isinstance(current, dict):
+            raise ValueError("MCP environment must be an object")
+
+        merged = {**legacy, **current}
+        for name, value in merged.items():
+            if not isinstance(name, str) or not name or "=" in name or "\0" in name:
+                raise ValueError(f"invalid MCP environment variable name: {name!r}")
+            if not isinstance(value, str) or "\0" in value:
+                raise ValueError(f"invalid MCP environment value for {name!r}")
+        return merged
+
     def start(self, name: str) -> tuple[bool, str]:
         if name in self.clients:
             client = self.clients[name]
             if client.running:
                 return True, f"{name} already running"
-            # If not running, remove and restart
+            client.close()
             self.clients.pop(name)
 
         servers = self._servers()
@@ -40,7 +60,7 @@ class MCPManager:
                 # Stdio Local Server
                 cmd = item.get("command")
                 args = item.get("args", [])
-                env = item.get("env", {})
+                env = self._environment(item)
                 transport = item.get("transport", "jsonl")
                 if not cmd:
                     return False, f"MCP {name} missing command or url"

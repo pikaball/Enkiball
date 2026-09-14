@@ -5,18 +5,30 @@ import threading
 from typing import Any
 
 from .sandbox import Sandbox, TurnInterrupted
-from .tools import edit_file, read_file, write_file
+from .tools import DEFAULT_READ_END, edit_file, read_file, write_file
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a UTF-8 text file from disk.",
+            "description": "Read a character range from a UTF-8 text file.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to target file."},
+                    "start": {
+                        "type": "integer",
+                        "description": "Inclusive character offset.",
+                        "minimum": 0,
+                        "default": 0,
+                    },
+                    "end": {
+                        "type": "integer",
+                        "description": "Exclusive character offset.",
+                        "minimum": 0,
+                        "default": DEFAULT_READ_END,
+                    },
                 },
                 "required": ["path"],
                 "additionalProperties": False,
@@ -120,13 +132,20 @@ def dispatch_tool(
             raise TypeError("tool arguments must be an object")
         if name == "read_file":
             path = args.get("path")
+            start = args.get("start", 0)
+            end = args.get("end", DEFAULT_READ_END)
             if not isinstance(path, str):
                 raise TypeError("path must be a string")
+            if isinstance(start, bool) or not isinstance(start, int):
+                raise TypeError("start must be an integer")
+            if isinstance(end, bool) or not isinstance(end, int):
+                raise TypeError("end must be an integer")
+            if start < 0:
+                raise ValueError("start must be non-negative")
+            if end < start:
+                raise ValueError("end must be greater than or equal to start")
             target = sandbox.resolve_path(path, "read")
-            content = read_file(str(target))
-            # Keep tool payload bounded for model context hygiene.
-            if len(content) > 20000:
-                content = content[:20000] + "\n...[truncated]"
+            content = read_file(str(target), start=start, end=end)
             return json.dumps({"ok": True, "content": content}, ensure_ascii=False)
 
         if name == "write_file":

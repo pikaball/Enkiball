@@ -258,6 +258,38 @@ class MarkdownRenderingTests(unittest.TestCase):
         self.assertEqual(output.count("paragraph-0:"), 1)
         self.assertEqual(output.count("paragraph-17:"), 1)
 
+    def test_thinking_preview_is_bounded_in_small_terminal(self) -> None:
+        console = Console(
+            file=io.StringIO(),
+            width=60,
+            height=8,
+            color_system=None,
+            force_terminal=False,
+        )
+        renderer = CliRenderer(console, Path.cwd())
+
+        preview = renderer._thinking_renderable("word " * 5000).plain
+        lines = preview.splitlines()
+
+        self.assertIn("thinking", preview)
+        self.assertIn("earlier lines", preview)
+        self.assertLessEqual(len(lines), 6)
+
+    def test_thinking_preview_keeps_recent_lines(self) -> None:
+        console = Console(
+            file=io.StringIO(),
+            width=80,
+            height=24,
+            color_system=None,
+            force_terminal=False,
+        )
+        renderer = CliRenderer(console, Path.cwd())
+
+        preview = renderer._thinking_renderable("first\nsecond\nthird").plain
+
+        self.assertIn("third", preview)
+        self.assertNotIn("earlier lines", preview)
+
     def test_finish_is_idempotent_after_interruption(self) -> None:
         console = Console(
             file=io.StringIO(),

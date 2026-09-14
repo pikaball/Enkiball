@@ -63,6 +63,20 @@ class DirectoryPermissionTests(unittest.TestCase):
 
         self.assertEqual(target, Path(self.external.name) / "file.txt")
 
+    def test_configured_read_only_directory_rejects_file_writes(self) -> None:
+        protected = Path(self.workspace.name) / "protected"
+        protected.mkdir()
+        target = protected / "file.txt"
+        target.write_text("original", encoding="utf-8")
+        sandbox = Sandbox(
+            cwd=self.workspace.name,
+            ro_permissions=[protected],
+        )
+
+        self.assertEqual(sandbox.resolve_path(target, "read"), target)
+        with self.assertRaises(PermissionDeniedError):
+            sandbox.resolve_path(target, "write")
+
     def test_approval_grants_directory_for_session(self) -> None:
         sandbox = Sandbox(cwd=self.workspace.name, approval=True)
         requests: list[tuple[Path, str]] = []
@@ -160,6 +174,17 @@ class CliPermissionTests(unittest.TestCase):
         self.assertFalse(args.no_approval)
         self.assertFalse(args.privilleged)
         self.assertEqual(args.dir_permission, [])
+        self.assertEqual(args.ro_permission, [])
+        self.assertEqual(args.sandbox_network, "none")
+        self.assertEqual(args.sandbox_env, [])
+
+    def test_cli_accepts_sandbox_network_and_environment(self) -> None:
+        args = _parse_args(
+            ["--sandbox-network", "host", "--sandbox-env", "HTTP_PROXY"]
+        )
+
+        self.assertEqual(args.sandbox_network, "host")
+        self.assertEqual(args.sandbox_env, ["HTTP_PROXY"])
 
     def test_cli_accepts_repeated_directory_permissions(self) -> None:
         args = _parse_args(
@@ -175,6 +200,13 @@ class CliPermissionTests(unittest.TestCase):
         self.assertEqual(args.dir_permission, ["/first", "/second"])
         self.assertTrue(args.no_approval)
 
+    def test_cli_accepts_repeated_read_only_permissions(self) -> None:
+        args = _parse_args(
+            ["--ro-permission", "/first", "--ro-permission", "/second"]
+        )
+
+        self.assertEqual(args.ro_permission, ["/first", "/second"])
+
     def test_cli_accepts_privilleged_mode(self) -> None:
         args = _parse_args(["--privilleged"])
 
@@ -188,6 +220,9 @@ class CliPermissionTests(unittest.TestCase):
         kwargs = agent_class.call_args.kwargs
         self.assertFalse(kwargs["sandbox"])
         self.assertEqual(kwargs["dir_permissions"], [Path.cwd().anchor])
+        self.assertEqual(kwargs["ro_permissions"], [])
+        self.assertEqual(kwargs["sandbox_network"], "none")
+        self.assertEqual(kwargs["sandbox_inherit_env"], [])
         cli_class.return_value.run.assert_called_once_with()
 
     def test_escape_immediately_interrupts_approval(self) -> None:
@@ -277,12 +312,57 @@ class ExecSandboxTests(unittest.TestCase):
         self.assertEqual(stdout, "visible")
         self.assertEqual(secret.read_text(encoding="utf-8"), "visible")
 
+    def test_nested_read_only_directory_overrides_writable_cwd_mount(self) -> None:
+        protected = Path(self.workspace.name) / "protected"
+        protected.mkdir()
+        target = protected / "data.txt"
+        target.write_text("original", encoding="utf-8")
+        sandbox = Sandbox(
+            self.workspace.name,
+            network="host",
+            ro_permissions=[protected],
+        )
+
+        code, stdout, _ = sandbox.run(
+            f"cat {target}; printf changed > {target}"
+        )
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "original")
+        self.assertEqual(target.read_text(encoding="utf-8"), "original")
+
+    def test_writable_mount_precedes_read_only_mount(self) -> None:
+        protected = Path(self.workspace.name) / "protected"
+        protected.mkdir()
+        sandbox = Sandbox(
+            self.workspace.name,
+            ro_permissions=[protected],
+        )
+
+        argv = sandbox._build_bwrap_command("true")
+        writable = argv.index("--bind")
+        protected_mount = argv.index(str(protected.resolve()))
+
+        self.assertLess(writable, protected_mount)
+
     def test_network_is_unavailable(self) -> None:
         code, _, _ = self.sandbox.run(
             "python3 -c 'import socket; socket.create_connection((\"1.1.1.1\", 80), 1)'"
         )
 
         self.assertNotEqual(code, 0)
+
+    def test_host_network_does_not_unshare_network_namespace(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, network="host")
+
+        argv = sandbox._build_bwrap_command("true")
+
+        self.assertNotIn("--unshare-net", argv)
+
+    def test_default_network_unshares_network_namespace(self) -> None:
+        argv = self.sandbox._build_bwrap_command("true")
+
+        self.assertIn("--unshare-net", argv)
 
     def test_sensitive_host_environment_is_not_inherited(self) -> None:
         with patch.dict(os.environ, {"ENKIBALL_TEST_SECRET": "not-for-child"}):
@@ -292,6 +372,27 @@ class ExecSandboxTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(stdout, "unset")
+
+    def test_environment_can_be_explicitly_set_and_inherited(self) -> None:
+        with patch.dict(os.environ, {"ENKIBALL_INHERITED": "host"}):
+            sandbox = Sandbox(
+                cwd=self.workspace.name,
+                env={"ENKIBALL_EXPLICIT": "configured"},
+                inherit_env=["ENKIBALL_INHERITED"],
+            )
+            child_env = sandbox._sandbox_environment()
+
+        self.assertEqual(child_env["ENKIBALL_EXPLICIT"], "configured")
+        self.assertEqual(child_env["ENKIBALL_INHERITED"], "host")
+
+    def test_missing_inherited_environment_is_rejected(self) -> None:
+        sandbox = Sandbox(
+            cwd=self.workspace.name,
+            inherit_env=["ENKIBALL_MISSING_ENV"],
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "is not set"):
+                sandbox._sandbox_environment()
 
     def test_output_is_bounded(self) -> None:
         _, stdout, _ = self.sandbox.run(
@@ -420,6 +521,16 @@ class HostExecTests(unittest.TestCase):
         sandbox = Sandbox(cwd=self.workspace.name, sandbox=False)
         cases = (
             ("read_file", {"path": None}, "path must be a string"),
+            (
+                "read_file",
+                {"path": "x", "start": "0"},
+                "start must be an integer",
+            ),
+            (
+                "read_file",
+                {"path": "x", "end": False},
+                "end must be an integer",
+            ),
             (
                 "write_file",
                 {"path": "x", "content": None},

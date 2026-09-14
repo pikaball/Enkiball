@@ -11,6 +11,7 @@ from enkiball import Enkiball, EnkiballCLI
 from enkiball.config import (
     DEFAULT_STATE_PATH,
     load_config,
+    load_state,
     save_config,
     save_state,
 )
@@ -43,6 +44,71 @@ class SessionStorePathTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.store.load("linked")
+
+    def test_sessions_are_filtered_to_current_cwd_and_ancestors(self) -> None:
+        sessions = self.root / "sessions"
+        exports = self.root / "exports"
+        project = self.root / "project"
+        child = project / "src"
+        sibling = self.root / "sibling"
+        nested = child / "nested"
+        for directory in (project, child, sibling, nested):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        project_store = SessionStore._from_paths(sessions, exports, cwd=project)
+        project_record = project_store.create("project")
+        child_store = SessionStore._from_paths(sessions, exports, cwd=child)
+        child_record = child_store.create("child")
+        sibling_store = SessionStore._from_paths(sessions, exports, cwd=sibling)
+        sibling_store.create("sibling")
+        nested_store = SessionStore._from_paths(sessions, exports, cwd=nested)
+        nested_store.create("nested")
+
+        visible = child_store.list_sessions()
+
+        self.assertEqual(
+            {record.session_id for record in visible},
+            {project_record.session_id, child_record.session_id},
+        )
+        self.assertEqual(child_store.resolve("1"), visible[0].session_id)
+        with self.assertRaises(PermissionError):
+            child_store.load(sibling_store.current_session_id or "")
+
+    def test_saving_ancestor_session_preserves_its_bound_cwd(self) -> None:
+        sessions = self.root / "sessions"
+        exports = self.root / "exports"
+        project = self.root / "project"
+        child = project / "child"
+        child.mkdir(parents=True)
+        parent_store = SessionStore._from_paths(sessions, exports, cwd=project)
+        record = parent_store.create("parent")
+        child_store = SessionStore._from_paths(sessions, exports, cwd=child)
+
+        loaded = child_store.load(record.session_id)
+        loaded.messages.append({"role": "user", "content": "hello"})
+        child_store.save(loaded)
+
+        persisted = json.loads(
+            (sessions / f"{record.session_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["cwd"], str(project.resolve()))
+
+    def test_legacy_session_without_cwd_is_not_visible(self) -> None:
+        legacy = self.store.base_dir / "legacy.json"
+        legacy.write_text(
+            json.dumps(
+                {
+                    "session_id": "legacy",
+                    "name": "legacy",
+                    "messages": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.store.list_sessions(), [])
+        with self.assertRaises(PermissionError):
+            self.store.load("legacy")
 
 
 class AtomicJsonWriteTests(unittest.TestCase):
@@ -145,11 +211,38 @@ class StatePathTests(unittest.TestCase):
         agent = self.build_agent(state_path)
         cli = EnkiballCLI(agent)
 
-        cli.handler._model(["/model", "command-model"], agent._engine)
+        cli.handler._model(["/model", "command-model"])
 
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["active_model"], "command-model")
-        self.assertEqual(cli.handler.state_path, state_path)
+        self.assertEqual(agent.state_path, state_path)
+
+    def test_shared_files_are_read_once_per_agent(self) -> None:
+        state_path = self.root / "shared-state.json"
+        save_state({"active_provider": "first", "active_model": "one"}, state_path)
+        with patch("enkiball.agent.load_state", wraps=load_state) as read_state:
+            first = self.build_agent(state_path)
+            second = self.build_agent(state_path)
+            self.assertEqual(read_state.call_count, 2)
+        self.addCleanup(first.shutdown)
+        self.addCleanup(second.shutdown)
+
+        with patch("enkiball.config.load_state", side_effect=AssertionError("runtime read")), patch(
+            "enkiball.config.load_config", side_effect=AssertionError("runtime read")
+        ):
+            EnkiballCLI(first).handler._model(["/model", "changed"])
+            self.assertEqual(second.model, "one")
+            first.switch_provider("second")
+            second.switch_model("local")
+            self.assertEqual((first.provider, first.model), ("second", "two"))
+            self.assertEqual((second.provider, second.model), ("first", "local"))
+            self.assertEqual(first._engine._build_compact_request(None)["max_tokens"], 200)
+            self.assertEqual(second.list_models(remote=False), ["one"])
+
+        save_config({"providers": {}}, self.config_path)
+        self.assertEqual(second.list_models(remote=False), ["one"])
+        self.assertEqual(first.list_models(remote=False), ["two"])
+        self.assertEqual(json.loads(state_path.read_text())["active_provider"], "first")
 
     def test_legacy_migration_preserves_unknown_fields(self) -> None:
         state_path = self.root / "legacy-state.json"

@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterable, Literal
+from typing import BinaryIO, Callable, Iterable, Literal, Mapping
 
 
 class PermissionDeniedError(PermissionError):
@@ -24,6 +24,7 @@ class TurnInterrupted(Exception):
 
 
 ApprovalDecision = Literal["once", "always", "deny"]
+SandboxNetwork = Literal["none", "host"]
 ApprovalHandler = Callable[[Path, str], ApprovalDecision | bool]
 MAX_OUTPUT_BYTES = 1_000_000
 
@@ -35,23 +36,46 @@ class Sandbox:
         dir_permissions: Iterable[str | Path] | None = None,
         approval: bool = False,
         sandbox: bool = True,
+        network: SandboxNetwork = "none",
+        env: Mapping[str, str] | None = None,
+        inherit_env: Iterable[str] | None = None,
+        ro_permissions: Iterable[str | Path] | None = None,
     ) -> None:
         self.cwd = Path(cwd or Path.cwd()).expanduser().resolve()
         if not self.cwd.is_dir():
             raise NotADirectoryError(f"Working directory not found: {self.cwd}")
         self.approval = bool(approval)
         self.enabled = bool(sandbox)
+        if network not in {"none", "host"}:
+            raise ValueError("network must be 'none' or 'host'")
+        self.network: SandboxNetwork = network
+        self._env = self._validate_environment(env or {})
+        self._inherit_env = self._validate_environment_names(inherit_env or ())
         self._write_roots = {self.cwd}
         self._read_roots: set[Path] = set()
+        self._managed_read_roots: dict[str, set[Path]] = {}
         self._roots_lock = threading.RLock()
         self._approval_handler: ApprovalHandler | None = None
+        self._root_aliases: dict[Path, Path] = {}
         for path in dir_permissions or ():
-            self._write_roots.add(self._resolve_root(path))
+            resolved = self._resolve_root(path)
+            self._write_roots.add(resolved)
+            raw = Path(path).expanduser()
+            raw = raw if raw.is_absolute() else self.cwd / raw
+            if raw != resolved:
+                self._root_aliases[raw] = resolved
+        for path in ro_permissions or ():
+            resolved = self._resolve_root(path)
+            self._read_roots.add(resolved)
+            raw = Path(path).expanduser()
+            raw = raw if raw.is_absolute() else self.cwd / raw
+            if raw != resolved:
+                self._root_aliases[raw] = resolved
 
     @property
     def allowed_directories(self) -> tuple[Path, ...]:
         with self._roots_lock:
-            return tuple(sorted(self._write_roots | self._read_roots, key=str))
+            return tuple(sorted(self._write_roots | self._all_read_roots(), key=str))
 
     @property
     def writable_directories(self) -> tuple[Path, ...]:
@@ -61,7 +85,14 @@ class Sandbox:
     @property
     def read_only_directories(self) -> tuple[Path, ...]:
         with self._roots_lock:
-            return tuple(sorted(self._read_roots - self._write_roots, key=str))
+            return tuple(sorted(self._all_read_roots() - self._write_roots, key=str))
+
+    def set_managed_read_roots(
+        self, owner: str, paths: Iterable[str | Path]
+    ) -> None:
+        roots = {self._resolve_root(path) for path in paths}
+        with self._roots_lock:
+            self._managed_read_roots[owner] = roots
 
     def set_approval_handler(self, handler: ApprovalHandler | None) -> None:
         self._approval_handler = handler
@@ -216,10 +247,24 @@ class Sandbox:
 
     def _is_allowed(self, target: Path, *, write: bool = False) -> bool:
         with self._roots_lock:
-            roots = self._write_roots if write else self._write_roots | self._read_roots
+            read_only_roots = self._all_read_roots() - self._write_roots
+            if write and any(
+                target == root or target.is_relative_to(root)
+                for root in read_only_roots
+            ):
+                return False
+            roots = self._write_roots if write else self._write_roots | read_only_roots
             return any(
                 target == root or target.is_relative_to(root) for root in roots
             )
+
+    def _all_read_roots(self) -> set[Path]:
+        managed = (
+            set().union(*self._managed_read_roots.values())
+            if self._managed_read_roots
+            else set()
+        )
+        return self._read_roots | managed
 
     def _build_bwrap_command(self, command: str) -> list[str]:
         if platform.system() != "Linux":
@@ -234,22 +279,31 @@ class Sandbox:
             "--new-session",
             "--unshare-pid",
             "--unshare-ipc",
-            "--unshare-net",
-            "--tmpfs",
-            "/",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
         ]
+        if self.network == "none":
+            argv.append("--unshare-net")
+        argv.extend(
+            [
+                "--tmpfs",
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+            ]
+        )
+        for root in self.writable_directories:
+            argv.extend(("--bind", str(root), str(root)))
         for path in self._runtime_paths():
             argv.extend(("--ro-bind", str(path), str(path)))
         for root in self.read_only_directories:
             argv.extend(("--ro-bind", str(root), str(root)))
-        for root in self.writable_directories:
-            argv.extend(("--bind", str(root), str(root)))
+        # Editable installations may retain the configured symlink path in scripts.
+        for alias, target in self._root_aliases.items():
+            if not any(alias.is_relative_to(root) for root in self.allowed_directories):
+                argv.extend(("--dir", str(alias.parent), "--symlink", str(target), str(alias)))
         argv.extend(("--dir", "/tmp/enkiball-home"))
         argv.extend(("--chdir", str(self.cwd), "--", "/bin/sh", "-c", command))
         return argv
@@ -273,9 +327,31 @@ class Sandbox:
             "/etc/nsswitch.conf",
             "/etc/passwd",
             "/etc/resolv.conf",
-            "/etc/ssl",
+            "/etc/ssl"
         )
         return tuple(Path(path) for path in candidates if Path(path).exists())
+
+    @staticmethod
+    def _validate_environment(env: Mapping[str, str]) -> dict[str, str]:
+        validated: dict[str, str] = {}
+        for key, value in env.items():
+            if not isinstance(key, str) or not key or "=" in key or "\0" in key:
+                raise ValueError(f"invalid environment variable name: {key!r}")
+            if not isinstance(value, str):
+                raise TypeError(f"environment variable {key!r} must be a string")
+            if "\0" in value:
+                raise ValueError(f"environment variable {key!r} contains NUL")
+            validated[key] = value
+        return validated
+
+    @staticmethod
+    def _validate_environment_names(names: Iterable[str]) -> tuple[str, ...]:
+        validated: list[str] = []
+        for name in names:
+            if not isinstance(name, str) or not name or "=" in name or "\0" in name:
+                raise ValueError(f"invalid environment variable name: {name!r}")
+            validated.append(name)
+        return tuple(dict.fromkeys(validated))
 
     def _sandbox_environment(self) -> dict[str, str]:
         env: dict[str, str] = {
@@ -295,4 +371,9 @@ class Sandbox:
             ),
             "TMPDIR": "/tmp",
         }
+        for key in self._inherit_env:
+            if key not in os.environ:
+                raise ValueError(f"environment variable is not set: {key}")
+            env[key] = os.environ[key]
+        env.update(self._env)
         return {key: value for key, value in env.items() if value}

@@ -32,6 +32,7 @@ class SessionRecord:
     created_at: str
     updated_at: str
     messages: list[dict[str, Any]]
+    cwd: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -39,6 +40,7 @@ class SessionRecord:
             "name": self.name,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "cwd": self.cwd,
             "messages": self.messages,
         }
 
@@ -50,22 +52,28 @@ class SessionRecord:
             created_at=str(data.get("created_at", _now_iso())),
             updated_at=str(data.get("updated_at", _now_iso())),
             messages=list(data.get("messages", [])),
+            cwd=str(data["cwd"]) if data.get("cwd") is not None else None,
         )
 
 
 class SessionStore:
-    def __init__(self) -> None:
-        self._init_paths(SESSION_DIR, EXPORT_DIR)
+    def __init__(self, cwd: str | Path | None = None) -> None:
+        self._init_paths(SESSION_DIR, EXPORT_DIR, cwd)
 
     @classmethod
-    def _from_paths(cls, base_dir: Path, export_dir: Path) -> SessionStore:
+    def _from_paths(
+        cls, base_dir: Path, export_dir: Path, cwd: str | Path | None = None
+    ) -> SessionStore:
         store = cls.__new__(cls)
-        store._init_paths(base_dir, export_dir)
+        store._init_paths(base_dir, export_dir, cwd)
         return store
 
-    def _init_paths(self, base_dir: Path, export_dir: Path) -> None:
+    def _init_paths(
+        self, base_dir: Path, export_dir: Path, cwd: str | Path | None
+    ) -> None:
         self.base_dir = base_dir
         self.export_dir = export_dir
+        self.cwd = Path.cwd().resolve() if cwd is None else Path(cwd).expanduser().resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self.current_session_id: str | None = None
@@ -96,6 +104,7 @@ class SessionStore:
             created_at=_now_iso(),
             updated_at=_now_iso(),
             messages=initial_messages or [],
+            cwd=str(self.cwd),
         )
         self.current_session_id = record.session_id
         self.current_session_name = record.name
@@ -121,7 +130,9 @@ class SessionStore:
         for fp in sorted(self.base_dir.glob("*.json")):
             try:
                 data = json.loads(fp.read_text(encoding="utf-8"))
-                out.append(SessionRecord.from_dict(data))
+                record = SessionRecord.from_dict(data)
+                if self._belongs_to_cwd_scope(record):
+                    out.append(record)
             except Exception:
                 continue
         out.sort(key=lambda s: s.updated_at, reverse=True)
@@ -146,10 +157,17 @@ class SessionStore:
         if not fp.exists():
             raise FileNotFoundError(f"session not found: {session_id}")
         data = json.loads(fp.read_text(encoding="utf-8"))
-        return SessionRecord.from_dict(data)
+        record = SessionRecord.from_dict(data)
+        if not self._belongs_to_cwd_scope(record):
+            raise PermissionError(
+                f"session does not belong to cwd or an ancestor: {session_id}"
+            )
+        return record
 
     def save(self, record: SessionRecord) -> None:
         record.updated_at = _now_iso()
+        if record.cwd is None:
+            record.cwd = str(self.cwd)
         fp = self._path(record.session_id)
         atomic_write_json(fp, record.to_dict())
 
@@ -184,6 +202,7 @@ class SessionStore:
                 created_at=_now_iso(),
                 updated_at=_now_iso(),
                 messages=[],
+                cwd=str(self.cwd),
             )
         record.messages = messages
         self.save(record)
@@ -230,6 +249,15 @@ class SessionStore:
                 return raw
         return None
 
+    def _belongs_to_cwd_scope(self, record: SessionRecord) -> bool:
+        if record.cwd is None:
+            return False
+        try:
+            session_cwd = Path(record.cwd).expanduser().resolve()
+            return self.cwd == session_cwd or self.cwd.is_relative_to(session_cwd)
+        except (OSError, RuntimeError):
+            return False
+
     def export_session(self, session_id: str, out_path: str | None = None) -> Path:
         record = self.load(session_id)
         target = Path(out_path) if out_path else self.export_dir / f"{session_id}.md"
@@ -241,6 +269,7 @@ class SessionStore:
             f"- Name: {record.name}",
             f"- Created: {record.created_at}",
             f"- Updated: {record.updated_at}",
+            f"- CWD: {record.cwd}",
             "",
             "## Messages",
             "",

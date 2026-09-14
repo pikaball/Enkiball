@@ -22,8 +22,8 @@ Usage::
         agent.model = "gpt-4o"
 
         # MCP control
-        agent.mcp_start("ssh-mcp")
-        agent.mcp_stop("ssh-mcp")
+        agent.mcp.start("ssh-mcp")
+        agent.mcp.stop("ssh-mcp")
         agent.mcp_enable("ssh-mcp")
 
         # Token stats
@@ -49,7 +49,16 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncGenerator, Awaitable, Callable, Generator
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Generator,
+    Iterable,
+    Literal,
+    Mapping,
+)
 
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -60,11 +69,11 @@ from .config import (
     get_provider_models,
     get_providers,
     load_config,
+    load_state,
     save_config,
     set_active_model,
     set_active_provider,
     set_mcp_enabled,
-    list_mcp_servers,
 )
 from .llm import (
     ChatEngine,
@@ -77,6 +86,7 @@ from .llm import (
 from .mcp import MCPManager
 from .sandbox import ApprovalHandler, Sandbox
 from .session_store import SessionRecord, SessionStore
+from .skills import DEFAULT_SKILL_DIR, Skill, SkillRegistry
 
 
 @dataclass
@@ -93,10 +103,15 @@ class ChatResult:
 
 
 class _ChatResultCollector:
-    def __init__(self, on_tool_event: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        on_tool_event: Callable[[str], None] | None = None,
+        on_thinking_event: Callable[[str], None] | None = None,
+    ) -> None:
         self.tool_calls: list[dict[str, Any]] = []
         self.thinking_parts: list[str] = []
         self.on_tool_event = on_tool_event
+        self.on_thinking_event = on_thinking_event
 
     def on_tool(self, event: str) -> None:
         self.tool_calls.append({"raw": event})
@@ -105,6 +120,8 @@ class _ChatResultCollector:
 
     def on_thinking(self, text: str) -> None:
         self.thinking_parts.append(text)
+        if self.on_thinking_event:
+            self.on_thinking_event(text)
 
     def result(self, content: str, interrupted: bool = False) -> ChatResult:
         return ChatResult(
@@ -113,6 +130,48 @@ class _ChatResultCollector:
             thinking="".join(self.thinking_parts),
             interrupted=interrupted,
         )
+
+
+class _NoticeQueue(list[str]):
+    """List-compatible queue with atomic snapshot-and-drain support."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.RLock()
+
+    def append(self, item: str) -> None:
+        with self._lock:
+            super().append(item)
+
+    def extend(self, items: Iterable[str]) -> None:
+        with self._lock:
+            super().extend(items)
+
+    def insert(self, index: int, item: str) -> None:
+        with self._lock:
+            super().insert(index, item)
+
+    def clear(self) -> None:
+        with self._lock:
+            super().clear()
+
+    def pop(self, index: int = -1) -> str:
+        with self._lock:
+            return super().pop(index)
+
+    def remove(self, item: str) -> None:
+        with self._lock:
+            super().remove(item)
+
+    def snapshot(self) -> list[str]:
+        with self._lock:
+            return super().copy()
+
+    def drain(self) -> list[str]:
+        with self._lock:
+            notices = super().copy()
+            super().clear()
+            return notices
 
 
 class Enkiball:
@@ -124,13 +183,12 @@ class Enkiball:
         Path to ``agent.json``.  Defaults to ``config/agent.json``.
     state_path : str | Path
         Path for active provider/model state. Defaults to the shared Enkiball
-        state file.
+        state file. Loaded once at startup; persisted switches do not affect
+        other running instances.
     system_prompt : str | None
         Override the default system prompt.
     auto_start_mcp : bool
         If *True* (default), enabled MCP servers are started on init.
-    extra_tools : list[dict] | None
-        Extra OpenAI-style tool schemas to register alongside built-ins.
     on_tool_event : callable | None
         Optional callback ``(event_str) -> None`` fired before each tool
         execution.  Useful for logging / auditing.
@@ -140,13 +198,24 @@ class Enkiball:
     cwd : str | Path | None
         Working directory available to built-in file and command tools.
     dir_permissions : list[str | Path] | None
-        Additional directories available to built-in tools.
+        Additional writable directories available to built-in tools.
+    ro_permissions : list[str | Path] | None
+        Additional read-only directories available to built-in tools.
     approval : bool
         Allow an interactive frontend to request access outside configured
         directories. Without a frontend, access is denied.
     sandbox : bool
         Use the command sandbox. When false, commands run directly in the host
         environment. Defaults to true.
+    sandbox_network : {"none", "host"}
+        Network access for sandboxed commands. Defaults to ``"none"``.
+    sandbox_env : Mapping[str, str] | None
+        Environment variables explicitly supplied to sandboxed commands.
+    sandbox_inherit_env : Iterable[str] | None
+        Names of host environment variables inherited by sandboxed commands.
+    skill_dirs : list[str | Path] | None
+        Directories containing skill folders. Defaults to
+        ``~/.config/enkiball/skills``. Pass an empty list to disable skills.
     """
 
     def __init__(
@@ -154,30 +223,50 @@ class Enkiball:
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         system_prompt: str | None = None,
         auto_start_mcp: bool = True,
-        extra_tools: list[dict[str, Any]] | None = None,
         on_tool_event: Callable[[str], None] | None = None,
         session_dir: str | Path | None = None,
         cwd: str | Path | None = None,
         dir_permissions: list[str | Path] | None = None,
         approval: bool = False,
         sandbox: bool = True,
+        sandbox_network: Literal["none", "host"] = "none",
+        sandbox_env: Mapping[str, str] | None = None,
+        sandbox_inherit_env: Iterable[str] | None = None,
+        model: str | None = None,
         state_path: str | Path = DEFAULT_STATE_PATH,
+        skill_dirs: list[str | Path] | None = None,
+        ro_permissions: list[str | Path] | None = None,
     ) -> None:
         self._config_path = Path(config_path)
         self._state_path = Path(state_path)
         ensure_config(self._config_path)
-        self._config = load_config(self._config_path, self._state_path)
+        state = load_state(self._state_path)
+        self._config = load_config(self._config_path, self._state_path, state=state)
 
-        self._sandbox = Sandbox(cwd, dir_permissions, approval, sandbox)
-        self._mcp = MCPManager(self._config)
-        self._engine = ChatEngine(
-            self._config, self._mcp, self._sandbox, state_path=self._state_path
+        self._sandbox = Sandbox(
+            cwd,
+            dir_permissions,
+            approval,
+            sandbox,
+            network=sandbox_network,
+            env=sandbox_env,
+            inherit_env=sandbox_inherit_env,
+            ro_permissions=ro_permissions,
         )
+        self._skill_registry = SkillRegistry(
+            [DEFAULT_SKILL_DIR] if skill_dirs is None else skill_dirs
+        )
+        self._sandbox.set_managed_read_roots("skills", self._skill_registry.roots)
+        self._mcp = MCPManager(self._config)
+        self.notice_queue: list[str] = _NoticeQueue()
+        self._engine = ChatEngine(
+            self._config, self._mcp, self._sandbox, state_path=self._state_path,
+            model=model, state=state,
+        )
+        self._engine.notice_queue = self.notice_queue
         self._on_tool_event = on_tool_event
-        self._session_store = self._build_session_store(session_dir)
-
-        if extra_tools:
-            self._engine.set_extra_tools(extra_tools)
+        self._session_store = self._build_session_store(session_dir, self.cwd)
+        self._sync_skill_tool()
 
         if system_prompt is not None:
             self._engine.set_system_prompt(system_prompt)
@@ -190,22 +279,78 @@ class Enkiball:
         return self._sandbox.cwd
 
     @property
+    def config_path(self) -> Path:
+        return self._config_path
+
+    @property
+    def state_path(self) -> Path:
+        return self._state_path
+
+    @property
     def dir_permissions(self) -> tuple[Path, ...]:
         return self._sandbox.allowed_directories
+
+    @property
+    def ro_permissions(self) -> tuple[Path, ...]:
+        return self._sandbox.read_only_directories
 
     def _set_approval_handler(self, handler: ApprovalHandler | None) -> None:
         self._sandbox.set_approval_handler(handler)
 
     @staticmethod
-    def _build_session_store(session_dir: str | Path | None) -> SessionStore:
+    def _build_session_store(
+        session_dir: str | Path | None, cwd: Path
+    ) -> SessionStore:
         if session_dir is None:
-            return SessionStore()
+            return SessionStore(cwd=cwd)
         base_dir = Path(session_dir).expanduser().resolve()
-        return SessionStore._from_paths(base_dir, base_dir.parent / "exports")
+        return SessionStore._from_paths(
+            base_dir, base_dir.parent / "exports", cwd=cwd
+        )
 
     # ========================================================================
     # Custom tools
     # ========================================================================
+
+    def _sync_skill_tool(self) -> None:
+        if self._skill_registry.skills:
+            self._engine.set_internal_tool(
+                "skill",
+                self._skill_registry.tool_schema(),
+                self._skill_registry.handle_tool,
+            )
+        else:
+            self._engine.set_internal_tool("skill", None, None)
+
+    @property
+    def skills(self) -> tuple[Skill, ...]:
+        return self._skill_registry.skills
+
+    @property
+    def skill_diagnostics(self) -> tuple[str, ...]:
+        return self._skill_registry.diagnostics
+
+    def load_skill(self, name: str, resource: str | None = None) -> str:
+        return self._skill_registry.load(name, resource)
+
+    def reload_skills(self) -> tuple[Skill, ...]:
+        self._skill_registry.reload()
+        self._sandbox.set_managed_read_roots("skills", self._skill_registry.roots)
+        self._sync_skill_tool()
+        return self.skills
+
+    def _with_explicit_skills(
+        self, message: str, system_context: str | None
+    ) -> str | None:
+        registry = getattr(self, "_skill_registry", None)
+        if registry is None:
+            return system_context
+        skill_context = registry.activation_context(message)
+        if skill_context is None:
+            return system_context
+        if system_context:
+            return f"{system_context}\n\n{skill_context}"
+        return skill_context
 
     def register_tool(
         self,
@@ -311,26 +456,31 @@ class Enkiball:
     @property
     def provider(self) -> str:
         """Name of the active provider."""
-        return get_active_provider(self._config, self._state_path)
+        return get_active_provider(self._config, self._state_path, state=self._engine.state)
 
     @property
     def providers(self) -> dict[str, dict[str, Any]]:
         """Return a copy of all configured providers and their settings."""
         return json.loads(json.dumps(get_providers(self._config)))
 
-    def switch_provider(self, name: str, save: bool = True) -> bool:
+    def switch_provider(self, name: str) -> bool:
         """Switch to a different provider.  Returns False if not found.
 
         The selection is always persisted to ``state.json``.
         """
-        return set_active_provider(self._config, name, self._state_path)
+        switched = set_active_provider(
+            self._config, name, self._state_path, state=self._engine.state
+        )
+        if switched:
+            self._engine._model_override = None
+        return switched
 
-    def switch_model(self, model: str, save: bool = True) -> None:
+    def switch_model(self, model: str) -> None:
         """Switch model (within current provider).
 
         The selection is always persisted to ``state.json``.
         """
-        set_active_model(self._config, model, self._state_path)
+        self._engine.model = model
 
     def list_models(
         self,
@@ -349,11 +499,8 @@ class Enkiball:
             remote=remote,
             timeout=timeout,
             state_path=self._state_path,
+            state=self._engine.state,
         )
-
-    def refresh_models(self, timeout: float = 5.0) -> list[str]:
-        """Force-fetch remote models for the active provider and return the merged list."""
-        return self.list_models(remote=True, timeout=timeout)
 
     @property
     def system_prompt(self) -> str:
@@ -420,6 +567,7 @@ class Enkiball:
         prompt: str | None = None,
         on_token: Callable[[str], None] | None = None,
         on_retry: Callable[[RetryEvent], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         """Summarize prior conversation and set a compact boundary.
 
@@ -436,7 +584,9 @@ class Enkiball:
 
         Returns the summary text.
         """
-        return self._engine.compact(prompt=prompt, on_token=on_token, on_retry=on_retry)
+        return self._engine.compact(
+            prompt=prompt, on_token=on_token, on_retry=on_retry, should_stop=should_stop
+        )
 
     # ========================================================================
     # Live capture (thread-safe snapshot of in-flight streaming turn)
@@ -476,8 +626,6 @@ class Enkiball:
         and closes the OpenAI stream in its existing cleanup path.
         """
         self._engine.interrupt()
-
-    cancel = interrupt
 
     @property
     def interrupted(self) -> bool:
@@ -551,17 +699,30 @@ class Enkiball:
         message: str,
         images: list[str] | None = None,
         *,
+        on_token: Callable[[str], None] | None = None,
+        on_tool_event: Callable[[str], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
         on_retry: Callable[[RetryEvent], None] | None = None,
         system_context: str | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> ChatResult:
         """Send *message* and block until the full reply is collected."""
-        collector = _ChatResultCollector(self._on_tool_event)
+        def _emit_tool(event: str) -> None:
+            if self._on_tool_event:
+                self._on_tool_event(event)
+            if on_tool_event and on_tool_event is not self._on_tool_event:
+                on_tool_event(event)
+
+        collector = _ChatResultCollector(
+            _emit_tool if self._on_tool_event or on_tool_event else None,
+            on_thinking,
+        )
+        system_context = self._with_explicit_skills(message, system_context)
 
         content = self._engine.stream_reply(
             user_input=message,
             image_paths=images,
-            on_token=lambda _: None,
+            on_token=on_token or (lambda _: None),
             on_tool_event=collector.on_tool,
             on_thinking=collector.on_thinking,
             on_retry=on_retry,
@@ -569,6 +730,44 @@ class Enkiball:
             should_stop=should_stop,
         )
         return collector.result(content, interrupted=self._engine.interrupted())
+
+    def btw(
+        self,
+        message: str,
+        images: list[str] | None = None,
+        *,
+        on_token: Callable[[str], None] | None = None,
+        on_tool_event: Callable[[str], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        on_retry: Callable[[RetryEvent], None] | None = None,
+        system_context: str | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ChatResult:
+        """Run a one-off question without adding it to this agent's history.
+
+        The temporary turn uses the same model, configured tools, MCP clients,
+        sandbox, and conversation context as the foreground agent. Tool side
+        effects are intentionally preserved; only conversation messages and
+        token accounting are restored after the turn.
+        """
+        messages = self._engine.export_messages()
+        usage = TokenUsage(**self._engine.token_usage.to_dict())
+        last_interrupted = self._engine.interrupted()
+        try:
+            return self.chat(
+                message,
+                images,
+                on_token=on_token,
+                on_tool_event=on_tool_event,
+                on_thinking=on_thinking,
+                on_retry=on_retry,
+                system_context=system_context,
+                should_stop=should_stop,
+            )
+        finally:
+            self._engine.load_messages(messages)
+            self._engine.token_usage = usage
+            self._engine._last_turn_interrupted = last_interrupted
 
     def stream(
         self,
@@ -584,6 +783,7 @@ class Enkiball:
         The generator's return value (``StopIteration.value``) is a
         :class:`ChatResult`.
         """
+        system_context = self._with_explicit_skills(message, system_context)
         tokens: list[str] = []
         collector = _ChatResultCollector(self._on_tool_event)
         _q: queue.Queue[str] = queue.Queue()
@@ -654,6 +854,7 @@ class Enkiball:
     ) -> ChatResult:
         """Async version of :meth:`chat`.  Collects the full reply then returns."""
         collector = _ChatResultCollector(self._on_tool_event)
+        system_context = self._with_explicit_skills(message, system_context)
 
         content = await self._engine.astream_reply(
             user_input=message,
@@ -688,53 +889,22 @@ class Enkiball:
         via :attr:`history`.  To capture them live, use
         :meth:`astream_events` instead.
         """
-        collector = _ChatResultCollector(self._on_tool_event)
-        q: asyncio.Queue[str | object] = asyncio.Queue()
-        sentinel: object = object()
-
-        async def _on_token(tok: str) -> None:
-            await q.put(tok)
-
-        async def _run() -> None:
-            try:
-                await self._engine.astream_reply(
-                    user_input=message,
-                    image_paths=images,
-                    on_token=_on_token,
-                    on_tool_event=collector.on_tool,
-                    on_thinking=collector.on_thinking,
-                    on_retry=on_retry,
-                    system_context=system_context,
-                    should_stop=should_stop,
-                )
-            finally:
-                await q.put(sentinel)
-
-        task = asyncio.create_task(_run())
-        try:
-            while True:
-                item = await q.get()
-                if item is sentinel:
-                    break
-                yield item  # type: ignore[misc]
-        finally:
-            if not task.done():
-                self._engine.interrupt()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            else:
-                # Surface any exception from the worker
-                exc = task.exception()
-                if exc is not None:
-                    raise exc
+        async for event in self.astream_events(
+            message,
+            images,
+            on_retry=on_retry,
+            system_context=system_context,
+            should_stop=should_stop,
+        ):
+            if event["type"] == "token":
+                yield event["data"]
 
     async def astream_events(
         self,
         message: str,
         images: list[str] | None = None,
         *,
+        on_retry: Callable[[RetryEvent], Awaitable[None] | None] | None = None,
         system_context: str | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -751,6 +921,7 @@ class Enkiball:
         content tokens.
         """
         collector = _ChatResultCollector(self._on_tool_event)
+        system_context = self._with_explicit_skills(message, system_context)
         tokens: list[str] = []
         q: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
         sentinel: object = object()
@@ -768,6 +939,10 @@ class Enkiball:
             await q.put({"type": "thinking", "data": text})
 
         async def _on_retry(event: RetryEvent) -> None:
+            if on_retry is not None:
+                callback_result = on_retry(event)
+                if asyncio.iscoroutine(callback_result):
+                    await callback_result
             await q.put({"type": "retry", "data": event})
 
         result_box: list[str] = []
@@ -819,10 +994,11 @@ class Enkiball:
         prompt: str | None = None,
         on_token: Callable[[str], Awaitable[None] | None] | None = None,
         on_retry: Callable[[RetryEvent], Awaitable[None] | None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         """Async version of :meth:`compact`."""
         return await self._engine.acompact(
-            prompt=prompt, on_token=on_token, on_retry=on_retry
+            prompt=prompt, on_token=on_token, on_retry=on_retry, should_stop=should_stop
         )
 
     # ========================================================================
@@ -885,14 +1061,6 @@ class Enkiball:
         """Direct access to the MCP manager."""
         return self._mcp
 
-    def mcp_start(self, name: str) -> tuple[bool, str]:
-        """Start a specific MCP server by name."""
-        return self._mcp.start(name)
-
-    def mcp_stop(self, name: str) -> tuple[bool, str]:
-        """Stop a specific MCP server by name."""
-        return self._mcp.stop(name)
-
     def mcp_enable(self, name: str, save: bool = False) -> bool:
         """Enable an MCP server in config and start it."""
         ok = set_mcp_enabled(self._config, name, True)
@@ -916,21 +1084,9 @@ class Enkiball:
             save_config(self._config, self._config_path)
         return True
 
-    def mcp_status(self) -> dict[str, str]:
-        """Return status dict: server_name -> RUNNING|STOPPED."""
-        return self._mcp.status()
-
-    def mcp_servers(self) -> dict[str, dict[str, Any]]:
-        """Return configured MCP servers from config."""
-        return list_mcp_servers(self._config)
-
     # ========================================================================
     # Session management (optional – requires explicit init)
     # ========================================================================
-
-    def init_session_store(self) -> SessionStore:
-        """Return the session store initialized by the constructor."""
-        return self._session_store
 
     @property
     def session_store(self) -> SessionStore:

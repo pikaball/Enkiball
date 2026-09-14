@@ -10,9 +10,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Awaitable, Callable
+from typing import Any, AsyncGenerator, Awaitable, Callable, Literal
 from uuid import uuid4
 
+import httpx
 from openai import AsyncOpenAI, OpenAI
 
 from .config import (
@@ -20,10 +21,12 @@ from .config import (
     get_active_model,
     get_model_params,
     get_system_prompt,
+    load_state,
     resolve_provider_credentials,
     set_active_model,
 )
 from .llm_tools import TOOL_SCHEMAS, dispatch_tool
+from .interruptible_http import InterruptibleAsyncTransport, InterruptibleTransport
 from .message_codec import (
     build_user_content,
     default_messages,
@@ -50,7 +53,7 @@ DEFAULT_COMPACT_PROMPT = (
 
 DEFAULT_AUTO_COMPACT_THRESHOLD_RATIO = 0.7
 DEFAULT_ENDPOINT_MAX_TOKENS = 300000
-TOOL_CALL_LIMIT = 256
+TOOL_CALL_LIMIT = 512
 MAX_REQUEST_RETRIES = 10
 REQUEST_RETRY_DELAYS = (3, 5, 10, 30, 60, 120, 180)
 
@@ -91,6 +94,16 @@ class TurnUsage:
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
+
+    def update(self, event: Any) -> None:
+        usage = getattr(event, "usage", None)
+        if usage is None:
+            return
+        # Stream usage is cumulative; a final chunk may repeat earlier counts.
+        for name in ("prompt_tokens", "completion_tokens"):
+            value = getattr(usage, name, None)
+            if value is not None:
+                setattr(self, name, int(value))
 
 
 @dataclass
@@ -149,9 +162,13 @@ class ChatEngine:
         mcp_manager: MCPManager | None = None,
         sandbox: Sandbox | None = None,
         state_path: Path = DEFAULT_STATE_PATH,
+        model: str | None = None,
+        state: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.state_path = Path(state_path)
+        self.state = copy.deepcopy(load_state(self.state_path) if state is None else state)
+        self._model_override = model
         self.mcp_manager = mcp_manager
         self.sandbox = sandbox or Sandbox()
         # Use system prompt from config if set, otherwise use default
@@ -173,9 +190,12 @@ class ChatEngine:
             int(legacy_threshold) if legacy_threshold else None
         )
         self.auto_compact_prompt: str | None = compact_cfg.get("prompt") or None
-        self._extra_tools: list[dict[str, Any]] = []
+        self._custom_tool_schemas: list[dict[str, Any]] = []
         # Custom tool handlers: name -> callable(args_dict) -> str
         self._tool_handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
+        self._internal_tools: dict[str, dict[str, Any]] = {}
+        self._internal_tool_handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
+        self.notice_queue: list[str] = []
         self.compact_index: int = 0
 
         # Live streaming buffer — updated incrementally during stream_reply /
@@ -208,7 +228,7 @@ class ChatEngine:
     def _auto_compact_effective_threshold_tokens(self) -> int:
         if self.auto_compact_threshold_tokens is not None:
             return self.auto_compact_threshold_tokens
-        model_params = get_model_params(self.config, state_path=self.state_path)
+        model_params = get_model_params(self.config, self.model, state_path=self.state_path, state=self.state)
         endpoint_max_tokens = int(
             model_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS)
             or DEFAULT_ENDPOINT_MAX_TOKENS
@@ -227,7 +247,6 @@ class ChatEngine:
         self,
         on_token: Callable[[str], None] | None = None,
         on_retry: Callable[[RetryEvent], None] | None = None,
-        turn: TurnContext | None = None,
     ) -> str | None:
         if not self._should_auto_compact():
             return None
@@ -239,7 +258,6 @@ class ChatEngine:
         self,
         on_token: Callable[[str], Awaitable[None] | None] | None = None,
         on_retry: Callable[[RetryEvent], Awaitable[None] | None] | None = None,
-        turn: TurnContext | None = None,
     ) -> str | None:
         if not self._should_auto_compact():
             return None
@@ -333,6 +351,56 @@ class ChatEngine:
         return turn.interrupted
 
     @staticmethod
+    def _start_stop_watcher(
+        turn: TurnContext,
+        should_stop: Callable[[], bool] | None,
+    ) -> tuple[threading.Event, threading.Thread] | None:
+        """Bridge an external stop callback into the turn cancellation event.
+
+        ``should_stop`` is normally polled between streamed LLM chunks. A
+        synchronous tool call can run for much longer than that interval, so
+        polling must continue while the tool is executing as well. Built-in
+        tools such as ``run_command`` receive ``turn.cancel_event`` and can
+        terminate their child process as soon as this watcher cancels it.
+        """
+        if should_stop is None:
+            return None
+        stopped = threading.Event()
+
+        def _watch() -> None:
+            while not stopped.wait(0.05):
+                try:
+                    if should_stop():
+                        turn.cancel()
+                        return
+                except Exception:
+                    # A stop callback must never make the model turn fail.
+                    return
+
+        watcher = threading.Thread(
+            target=_watch,
+            name="enkiball-stop-watcher",
+            daemon=True,
+        )
+        watcher.start()
+        return stopped, watcher
+
+    @staticmethod
+    async def _watch_async_stop(
+        turn: TurnContext,
+        should_stop: Callable[[], bool],
+    ) -> None:
+        """Async counterpart of :meth:`_start_stop_watcher`."""
+        while True:
+            await asyncio.sleep(0.05)
+            try:
+                if should_stop():
+                    turn.cancel()
+                    return
+            except Exception:
+                return
+
+    @staticmethod
     def _retry_delay(attempt: int) -> int:
         idx = min(max(attempt, 1), len(REQUEST_RETRY_DELAYS)) - 1
         return REQUEST_RETRY_DELAYS[idx]
@@ -372,14 +440,18 @@ class ChatEngine:
 
     @property
     def model(self) -> str:
-        return get_active_model(self.config, self.state_path)
+        return self._model_override or get_active_model(self.config, self.state_path, state=self.state)
 
     @model.setter
     def model(self, new_model: str) -> None:
-        set_active_model(self.config, new_model, self.state_path)
+        # Explicit runtime switching keeps the historical persistent behavior.
+        # Constructor-level overrides (used by isolated solver roles) avoid
+        # touching the shared active-model state.
+        self._model_override = None
+        set_active_model(self.config, new_model, self.state_path, state=self.state)
 
     def _client(self) -> OpenAI:
-        api_key, base_url = resolve_provider_credentials(self.config, self.state_path)
+        api_key, base_url = resolve_provider_credentials(self.config, self.state_path, state=self.state)
         if not api_key:
             raise RuntimeError(
                 "Missing API key. Set the appropriate env var or configure "
@@ -388,10 +460,14 @@ class ChatEngine:
         kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        return OpenAI(**kwargs)
+        turn = self._active_turn
+        transport = InterruptibleTransport(turn.cancel_event if turn else threading.Event())
+        return OpenAI(**kwargs, max_retries=0, http_client=httpx.Client(
+            transport=transport, trust_env=False, timeout=httpx.Timeout(600, connect=5),
+        ))
 
     def _async_client(self) -> AsyncOpenAI:
-        api_key, base_url = resolve_provider_credentials(self.config, self.state_path)
+        api_key, base_url = resolve_provider_credentials(self.config, self.state_path, state=self.state)
         if not api_key:
             raise RuntimeError(
                 "Missing API key. Configure api_key in your provider config."
@@ -399,11 +475,16 @@ class ChatEngine:
         kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        return AsyncOpenAI(**kwargs)
+        turn = self._active_turn
+        transport = InterruptibleAsyncTransport(turn.cancel_event if turn else threading.Event())
+        return AsyncOpenAI(**kwargs, max_retries=0, http_client=httpx.AsyncClient(
+            transport=transport, trust_env=False, timeout=httpx.Timeout(600, connect=5),
+        ))
 
     def _get_tools(self) -> list[dict[str, Any]]:
         tools = list(TOOL_SCHEMAS)
-        tools.extend(self._extra_tools)
+        tools.extend(copy.deepcopy(list(self._internal_tools.values())))
+        tools.extend(self._custom_tool_schemas)
         if self.mcp_manager:
             tools.extend(self.mcp_manager.get_tools())
         return tools
@@ -415,11 +496,6 @@ class ChatEngine:
             if isinstance(fn_block, dict):
                 return str(fn_block.get("name", fallback))
         return fallback
-
-    def set_extra_tools(self, schemas: list[dict[str, Any]]) -> None:
-        if schemas:
-            raise ValueError("extra_tools requires handlers; use register_tool()")
-        self._extra_tools = []
 
     def register_tool(
         self,
@@ -440,20 +516,49 @@ class ChatEngine:
         builtins = {self._tool_schema_name(item) for item in TOOL_SCHEMAS}
         if tool_name in builtins or tool_name.startswith("mcp__"):
             raise ValueError(f"reserved tool name: {tool_name}")
+        if tool_name in self._internal_tool_handlers:
+            raise ValueError(f"reserved tool name: {tool_name}")
         if tool_name in self._tool_handlers or any(
-            self._tool_schema_name(item) == tool_name for item in self._extra_tools
+            self._tool_schema_name(item) == tool_name
+            for item in self._custom_tool_schemas
         ):
             raise ValueError(f"tool already registered: {tool_name}")
-        self._extra_tools.append(copy.deepcopy(schema))
+        self._custom_tool_schemas.append(copy.deepcopy(schema))
         self._tool_handlers[tool_name] = handler
         return tool_name
+
+    def set_internal_tool(
+        self,
+        name: str,
+        schema: dict[str, Any] | None,
+        handler: Callable[[dict[str, Any]], Any] | None,
+    ) -> None:
+        self._internal_tools.pop(name, None)
+        self._internal_tool_handlers.pop(name, None)
+        if schema is None or handler is None:
+            return
+        tool_name = self._tool_schema_name(schema, name)
+        if tool_name != name:
+            raise ValueError("internal tool schema name does not match")
+        if schema.get("type") != "function" or not isinstance(
+            schema.get("function"), dict
+        ):
+            raise ValueError("tool schema must be an OpenAI function schema")
+        parameters = schema["function"].get("parameters")
+        if not isinstance(parameters, dict) or parameters.get("type") != "object":
+            raise ValueError("tool parameters must be an object schema")
+        builtins = {self._tool_schema_name(item) for item in TOOL_SCHEMAS}
+        if name in builtins or name.startswith("mcp__") or name in self._tool_handlers:
+            raise ValueError(f"reserved tool name: {name}")
+        self._internal_tools[name] = copy.deepcopy(schema)
+        self._internal_tool_handlers[name] = handler
 
     def unregister_tool(self, name: str) -> bool:
         existed = name in self._tool_handlers
         self._tool_handlers.pop(name, None)
-        self._extra_tools = [
+        self._custom_tool_schemas = [
             schema
-            for schema in self._extra_tools
+            for schema in self._custom_tool_schemas
             if self._tool_schema_name(schema) != name
         ]
         return existed
@@ -583,14 +688,23 @@ class ChatEngine:
 
     @staticmethod
     def _flatten_mcp_content(mcp_res: Any) -> dict[str, Any]:
-        payload: dict[str, Any] = {"ok": True, "raw": mcp_res}
-        if not isinstance(mcp_res, dict) or "content" not in mcp_res:
-            return payload
+        if not isinstance(mcp_res, dict):
+            return {"ok": True, "result": mcp_res}
+
+        is_error = bool(mcp_res.get("isError"))
+        payload: dict[str, Any] = {"ok": not is_error}
+        for key, value in mcp_res.items():
+            if key not in {"content", "isError"}:
+                payload[key] = value
+
         content_list = mcp_res.get("content", [])
         texts: list[str] = []
         saved_images: list[str] = []
+        other_content: list[Any] = []
         for item in content_list:
-            if item.get("type") == "text":
+            if not isinstance(item, dict):
+                other_content.append(item)
+            elif item.get("type") == "text":
                 texts.append(item.get("text", ""))
             elif item.get("type") == "image":
                 data = item.get("data")
@@ -598,15 +712,20 @@ class ChatEngine:
                     try:
                         path = ChatEngine._persist_mcp_image(data, item.get("mimeType"))
                         saved_images.append(path)
-                        texts.append(f"[Image saved: {path}]")
                         continue
                     except Exception:
                         pass
-                texts.append("[Image data]")
-        payload["text"] = "\n".join(texts)
+                other_content.append(
+                    {key: value for key, value in item.items() if key != "data"}
+                )
+            else:
+                other_content.append(item)
+        if texts:
+            payload["text"] = "\n".join(texts)
         if saved_images:
             payload["images"] = saved_images
-        payload["is_error"] = bool(mcp_res.get("isError"))
+        if other_content:
+            payload["content"] = other_content
         return payload
 
     def _dispatch_tool(
@@ -615,8 +734,16 @@ class ChatEngine:
         args: dict[str, Any],
         turn: TurnContext | None = None,
     ) -> str:
-        # Custom tools registered via register_tool() take precedence
-        handler = self._tool_handlers.get(name)
+        result = self._dispatch_tool_raw(name, args, turn)
+        return self._attach_sys_notices(result)
+
+    def _dispatch_tool_raw(
+        self,
+        name: str,
+        args: dict[str, Any],
+        turn: TurnContext | None = None,
+    ) -> str:
+        handler = self._internal_tool_handlers.get(name) or self._tool_handlers.get(name)
         if handler is not None:
             try:
                 result = handler(args)
@@ -647,6 +774,25 @@ class ChatEngine:
         except Exception as e:  # noqa: BLE001
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
+    def _attach_sys_notices(self, tool_result: str) -> str:
+        drain = getattr(self.notice_queue, "drain", None)
+        if callable(drain):
+            notices = drain()
+        else:
+            notices = list(self.notice_queue)
+            self.notice_queue.clear()
+        if not notices:
+            return tool_result
+        notice_block = (
+            "<sys-notice>\n"
+            "Delayed system notices supplied by the harness:\n"
+            f"{json.dumps(notices, ensure_ascii=False, default=str)}\n"
+            "</sys-notice>"
+        )
+        if not tool_result:
+            return notice_block
+        return f"{tool_result}\n\n{notice_block}"
+
     @staticmethod
     def _collect_stream_output(
         stream: Any,
@@ -665,15 +811,8 @@ class ChatEngine:
                 if should_stop and should_stop():
                     interrupted = True
                     break
+                usage.update(event)
                 if not event.choices:
-                    # Check for usage in final chunk
-                    if hasattr(event, "usage") and event.usage:
-                        usage.prompt_tokens = (
-                            getattr(event.usage, "prompt_tokens", 0) or 0
-                        )
-                        usage.completion_tokens = (
-                            getattr(event.usage, "completion_tokens", 0) or 0
-                        )
                     continue
 
                 delta = event.choices[0].delta
@@ -705,6 +844,8 @@ class ChatEngine:
                         entry["name"] = tc.function.name
                     if tc.function and tc.function.arguments:
                         entry["arguments_parts"].append(tc.function.arguments)
+        except TurnInterrupted:
+            interrupted = True
         finally:
             close_fn = getattr(stream, "close", None)
             if callable(close_fn):
@@ -748,16 +889,129 @@ class ChatEngine:
             ]
         messages.append(assistant_msg)
 
+    def _build_stream_request(self, llm_params: dict[str, Any]) -> dict[str, Any]:
+        create_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._prepare_messages_for_api(),
+            "temperature": llm_params.get("temperature", 1),
+            "max_tokens": llm_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        tools = self._get_tools()
+        if tools:
+            create_kwargs["tools"] = tools
+            create_kwargs["tool_choice"] = "auto"
+        if "extra_body" in llm_params:
+            create_kwargs["extra_body"] = llm_params["extra_body"]
+        return create_kwargs
+
+    def _record_stream_response(
+        self,
+        assistant_content: str,
+        reasoning_content: str,
+        tool_calls: list[ParsedToolCall],
+        interrupted: bool,
+        usage: TurnUsage,
+        turn: TurnContext,
+        should_stop: Callable[[], bool] | None,
+    ) -> Literal["interrupted", "complete", "tools"]:
+        self.token_usage.add(usage.prompt_tokens, usage.completion_tokens)
+        if interrupted or self._should_stop(turn, should_stop):
+            if assistant_content or reasoning_content:
+                self._append_assistant_message(
+                    self.messages, assistant_content, [], reasoning_content
+                )
+                self.messages[-1]["_usage"] = {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                }
+            return "interrupted"
+
+        self._append_assistant_message(
+            self.messages, assistant_content, tool_calls, reasoning_content
+        )
+        self.messages[-1]["_usage"] = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+        }
+        return "tools" if tool_calls else "complete"
+
+    def _record_interrupted_tool_calls(
+        self, tool_calls: list[ParsedToolCall], start_index: int
+    ) -> None:
+        interrupted_result = json.dumps(
+            {"ok": False, "error": "turn interrupted"}, ensure_ascii=False
+        )
+        for pending in tool_calls[start_index:]:
+            self.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": pending.tool_call_id,
+                    "content": interrupted_result,
+                }
+            )
+
+    def _append_tool_result(self, tool_call_id: str, result: str) -> None:
+        self.messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "content": result}
+        )
+
+    def _tool_loop_fallback(self) -> str:
+        fallback = "Tool-calling loop reached limit. Please refine the request."
+        self.messages.append({"role": "assistant", "content": fallback})
+        return fallback
+
+    def _build_compact_request(self, prompt: str | None) -> dict[str, Any]:
+        temp_msgs = self._prepare_history_for_api(
+            self.messages[self.compact_index :]
+        )
+        temp_msgs.append({"role": "user", "content": prompt or DEFAULT_COMPACT_PROMPT})
+        model_params = get_model_params(self.config, self.model, state_path=self.state_path, state=self.state)
+        create_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": temp_msgs,
+            "temperature": model_params.get("temperature", 0.2),
+            "max_tokens": model_params.get(
+                "max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS
+            ),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if "extra_body" in model_params:
+            create_kwargs["extra_body"] = model_params["extra_body"]
+        return create_kwargs
+
+    def _commit_compact_summary(self, summary: str, usage: TurnUsage) -> None:
+        self.token_usage.add(usage.prompt_tokens, usage.completion_tokens)
+        compact_marker: dict[str, Any] = {
+            "role": "system",
+            "content": f"[Compact summary of prior conversation]\n\n{summary}",
+            "_compact": True,
+            "_usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+            },
+        }
+        self.messages.append(compact_marker)
+        self.compact_index = len(self.messages) - 1
+
     def compact(
         self,
         prompt: str | None = None,
         on_token: Callable[[str], None] | None = None,
         on_retry: Callable[[RetryEvent], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         turn = self._begin_turn()
+        watcher = self._start_stop_watcher(turn, should_stop)
         try:
             return self._compact_impl(prompt, on_token, on_retry)
         finally:
+            if watcher is not None:
+                stopped, thread = watcher
+                stopped.set()
+                thread.join(timeout=0.2)
             self._end_turn(turn)
 
     def _compact_impl(
@@ -773,25 +1027,8 @@ class ChatEngine:
 
         Returns the summary text.
         """
-        compact_prompt = prompt or DEFAULT_COMPACT_PROMPT
-
-        # Build a temporary message list: current API-visible messages + the
-        # compact instruction as a user message.
-        temp_msgs = self._prepare_history_for_api(self.messages[self.compact_index :])
-        temp_msgs.append({"role": "user", "content": compact_prompt})
-
+        create_kwargs = self._build_compact_request(prompt)
         client = self._client()
-        model_params = get_model_params(self.config, state_path=self.state_path)
-        create_kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": temp_msgs,
-            "temperature": model_params.get("temperature", 0.2),
-            "max_tokens": model_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if "extra_body" in model_params:
-            create_kwargs["extra_body"] = model_params["extra_body"]
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             summary_parts: list[str] = []
             usage = TurnUsage()
@@ -799,14 +1036,8 @@ class ChatEngine:
                 stream: Any = client.chat.completions.create(**create_kwargs)
                 try:
                     for event in stream:
+                        usage.update(event)
                         if not event.choices:
-                            if hasattr(event, "usage") and event.usage:
-                                usage.prompt_tokens = (
-                                    getattr(event.usage, "prompt_tokens", 0) or 0
-                                )
-                                usage.completion_tokens = (
-                                    getattr(event.usage, "completion_tokens", 0) or 0
-                                )
                             continue
                         delta = event.choices[0].delta
                         if delta.content:
@@ -819,34 +1050,24 @@ class ChatEngine:
                         close_fn()
                 break
             except Exception as exc:
+                if self._active_turn is not None and self._active_turn.interrupted:
+                    client.close()
+                    raise TurnInterrupted from exc
                 if summary_parts or attempt >= MAX_REQUEST_RETRIES:
                     client.close()
                     raise
                 delay = self._retry_delay(attempt + 1)
                 if on_retry:
                     on_retry(self._retry_event(attempt + 1, delay, exc))
-                if not self._wait_for_retry(delay):
+                if not self._wait_for_retry(
+                    delay, should_stop=lambda: self.interrupted()
+                ):
                     client.close()
-                    raise
+                    raise TurnInterrupted
 
         client.close()
-        self.token_usage.add(usage.prompt_tokens, usage.completion_tokens)
         summary = "".join(summary_parts)
-
-        # Insert a compact marker: a system message with the summary.
-        # All messages before this marker will be skipped when sending to the LLM.
-        compact_marker: dict[str, Any] = {
-            "role": "system",
-            "content": f"[Compact summary of prior conversation]\n\n{summary}",
-            "_compact": True,
-            "_usage": {
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-            },
-        }
-        self.messages.append(compact_marker)
-        self.compact_index = len(self.messages) - 1
-
+        self._commit_compact_summary(summary, usage)
         return summary
 
     def stream_reply(
@@ -861,6 +1082,7 @@ class ChatEngine:
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
         turn = self._begin_turn()
+        watcher = self._start_stop_watcher(turn, should_stop)
         try:
             return self._stream_reply_impl(
                 user_input,
@@ -874,6 +1096,10 @@ class ChatEngine:
                 turn,
             )
         finally:
+            if watcher is not None:
+                stopped, thread = watcher
+                stopped.set()
+                thread.join(timeout=0.2)
             self._end_turn(turn)
 
     def _stream_reply_impl(
@@ -895,7 +1121,7 @@ class ChatEngine:
             self.messages.append({"role": "system", "content": system_context})
         self.messages.append({"role": "user", "content": content})
 
-        llm_params = get_model_params(self.config, state_path=self.state_path)
+        llm_params = get_model_params(self.config, self.model, state_path=self.state_path, state=self.state)
         client = self._client()
 
         self._live_reset()
@@ -918,23 +1144,7 @@ class ChatEngine:
             for _ in range(TOOL_CALL_LIMIT):
                 if self._should_stop(turn, should_stop):
                     return ""
-                current_tools = self._get_tools()
-                kwargs: dict[str, Any] = {}
-                if current_tools:
-                    kwargs["tools"] = current_tools
-                    kwargs["tool_choice"] = "auto"
-
-                create_kwargs: dict[str, Any] = {
-                    "model": self.model,
-                    "messages": self._prepare_messages_for_api(),
-                    "temperature": llm_params.get("temperature", 1),
-                    "max_tokens": llm_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                }
-                if "extra_body" in llm_params:
-                    create_kwargs["extra_body"] = llm_params["extra_body"]
-                create_kwargs.update(kwargs)
+                create_kwargs = self._build_stream_request(llm_params)
 
                 for attempt in range(MAX_REQUEST_RETRIES + 1):
                     emitted_before = self.capture()
@@ -949,11 +1159,13 @@ class ChatEngine:
                         ) = self._collect_stream_output(
                             stream,
                             _tok,
-                            on_thinking=_think if self.show_thinking else None,
+                            on_thinking=_think,
                             should_stop=lambda: self._should_stop(turn, should_stop),
                         )
                         break
                     except Exception as exc:
+                        if self._should_stop(turn, should_stop):
+                            return ""
                         emitted_after = self.capture()
                         emitted = (
                             emitted_after.content != emitted_before.content
@@ -968,29 +1180,20 @@ class ChatEngine:
                             delay,
                             should_stop=lambda: self._should_stop(turn, should_stop),
                         ):
-                            raise
-                self.token_usage.add(
-                    turn_usage.prompt_tokens, turn_usage.completion_tokens
+                            return ""
+                response_state = self._record_stream_response(
+                    assistant_content,
+                    reasoning_content,
+                    tool_calls,
+                    interrupted,
+                    turn_usage,
+                    turn,
+                    should_stop,
                 )
-
-                if interrupted or self._should_stop(turn, should_stop):
-                    if assistant_content:
-                        self._append_assistant_message(
-                            self.messages, assistant_content, [], reasoning_content
-                        )
+                if response_state == "interrupted":
                     return assistant_content
-                self._append_assistant_message(
-                    self.messages, assistant_content, tool_calls, reasoning_content
-                )
-
-                if not tool_calls:
-                    assistant_msg = self.messages[-1]
-                    if isinstance(assistant_msg, dict):
-                        assistant_msg["_usage"] = {
-                            "prompt_tokens": turn_usage.prompt_tokens,
-                            "completion_tokens": turn_usage.completion_tokens,
-                        }
-                    self._auto_compact_if_needed(on_retry=on_retry, turn=turn)
+                if response_state == "complete":
+                    self._auto_compact_if_needed(on_retry=on_retry)
                     return assistant_content
 
                 for index, tc in enumerate(tool_calls):
@@ -1001,31 +1204,13 @@ class ChatEngine:
                             raise TurnInterrupted
                         result = self._dispatch_tool(tc.name, args, turn)
                     except TurnInterrupted:
-                        interrupted_result = json.dumps(
-                            {"ok": False, "error": "turn interrupted"},
-                            ensure_ascii=False,
-                        )
-                        for pending in tool_calls[index:]:
-                            self.messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": pending.tool_call_id,
-                                    "content": interrupted_result,
-                                }
-                            )
+                        self._record_interrupted_tool_calls(tool_calls, index)
                         if turn.interrupted:
                             return assistant_content
                         raise
-                    self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.tool_call_id,
-                            "content": result,
-                        }
-                    )
+                    self._append_tool_result(tc.tool_call_id, result)
 
-            fallback = "Tool-calling loop reached limit. Please refine the request."
-            self.messages.append({"role": "assistant", "content": fallback})
+            fallback = self._tool_loop_fallback()
             _tok(fallback)
             return fallback
         finally:
@@ -1080,14 +1265,8 @@ class ChatEngine:
                 if should_stop and should_stop():
                     interrupted = True
                     break
+                usage.update(event)
                 if not event.choices:
-                    if hasattr(event, "usage") and event.usage:
-                        usage.prompt_tokens = (
-                            getattr(event.usage, "prompt_tokens", 0) or 0
-                        )
-                        usage.completion_tokens = (
-                            getattr(event.usage, "completion_tokens", 0) or 0
-                        )
                     continue
 
                 delta = event.choices[0].delta
@@ -1117,6 +1296,8 @@ class ChatEngine:
                         entry["name"] = tc.function.name
                     if tc.function and tc.function.arguments:
                         entry["arguments_parts"].append(tc.function.arguments)
+        except TurnInterrupted:
+            interrupted = True
         finally:
             close_fn = getattr(stream, "close", None)
             if callable(close_fn):
@@ -1144,11 +1325,25 @@ class ChatEngine:
         prompt: str | None = None,
         on_token: Callable[[str], Awaitable[None] | None] | None = None,
         on_retry: Callable[[RetryEvent], Awaitable[None] | None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         turn = self._begin_turn()
+        stop_task = (
+            asyncio.create_task(self._watch_async_stop(turn, should_stop))
+            if should_stop is not None else None
+        )
         try:
             return await self._acompact_impl(prompt, on_token, on_retry)
+        except asyncio.CancelledError:
+            turn.cancel()
+            raise
         finally:
+            if stop_task is not None:
+                stop_task.cancel()
+                try:
+                    await stop_task
+                except asyncio.CancelledError:
+                    pass
             self._end_turn(turn)
 
     async def _acompact_impl(
@@ -1158,23 +1353,8 @@ class ChatEngine:
         on_retry: Callable[[RetryEvent], Awaitable[None] | None] | None = None,
     ) -> str:
         """Async version of :meth:`compact`."""
-        compact_prompt = prompt or DEFAULT_COMPACT_PROMPT
-
-        temp_msgs = self._prepare_history_for_api(self.messages[self.compact_index :])
-        temp_msgs.append({"role": "user", "content": compact_prompt})
-
+        create_kwargs = self._build_compact_request(prompt)
         client = self._async_client()
-        model_params = get_model_params(self.config, state_path=self.state_path)
-        create_kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": temp_msgs,
-            "temperature": model_params.get("temperature", 0.2),
-            "max_tokens": model_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if "extra_body" in model_params:
-            create_kwargs["extra_body"] = model_params["extra_body"]
         async def _maybe_retry(cb: Callable[[RetryEvent], Any] | None, event: RetryEvent) -> None:
             if cb is None:
                 return
@@ -1189,14 +1369,8 @@ class ChatEngine:
                 stream: Any = await client.chat.completions.create(**create_kwargs)
                 try:
                     async for event in stream:
+                        usage.update(event)
                         if not event.choices:
-                            if hasattr(event, "usage") and event.usage:
-                                usage.prompt_tokens = (
-                                    getattr(event.usage, "prompt_tokens", 0) or 0
-                                )
-                                usage.completion_tokens = (
-                                    getattr(event.usage, "completion_tokens", 0) or 0
-                                )
                             continue
                         delta = event.choices[0].delta
                         if delta.content:
@@ -1215,31 +1389,25 @@ class ChatEngine:
                             except Exception:
                                 pass
                 break
+            except asyncio.CancelledError:
+                await client.close()
+                raise
             except Exception as exc:
+                if self._active_turn is not None and self._active_turn.interrupted:
+                    await client.close()
+                    raise TurnInterrupted from exc
                 if summary_parts or attempt >= MAX_REQUEST_RETRIES:
                     await client.close()
                     raise
                 delay = self._retry_delay(attempt + 1)
                 await _maybe_retry(on_retry, self._retry_event(attempt + 1, delay, exc))
-                if not await self._await_retry(delay):
+                if not await self._await_retry(delay, should_stop=self.interrupted):
                     await client.close()
-                    raise
+                    raise TurnInterrupted
 
         await client.close()
-        self.token_usage.add(usage.prompt_tokens, usage.completion_tokens)
         summary = "".join(summary_parts)
-
-        compact_marker: dict[str, Any] = {
-            "role": "system",
-            "content": f"[Compact summary of prior conversation]\n\n{summary}",
-            "_compact": True,
-            "_usage": {
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-            },
-        }
-        self.messages.append(compact_marker)
-        self.compact_index = len(self.messages) - 1
+        self._commit_compact_summary(summary, usage)
         return summary
 
     async def astream_reply(
@@ -1254,6 +1422,9 @@ class ChatEngine:
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
         turn = self._begin_turn()
+        stop_task: asyncio.Task[None] | None = None
+        if should_stop is not None:
+            stop_task = asyncio.create_task(self._watch_async_stop(turn, should_stop))
         try:
             return await self._astream_reply_impl(
                 user_input,
@@ -1270,6 +1441,12 @@ class ChatEngine:
             turn.cancel()
             raise
         finally:
+            if stop_task is not None:
+                stop_task.cancel()
+                try:
+                    await stop_task
+                except asyncio.CancelledError:
+                    pass
             self._end_turn(turn)
 
     async def _astream_reply_impl(
@@ -1293,7 +1470,7 @@ class ChatEngine:
             self.messages.append({"role": "system", "content": system_context})
         self.messages.append({"role": "user", "content": content})
 
-        llm_params = get_model_params(self.config, state_path=self.state_path)
+        llm_params = get_model_params(self.config, self.model, state_path=self.state_path, state=self.state)
         client = self._async_client()
 
         self._live_reset()
@@ -1321,23 +1498,7 @@ class ChatEngine:
             for _ in range(TOOL_CALL_LIMIT):
                 if self._should_stop(turn, should_stop):
                     return ""
-                current_tools = self._get_tools()
-                kwargs: dict[str, Any] = {}
-                if current_tools:
-                    kwargs["tools"] = current_tools
-                    kwargs["tool_choice"] = "auto"
-
-                create_kwargs: dict[str, Any] = {
-                    "model": self.model,
-                    "messages": self._prepare_messages_for_api(),
-                    "temperature": llm_params.get("temperature", 1),
-                    "max_tokens": llm_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                }
-                if "extra_body" in llm_params:
-                    create_kwargs["extra_body"] = llm_params["extra_body"]
-                create_kwargs.update(kwargs)
+                create_kwargs = self._build_stream_request(llm_params)
 
                 for attempt in range(MAX_REQUEST_RETRIES + 1):
                     emitted_before = self.capture()
@@ -1352,11 +1513,13 @@ class ChatEngine:
                         ) = await self._acollect_stream_output(
                             stream,
                             _tok,
-                            on_thinking=_think if self.show_thinking else None,
+                            on_thinking=_think,
                             should_stop=lambda: self._should_stop(turn, should_stop),
                         )
                         break
                     except Exception as exc:
+                        if self._should_stop(turn, should_stop):
+                            return ""
                         emitted_after = self.capture()
                         emitted = (
                             emitted_after.content != emitted_before.content
@@ -1373,29 +1536,20 @@ class ChatEngine:
                             delay,
                             should_stop=lambda: self._should_stop(turn, should_stop),
                         ):
-                            raise
-                self.token_usage.add(
-                    turn_usage.prompt_tokens, turn_usage.completion_tokens
+                            return ""
+                response_state = self._record_stream_response(
+                    assistant_content,
+                    reasoning_content,
+                    tool_calls,
+                    interrupted,
+                    turn_usage,
+                    turn,
+                    should_stop,
                 )
-
-                if interrupted or self._should_stop(turn, should_stop):
-                    if assistant_content:
-                        self._append_assistant_message(
-                            self.messages, assistant_content, [], reasoning_content
-                        )
+                if response_state == "interrupted":
                     return assistant_content
-                self._append_assistant_message(
-                    self.messages, assistant_content, tool_calls, reasoning_content
-                )
-
-                if not tool_calls:
-                    assistant_msg = self.messages[-1]
-                    if isinstance(assistant_msg, dict):
-                        assistant_msg["_usage"] = {
-                            "prompt_tokens": turn_usage.prompt_tokens,
-                            "completion_tokens": turn_usage.completion_tokens,
-                        }
-                    await self._aauto_compact_if_needed(on_retry=on_retry, turn=turn)
+                if response_state == "complete":
+                    await self._aauto_compact_if_needed(on_retry=on_retry)
                     return assistant_content
 
                 for index, tc in enumerate(tool_calls):
@@ -1406,33 +1560,15 @@ class ChatEngine:
                             raise TurnInterrupted
                         result = await self._adispatch_tool(tc.name, args, turn)
                     except (TurnInterrupted, asyncio.CancelledError) as exc:
-                        interrupted_result = json.dumps(
-                            {"ok": False, "error": "turn interrupted"},
-                            ensure_ascii=False,
-                        )
-                        for pending in tool_calls[index:]:
-                            self.messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": pending.tool_call_id,
-                                    "content": interrupted_result,
-                                }
-                            )
+                        self._record_interrupted_tool_calls(tool_calls, index)
                         if isinstance(exc, asyncio.CancelledError):
                             raise
                         if turn.interrupted:
                             return assistant_content
                         raise
-                    self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.tool_call_id,
-                            "content": result,
-                        }
-                    )
+                    self._append_tool_result(tc.tool_call_id, result)
 
-            fallback = "Tool-calling loop reached limit. Please refine the request."
-            self.messages.append({"role": "assistant", "content": fallback})
+            fallback = self._tool_loop_fallback()
             await _tok(fallback)
             return fallback
         finally:

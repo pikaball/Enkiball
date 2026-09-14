@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import mimetypes
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,15 @@ def image_path_to_data_url(path: str) -> str:
         raise FileNotFoundError(f"Image not found: {fp}")
     if not fp.is_file():
         raise IsADirectoryError(f"Not a file: {fp}")
-    mime, _ = mimetypes.guess_type(str(fp))
+    stat = fp.stat()
+    return _cached_image_data_url(str(fp), stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=32)
+def _cached_image_data_url(path: str, mtime_ns: int, size: int) -> str:
+    del mtime_ns, size
+    fp = Path(path)
+    mime, _ = mimetypes.guess_type(path)
     if not mime:
         mime = "application/octet-stream"
     payload = base64.b64encode(fp.read_bytes()).decode("ascii")

@@ -8,7 +8,7 @@ import termios
 import threading
 import tty
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -192,6 +192,8 @@ class EnkiballCLI:
         input_transform: Callable[[str, list[str]], str | tuple[str, str | None]] | None = None,
         turn_lock: object | None = None,
         on_session_change: Callable[[str], None] | None = None,
+        debug_scope: dict[str, Any] | None = None,
+        btw_context: Callable[[], str] | None = None,
     ) -> None:
         self.console = console or Console()
         if agent is None:
@@ -201,15 +203,15 @@ class EnkiballCLI:
                 self.console.print(str(e), style="bold red")
                 raise
         self.agent = agent
+        self.debug_scope = debug_scope if debug_scope is not None else {}
+        self.debug_scope.setdefault("agent", self.agent)
+        self.debug_scope.setdefault("cli", self)
         self.session_store = agent.session_store
         self.handler = CommandHandler(
             self.console,
-            agent._config,
-            agent._mcp,
-            self.session_store,
-            config_path=agent._config_path,
-            state_path=agent._state_path,
-            agent=agent,
+            agent,
+            debug_scope=self.debug_scope,
+            btw_context=btw_context,
         )
         self.history_path = history_path or (
             Path.home() / ".config" / "enkiball" / "history"
@@ -230,10 +232,6 @@ class EnkiballCLI:
     ) -> None:
         """Register a custom slash command (delegates to ``CommandHandler``)."""
         self.handler.register_command(name, handler, help_text, completions)
-
-    def register_tool(self, *args, **kwargs) -> Callable[..., object]:
-        """Register a custom tool on the underlying agent."""
-        return self.agent.register_tool(*args, **kwargs)
 
     # -- Main loop ----------------------------------------------------------
 
@@ -257,7 +255,7 @@ class EnkiballCLI:
             style="green",
         )
         console.print(
-            f"Config: {agent._config_path}  Provider: {agent.provider}  Model: {agent.model}",
+            f"Config: {agent.config_path}  Provider: {agent.provider}  Model: {agent.model}",
             style="cyan",
         )
         current = session_store.begin_new(
@@ -284,7 +282,20 @@ class EnkiballCLI:
 
             if text.startswith("/"):
                 before_session_id = session_store.current_session_id
-                keep_running = handler.handle(text, agent._engine, session)
+                command_exit_requested = False
+                # Slash commands may perform a synchronous model turn (for
+                # example /btw), so give them the same Esc cancellation path
+                # as an ordinary foreground turn.
+                with _StreamInputMonitor() as monitor:
+                    handler.set_stop_callback(monitor.should_stop)
+                    try:
+                        keep_running = handler.handle(text, session)
+                    except TurnInterrupted:
+                        console.print("\n[interrupted]", style="bold yellow")
+                        keep_running = True
+                    finally:
+                        handler.set_stop_callback(None)
+                    command_exit_requested = monitor.exit_requested
                 after_session_id = session_store.current_session_id
                 if (
                     self.on_session_change
@@ -300,12 +311,12 @@ class EnkiballCLI:
                     CliRenderer(console, agent.cwd).history(
                         agent.messages,
                         title=session_store.current_session_name or after_session_id,
-                        show_thinking=agent._engine.show_thinking,
+                        show_thinking=agent.show_thinking,
                     )
                 handler.pending_history_replay = False
                 if handler.pending_input is not None:
                     prefill_text = handler.pending_input
-                if not keep_running:
+                if command_exit_requested or not keep_running:
                     break
                 continue
 
@@ -322,7 +333,7 @@ class EnkiballCLI:
                 else:
                     llm_text = transformed
 
-            thinking_active = agent._engine.show_thinking
+            thinking_active = agent.show_thinking
             renderer = CliRenderer(console, agent.cwd)
 
             interrupted = False
@@ -345,11 +356,11 @@ class EnkiballCLI:
                             _derive_session_title(text, images_for_turn)
                         )
                     if self.turn_lock is None:
-                        agent._engine.stream_reply(
+                        agent.chat(
                             llm_text,
                             images_for_turn,
-                            renderer.token,
-                            renderer.tool,
+                            on_token=renderer.token,
+                            on_tool_event=renderer.tool,
                             on_thinking=renderer.thinking if thinking_active else None,
                             on_retry=renderer.retry,
                             system_context=system_context,
@@ -357,11 +368,11 @@ class EnkiballCLI:
                         )
                     else:
                         with self.turn_lock:
-                            agent._engine.stream_reply(
+                            agent.chat(
                                 llm_text,
                                 images_for_turn,
-                                renderer.token,
-                                renderer.tool,
+                                on_token=renderer.token,
+                                on_tool_event=renderer.tool,
                                 on_thinking=renderer.thinking if thinking_active else None,
                                 on_retry=renderer.retry,
                                 system_context=system_context,
@@ -410,9 +421,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="allow tool access to an additional directory; repeatable",
     )
     parser.add_argument(
+        "--ro-permission",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="allow read-only tool access to an additional directory; repeatable",
+    )
+    parser.add_argument(
         "--no-approval",
         action="store_true",
         help="silently deny tool access outside allowed directories",
+    )
+    parser.add_argument(
+        "--sandbox-network",
+        choices=("none", "host"),
+        default="none",
+        help="network access for sandboxed commands (default: none)",
+    )
+    parser.add_argument(
+        "--sandbox-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="inherit a host environment variable in the sandbox; repeatable",
     )
     parser.add_argument(
         "--privilleged",
@@ -433,6 +464,9 @@ def main(argv: list[str] | None = None) -> None:
             else args.dir_permission,
             approval=not args.no_approval,
             sandbox=not args.privilleged,
+            sandbox_network=args.sandbox_network,
+            sandbox_inherit_env=args.sandbox_env,
+            ro_permissions=args.ro_permission,
         )
         cli = EnkiballCLI(agent)
     except FileNotFoundError:

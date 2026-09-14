@@ -8,7 +8,7 @@ from pathlib import Path
 
 from enkiball.llm_tools import TOOL_SCHEMAS, dispatch_tool
 from enkiball.sandbox import Sandbox, TurnInterrupted
-from enkiball.tools import MAX_FILE_BYTES, edit_file, read_file, write_file
+from enkiball.tools import MAX_EDIT_FILE_SIZE, MAX_LENGTH, edit_file, read_file, write_file
 
 
 class EditFileTests(unittest.TestCase):
@@ -69,17 +69,39 @@ class EditFileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be different"):
             edit_file(str(self.path), "content", "content")
 
-    def test_file_tools_reject_oversized_content(self) -> None:
-        self.path.write_bytes(b"x" * (MAX_FILE_BYTES + 1))
+    def test_edit_rejects_oversized_files(self) -> None:
+        self.path.write_bytes(b"x" * (MAX_EDIT_FILE_SIZE + 1))
 
-        with self.assertRaisesRegex(ValueError, "byte limit"):
-            read_file(str(self.path))
-        with self.assertRaisesRegex(ValueError, "byte limit"):
+        with self.assertRaisesRegex(ValueError, "filesize"):
             edit_file(str(self.path), "x", "y")
+
+    def test_read_file_defaults_to_first_thousand_characters(self) -> None:
+        self.path.write_text("x" * 1200, encoding="utf-8")
+
+        self.assertEqual(read_file(str(self.path)), "x" * 1000)
+
+    def test_read_file_uses_character_offsets(self) -> None:
+        self.path.write_text("a你b好c", encoding="utf-8")
+
+        self.assertEqual(read_file(str(self.path), start=1, end=4), "你b好")
+
+    def test_read_file_validates_offsets(self) -> None:
+        self.path.write_text("content", encoding="utf-8")
+
+        invalid = (
+            ({"start": True}, "start must be an integer"),
+            ({"end": "3"}, "end must be an integer"),
+            ({"start": -1}, "start must be non-negative"),
+            ({"start": 3, "end": 2}, "end must be greater"),
+        )
+        for kwargs, error in invalid:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex((TypeError, ValueError), error):
+                    read_file(str(self.path), **kwargs)
 
     def test_write_rejects_result_over_size_limit(self) -> None:
         with self.assertRaisesRegex(ValueError, "byte limit"):
-            write_file(str(self.path), "x" * (MAX_FILE_BYTES + 1))
+            write_file(str(self.path), "x" * (MAX_LENGTH + 1))
 
 
 class EditDispatchTests(unittest.TestCase):
@@ -105,6 +127,32 @@ class EditDispatchTests(unittest.TestCase):
                 {"ok": True, "path": str(path.resolve()), "replacements": 1},
             )
             self.assertEqual(path.read_text(encoding="utf-8"), "after")
+
+    def test_read_dispatch_forwards_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sample.txt"
+            path.write_text("0123456789", encoding="utf-8")
+
+            result = json.loads(
+                dispatch_tool(
+                    "read_file",
+                    {"path": str(path), "start": 2, "end": 6},
+                    Sandbox(cwd=temp_dir),
+                )
+            )
+
+            self.assertEqual(result, {"ok": True, "content": "2345"})
+
+    def test_read_dispatch_rejects_invalid_range(self) -> None:
+        result = json.loads(
+            dispatch_tool(
+                "read_file",
+                {"path": "unused", "start": 4, "end": 2},
+            )
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("end must be greater", result["error"])
 
     def test_dispatch_rejects_non_boolean_replace_all(self) -> None:
         result = json.loads(

@@ -6,6 +6,7 @@ src/enkiball/cli.py
 src/enkiball/cli_renderer.py
 src/enkiball/commands.py
 src/enkiball/config.py
+src/enkiball/interruptible_http.py
 src/enkiball/llm.py
 src/enkiball/llm_tools.py
 src/enkiball/mcp.py
@@ -14,6 +15,7 @@ src/enkiball/message_codec.py
 src/enkiball/persistence.py
 src/enkiball/sandbox.py
 src/enkiball/session_store.py
+src/enkiball/skills.py
 src/enkiball/tools.py
 src/enkiball.egg-info/PKG-INFO
 src/enkiball.egg-info/SOURCES.txt
@@ -23,8 +25,15 @@ src/enkiball.egg-info/requires.txt
 src/enkiball.egg-info/top_level.txt
 tests/test_cli_renderer.py
 tests/test_edit_tool.py
+tests/test_efficiency.py
 tests/test_foundation.py
+tests/test_http_interrupt.py
+tests/test_interrupt.py
+tests/test_mcp_config.py
 tests/test_mcp_sse.py
+tests/test_notice.py
 tests/test_persistence.py
 tests/test_sandbox.py
 tests/test_session_history.py
+tests/test_skills.py
+tests/test_stream_usage.py

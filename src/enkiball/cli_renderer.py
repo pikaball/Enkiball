@@ -370,12 +370,7 @@ class CliRenderer:
     ) -> None:
         reasoning = message.get("reasoning_content")
         if show_thinking and isinstance(reasoning, str) and reasoning:
-            preview, hidden = _truncate_preview(reasoning)
-            thinking = Text("◇ thinking  ", style="dim magenta")
-            thinking.append(preview, style="dim")
-            if hidden:
-                thinking.append(f"  ... {hidden}", style="dim")
-            self.console.print(thinking)
+            self.console.print(self._thinking_renderable(reasoning))
 
         content = message.get("content")
         if isinstance(content, str) and content:
@@ -466,14 +461,41 @@ class CliRenderer:
                 boundary = offset
         return boundary
 
-    @staticmethod
-    def _thinking_renderable(content: str) -> Text:
-        preview, hidden = _truncate_preview(content)
-        text = Text("◇ thinking  ", style="dim magenta")
-        text.append(preview, style="dim")
+    def _thinking_renderable(self, content: str) -> Text:
+        """Build a preview of *content* that always fits the viewport.
+
+        Truncating by logical lines is not enough: reasoning commonly arrives
+        as a single very long line, which wraps into hundreds of terminal
+        rows.  Rendering that through ``Live`` (which forces
+        ``vertical_overflow="visible"`` when stopping) scrolls the whole
+        screen and corrupts the transcript.  Wrapping first and keeping only
+        the most recent lines bounds the rendered height.
+        """
+        prefix = "◇ thinking  "
+        width = max(20, self.console.width or 80)
+        budget = self._thinking_line_budget()
+        wrapped = self._wrap_text(content, max(10, width - len(prefix) - 1))
+        if len(wrapped) > budget:
+            shown = wrapped[-max(1, budget - 1) :]
+            hidden = len(wrapped) - len(shown)
+        else:
+            shown = wrapped
+            hidden = 0
+        text = Text(prefix, style="dim magenta")
         if hidden:
-            text.append(f"  ... {hidden}", style="dim")
+            text.append(f"… {hidden} earlier lines", style="dim")
+            text.append("\n", style="dim")
+        text.append("\n".join(shown), style="dim")
         return text
+
+    def _thinking_line_budget(self) -> int:
+        height = self.console.height or (MAX_PREVIEW_LINES + 2)
+        return max(1, min(MAX_PREVIEW_LINES, height - 2))
+
+    def _wrap_text(self, content: str, width: int) -> list[str]:
+        sample = content[-MAX_PREVIEW_CHARS:]
+        lines = Text(sample).wrap(self.console, max(1, width))
+        return [line.plain for line in lines]
 
     def _update_live(self, renderable: RenderableType, refresh: bool = False) -> None:
         if self._live is None:
