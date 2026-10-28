@@ -74,6 +74,7 @@ from .config import (
     set_active_model,
     set_active_provider,
     set_mcp_enabled,
+    set_show_thinking,
 )
 from .llm import (
     ChatEngine,
@@ -265,6 +266,9 @@ class Enkiball:
         )
         self._engine.notice_queue = self.notice_queue
         self._on_tool_event = on_tool_event
+        self._bg_lock = threading.Lock()
+        self._bg_exec: concurrent.futures.ThreadPoolExecutor | None = None
+        self._bg_futures: list[concurrent.futures.Future[ChatResult]] = []
         self._session_store = self._build_session_store(session_dir, self.cwd)
         self._sync_skill_tool()
 
@@ -522,6 +526,13 @@ class Enkiball:
     def show_thinking(self, value: bool) -> None:
         self._engine.show_thinking = value
 
+    def set_show_thinking(self, enabled: bool) -> None:
+        """Toggle thinking output and persist the choice to ``state.json``."""
+        self._engine.show_thinking = bool(enabled)
+        set_show_thinking(
+            bool(enabled), self._state_path, state=self._engine.state
+        )
+
     # ========================================================================
     # Token statistics
     # ========================================================================
@@ -592,38 +603,40 @@ class Enkiball:
     # Live capture (thread-safe snapshot of in-flight streaming turn)
     # ========================================================================
 
-    def capture(self) -> LiveSnapshot:
+    def capture(self, collect_thinking: bool = False) -> LiveSnapshot:
         """Return a snapshot of the current (or most-recent) streaming turn.
 
         This method is **synchronous and thread-safe** — safe to call from any
         thread, including while :meth:`chat`, :meth:`stream`, :meth:`achat`,
         :meth:`astream`, or :meth:`astream_events` is still in progress.
 
-        The returned :class:`LiveSnapshot` contains the content, thinking text,
-        and tool events accumulated so far, plus a ``in_progress`` flag.
+        ``LiveSnapshot.content`` contains text and tool call/result markers in
+        arrival order. Set ``collect_thinking=True`` to include thinking at its
+        original position. Reading does not consume the buffer. Within one turn,
+        snapshots with the same option grow by appending text; the next turn
+        resets the buffer. ``in_progress`` stays true through turn cleanup.
 
         Example::
 
-            # Another thread / coroutine kicks off a long chat
-            threading.Thread(target=lambda: agent.chat("big task")).start()
+            future = agent.chat_in_background("big task")
 
             # Poll progress from the main thread
-            while True:
+            while not future.done():
                 snap = agent.capture()
                 print(f"[{len(snap.content)} chars so far]")
-                if not snap.in_progress:
-                    break
                 time.sleep(0.5)
+            result = future.result()
         """
-        return self._engine.capture()
+        return self._engine.capture(collect_thinking=collect_thinking)
 
     def interrupt(self) -> None:
         """Ask the currently running turn to stop as soon as possible.
 
         This is intentionally lightweight: it only sets an internal stop flag.
         It does not wait for the worker thread/task, drain resources, or shut
-        down MCP processes.  The stream loop observes the flag between chunks
-        and closes the OpenAI stream in its existing cleanup path.
+        down MCP servers. HTTP waits and MCP tool calls observe the flag,
+        close their active I/O, and request MCP cancellation. Remote execution
+        may continue if the server does not support cancellation.
         """
         self._engine.interrupt()
 
@@ -657,32 +670,45 @@ class Enkiball:
         Only one background turn should be in flight at a time, since the
         underlying ``ChatEngine`` is single-conversation.
         """
-        executor = self._bg_executor()
-        return executor.submit(
-            self.chat,
-            message,
-            images=images,
-            system_context=system_context,
-            should_stop=should_stop,
-        )
+        with self._bg_lock:
+            executor = self._bg_executor()
+            future = executor.submit(
+                self.chat,
+                message,
+                images=images,
+                system_context=system_context,
+                should_stop=should_stop,
+            )
+            self._bg_futures = [f for f in self._bg_futures if not f.done()]
+            self._bg_futures.append(future)
+            return future
 
     def wait(self, timeout: float | None = None) -> bool:
-        """Block until the current streaming turn finishes (or timeout).
+        """Wait for the active turn and background work already submitted.
 
-        Returns *True* if it finished, *False* if timeout elapsed.  Polls
-        :meth:`capture` internally.
+        Includes initialization and resource cleanup. Returns *True* when done
+        (also when idle, failed, or cancelled), *False* on timeout. Does not
+        cancel work or propagate task errors; use the background Future's
+        ``result()`` to obtain the result or exception. This is a blocking API.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            snap = self._engine.capture()
-            if not snap.in_progress:
-                return True
-            if deadline is not None and time.monotonic() >= deadline:
+        with self._bg_lock:
+            futures = tuple(self._bg_futures)
+        if not self._engine.wait(timeout):
+            return False
+        for future in futures:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                future.exception(timeout=remaining)
+            except concurrent.futures.TimeoutError:
                 return False
-            time.sleep(0.05)
+            except concurrent.futures.CancelledError:
+                pass
+        return True
 
     def _bg_executor(self) -> concurrent.futures.ThreadPoolExecutor:
-        ex = getattr(self, "_bg_exec", None)
+        # Caller holds _bg_lock while creating the executor and recording work.
+        ex = self._bg_exec
         if ex is None:
             ex = concurrent.futures.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="enkiball-bg"
@@ -1120,10 +1146,11 @@ class Enkiball:
     def shutdown(self) -> list[str]:
         """Stop all MCP servers and release resources."""
         self.interrupt()
-        ex = getattr(self, "_bg_exec", None)
+        with self._bg_lock:
+            ex = self._bg_exec
+            self._bg_exec = None
         if ex is not None:
             ex.shutdown(wait=True, cancel_futures=True)
-            self._bg_exec = None
         return self._mcp.stop_all()
 
     def __enter__(self) -> Enkiball:

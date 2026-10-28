@@ -512,7 +512,7 @@ class CommandHandler:
     # -- /thinking -----------------------------------------------------------
 
     def _thinking(self) -> bool:
-        self.agent.show_thinking = not self.agent.show_thinking
+        self.agent.set_show_thinking(not self.agent.show_thinking)
         state = "ON" if self.agent.show_thinking else "OFF"
         self.console.print(f"thinking output: {state}", style="cyan")
         return True

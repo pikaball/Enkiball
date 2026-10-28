@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from .mcp_client import MCPClient, SSEMCPClient, StdioMCPClient, StreamableHTTPMCPClient
@@ -55,7 +56,7 @@ class MCPManager:
                     client = StreamableHTTPMCPClient(name, item["url"], headers=headers)
                 else:
                     # Default remote type: SSE
-                    client = SSEMCPClient(name, item["url"])
+                    client = SSEMCPClient(name, item["url"], headers=headers)
             else:
                 # Stdio Local Server
                 cmd = item.get("command")
@@ -150,7 +151,10 @@ class MCPManager:
                 all_tools.append({"type": "function", "function": openai_fn})
         return all_tools
 
-    def call_tool(self, unique_name: str, args: dict[str, Any]) -> Any:
+    def call_tool(
+        self, unique_name: str, args: dict[str, Any],
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
         # Expected format: mcp__<server>__<tool>
         parts = unique_name.split("__", 2)
         if len(parts) != 3 or parts[0] != "mcp":
@@ -163,4 +167,4 @@ class MCPManager:
         if not client or not client.running:
             raise RuntimeError(f"MCP server {server_name} not available")
 
-        return client.call_tool(tool_name, args)
+        return client.call_tool(tool_name, args, cancel_event=cancel_event)

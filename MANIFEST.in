@@ -1,0 +1,7 @@
+include README.md pyproject.toml
+include scripts/build_release.py
+recursive-include src/enkiball *.py
+recursive-include tests *.py
+prune build
+prune dist
+global-exclude *.py[cod] __pycache__ .env .env.* .pypirc *.key *.ipynb

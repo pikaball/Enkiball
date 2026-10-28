@@ -1,20 +1,32 @@
 Metadata-Version: 2.4
 Name: enkiball
-Version: 0.1.0
-Summary: A CLI foundation for Enkiball security research agent
+Version: 0.1.4
+Summary: A Python LLM foundation with a CLI and Python API
+License-Expression: GPL-3.0-only
+Keywords: agent,cli,llm,mcp,python
+Classifier: Development Status :: 3 - Alpha
+Classifier: Environment :: Console
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: openai>=1.40.0
 Requires-Dist: prompt_toolkit>=3.0.47
 Requires-Dist: rich>=13.7.1
+Requires-Dist: markdown-it-py>=2.2.0
+Requires-Dist: pylatexenc<3,>=2.10
 Requires-Dist: httpx>=0.27.0
 Requires-Dist: PyYAML>=6.0
+Dynamic: license-file
 
 # Enkiball
 
-Enkiball 是一个面向安全研究和长上下文任务的 agent 基座，同时提供交互式 CLI 和 Python 库 API。
+Enkiball 是一个面向长上下文任务的 Python LLM 基座，同时提供交互式 CLI 和 Python 库 API。
 
-当前核心能力包括多 provider/model 管理、流式对话、图片输入、工具调用、MCP 接入、会话持久化、历史压缩、实时输出捕获和后台执行。更上层的 Task Controller、SubAgent、WebHack 编排能力仍在演进中。
+当前核心能力包括多 provider/model 管理、流式对话、图片输入、工具调用、MCP 接入、会话持久化、历史压缩、实时输出捕获和后台执行。
 
 ## 目录
 
@@ -32,24 +44,26 @@ Enkiball 是一个面向安全研究和长上下文任务的 agent 基座，同�
 ## 安装
 
 ```bash
+pip install enkiball
+```
+
+从源码开发安装：
+
+```bash
 pip install -e .
 ```
 
 安装后 `enkiball` 命令全局可用，可在任意目录下启动。
 
-运行环境要求见 `pyproject.toml`：Python `>=3.10`，主要依赖为 `openai`、`prompt_toolkit`、`rich`、`httpx`。
+运行环境要求：Linux、Python `>=3.10`。默认命令沙箱需要系统安装 `bubblewrap`（Debian/Ubuntu：`sudo apt install bubblewrap`）。Python 依赖由 pip 自动安装。
 
 ## 配置
 
-配置文件位于 `~/.config/enkiball/enki.json`，首次运行前需手动创建：
-
-```bash
-mkdir -p ~/.config/enkiball
-```
+配置文件位于 `~/.config/enkiball/enki.json`。首次运行时会自动创建默认配置；将其中的 `api_key` 替换为你的 API key，并按需调整 provider 和模型：
 
 ```json
 {
-  "system_prompt": "You are Enkiball, a practical assistant for security research tasks.",
+  "system_prompt": "You are Enkiball, a practical assistant for long-context tasks.",
   "auto_compact": {
     "enabled": false,
     "threshold_ratio": 0.7
@@ -185,9 +199,13 @@ enkiball --cwd /path/to/project --dir-permission /path/to/shared --ro-permission
 
 CLI 默认在工具请求访问授权目录之外时提供 `once`、`always`、`deny` 三个选项。`once` 只放行当前请求，`always` 将目录授权到当前进程结束，`deny` 拒绝；按 `Esc` 会中断当前 LLM turn 并返回输入提示。使用 `--no-approval` 可改为静默拒绝。可重复传入 `--dir-permission` 授予读写权限，或用 `--ro-permission` 只授予读取权限。
 
-普通输入直接发送给 LLM，支持流式输出。按 `Ctrl+J` 换行，`Enter` 发送。`Esc` 可中断请求发送后等待响应、流式数据等待和重试等待，也适用于 `/compact`；已收到的对话内容会保留，中断的压缩不会替换历史。
+普通输入直接发送给 LLM，支持流式输出。按 `Ctrl+J` 换行，`Enter` 发送。`Esc` 可中断请求发送后等待响应、流式数据等待、重试等待和 MCP 工具调用，也适用于 `/compact`；已收到的对话内容会保留，中断的压缩不会替换历史。
 
 使用 `/session use` 或 `/session fork` 恢复历史时，CLI 会按实时对话相同的样式重绘 user、assistant、Markdown 表格和工具调用；历史 tool result 不会整段回显。
+
+正文、列表、代码块和工具预览的长行由终端自然折行，CLI 不再按窗口宽度插入换行和补齐空格，方便鼠标选择复制。代码中的实际换行和缩进仍保留，工具侧边标记、行号只出现在原始行的开头。表格和有高度限制的 thinking 预览仍按终端尺寸排版。实时回复和历史回放使用相同规则。
+
+Markdown 标题与相邻内容之间保留空行，流式输出分段提交时也会补齐标题间距。正文中的 `$...$`、`\(...\)` 以及块公式 `$$...$$`、`\[...\]` 会转换为终端可复制的 Unicode 数学文本，支持常见希腊字母、上下标、分数和根号。无法解析或不支持的公式会保留完整原文和分隔符；代码块、行内代码中的 LaTeX 保持原样。公式尚未闭合时不会因其中的空行提前提交，中断时则显示已收到的原文。
 
 ### 命令列表
 
@@ -426,20 +444,27 @@ asyncio.run(main())
 后台执行适合 fire-and-poll 场景：
 
 ```python
+import time
+
 future = agent.chat_in_background("run a long analysis")
 
 while not future.done():
     snapshot = agent.capture()
     print(snapshot.content[-120:])
+    time.sleep(0.1)
 
 result = future.result()
 ```
 
 - `chat_in_background(...)` — 在线程池中启动 `chat()`，返回 `Future[ChatResult]`。
-- `capture()` — 返回 `LiveSnapshot`，可从任意线程读取当前流式输出。
-- `wait(timeout=None)` — 等待当前流式任务结束，超时返回 `False`。
+- `capture(collect_thinking=False)` — 返回 `LiveSnapshot`，可从任意线程读取当前或最近一轮的累计输出；正文、工具调用和工具结果按发生顺序拼接。传入 `True` 时，thinking 也在原位置插入。
+- `wait(timeout=None)` — 同步阻塞，等待调用时的活动 chat/compact 轮次及已经提交的后台任务结束，包括初始化和资源清理。结束或当前空闲时返回 `True`，超时返回 `False`；超时不会中断任务。失败或取消也算结束，结果与异常需通过 `future.result()` 获取。在异步事件循环中等待应使用 `await asyncio.to_thread(agent.wait, timeout)`。
 - `interrupt()` — 请求当前流式任务停止。
 - `interrupted` — 当前是否已经请求 interrupt。
+
+`capture()` 不消费缓冲区。同一轮中保持相同的 `collect_thinking` 参数，旧快照的 `content` 始终是新快照的前缀；下一轮对话开始时清空。工具调用在参数收集完整、即将执行时写入，工具结果在执行结束后写入，不包含命令执行过程中的 stdout 增量。图片工具结果包含文字和图片占位标记，不包含图片数据。后台任务刚提交时可能尚未开始，判断该任务是否完成请使用 `future.done()` 或 `wait()`。
+
+模型请求只对连接故障、超时、HTTP 408/409/429 和 5xx 错误自动重试。一旦本次请求已输出正文或 thinking，断流会直接抛错，避免重新生成导致重复输出；参数、鉴权和普通回调错误不自动重试。重试判断独立于 `capture()`。
 
 ### Provider 和模型接口
 
@@ -478,7 +503,7 @@ agent.reset_token_usage()
 ```
 
 - `system_prompt` — 当前 system prompt，可读写。
-- `show_thinking` — CLI 是否显示 reasoning/thinking 内容；不影响 API 回调、`ChatResult.thinking` 和 `capture()` 的内容采集，也不控制服务端是否启用推理。
+- `show_thinking` — CLI 是否显示 reasoning/thinking 内容；不影响 API 回调、`ChatResult.thinking` 和内部 thinking 采集。通过 `capture(collect_thinking=True)` 可将 thinking 包含在快照中；该开关不控制服务端是否启用推理。
 - `token_usage` — `TokenUsage` 实例，累计 prompt/completion/total tokens。
 - `reset_token_usage()` — 清空累计 token 统计。
 
@@ -531,7 +556,7 @@ agent.mcp_disable("ssh-mcp", save=True)
 - `start_enabled()` — 启动所有 enabled server。
 - `stop_all()` — 停止所有已启动 server。
 - `get_tools()` — 将 MCP tools 转换为 OpenAI function tool schema。
-- `call_tool(unique_name, args)` — 调用 MCP tool，名称格式为 `mcp__<server>__<tool>`。
+- `call_tool(unique_name, args, cancel_event=None)` — 调用 MCP tool，名称格式为 `mcp__<server>__<tool>`；可传入 `threading.Event`，置位后退出等待并抛出 `TurnInterrupted`。
 
 ### 会话持久化接口
 
@@ -594,16 +619,14 @@ class ChatResult:
 ```python
 @dataclass
 class LiveSnapshot:
-    content: str
-    thinking: str
-    tool_events: list[str]
-    in_progress: bool
-    started_at: float | None
-    updated_at: float | None
-    elapsed: float
+    content: str = ""
+    in_progress: bool = False
 ```
 
-用于读取当前或最近一次流式任务的线程安全快照。
+用于读取当前或最近一轮对话的线程安全快照，仅包含以上两个字段。
+
+- `content` — 按发生顺序拼接的正文、可选 thinking、`<tool_call_pending ...>` 和 `<tool_result ...>` 文本；包含本轮多次模型请求的输出。
+- `in_progress` — 当前对话是否仍在执行，包含资源清理阶段；任务提交到后台队列但尚未开始时为 `False`。它不表示执行是否成功，也不跟踪独立的 `compact()` 操作。
 
 ### `RetryEvent`
 
@@ -708,6 +731,8 @@ agent.unregister_tool("ping")
 - 抛出异常 → 自动捕获为 `{"ok": false, "error": "..."}` 发给 LLM
 
 工具名不能覆盖内置工具或 `mcp__` 前缀；重复注册会直接报错。一个 `Enkiball` 同时只运行一个 chat/compact operation，并发启动会 fail fast。`interrupt()` 会停止流式响应，并终止正在执行的 `run_command` 进程组。
+
+MCP 的 Stdio、SSE、Streamable HTTP 工具调用均接收同一个停止信号：退出本地等待、关闭当前 HTTP 请求，并尽力发送 `notifications/cancelled`（通知发送最多等待约 0.25 秒）。正常取消保留 MCP 连接供后续调用；Stdio 若在写入半个消息时中断，会关闭该进程以免破坏后续协议，需要重新启动。服务端可能忽略取消通知，因此不保证远端任务已经停止或回滚。需要关闭本地 MCP 服务时，使用 `/mcp stop` 或 `agent.mcp.stop(name)`，会终止它所属的进程组。自定义 Python 工具仍需要自行实现取消逻辑。
 
 ## Skills
 
@@ -825,10 +850,13 @@ cli.run()
 LLM 在对话中可以按需调用以下内置工具。这些工具是模型工具，不是用户 slash command。
 
 - `read_file` — 按字符偏移读取 UTF-8 文本文件，`start`/`end` 默认为 `0`/`1000`，区间为 `[start, end)`。
+- `read_image` — 模型主动读取本地图片，参数为 `path`（绝对路径或相对 `cwd` 的路径），遵循文件读取权限。支持 PNG、JPEG、GIF、WebP，单图最大 20 MiB；图片内容会附加到下一次模型请求，需要模型及端点支持视觉输入，无需手动 `/image add`。会话保存读取时的图片快照，删除或修改原文件不影响回放，但会增加会话文件大小。
 - `write_file` — 写入或追加 UTF-8 文本文件。
 - `edit` — 精确替换现有 UTF-8 文本文件中的唯一匹配，支持 `replace_all`。
 - `run_command` — 执行 shell 命令并返回 exit code、stdout、stderr；默认使用 Linux bubblewrap 沙箱。可用 `privilleged=true` 请求一次性宿主执行审批。
 - `skill` — 按需加载 skill 正文或其中的 UTF-8 资源；仅在发现到有效 skill 时注册。
+
+`run_command` 的工具说明会随请求更新当前执行模式、工作目录、网络模式、可写/只读挂载目录及特权审批是否可用。模型可在明确需要沙箱外访问时直接调用 `privilleged=true`，也可在诊断出沙箱限制后重试；该参数触发单次审批，以当前宿主用户执行，不代表 sudo/root 提权。审批不可用时会明确告知模型，禁用沙箱时也会注明命令已经在宿主执行。
 
 文件工具只能访问 `cwd`、`dir_permissions` 和 `ro_permissions`；其中 `cwd` 与 `dir_permissions` 可写，`ro_permissions` 只读。命令工具使用相同挂载权限，其他宿主路径不可见，网络默认隔离，环境变量经过清理；可通过 `sandbox_network="host"` 共享宿主网络，通过 `sandbox_env` 或 `sandbox_inherit_env` 显式传入环境变量。裸 CLI 对应提供 `--sandbox-network {none,host}`、可重复的 `--sandbox-env NAME` 和 `--ro-permission DIR`。超时或 turn interrupt 会终止整个进程组。交互式 `read + always` 只授予只读目录并以 `--ro-bind` 挂载；write/edit 授权才允许写入。当前 exec 沙箱要求 Linux 和 `bubblewrap`；后端不可用时拒绝执行，不会自动退化为宿主 shell。`sandbox=False` 会显式关闭命令沙箱。沙箱启用时，`privilleged=true` 每次都只提供 `allow once` 或 `deny`，通过后该命令直接在宿主环境执行。
 
@@ -857,51 +885,16 @@ src/enkiball/
 └── tools.py             内置本地工具实现
 ```
 
-## 架构设计（规划中）
+## 许可证
 
-----
+本项目采用 [GNU General Public License v3.0](LICENSE)（`GPL-3.0-only`）。
 
-初版设想（2026.01）
+## 发布检查
 
-三个核心组件：Task Controller、Main Agent、SubAgent。
+```bash
+python -m unittest discover -s tests -q
+uv run --no-project --with build python scripts/build_release.py
+uvx twine check --strict dist/*
+```
 
-Task Controller 维护结构化任务树，每个 Task 包含 Target、Context、Subtasks、Process、Status。Main Agent 通过工具操作 Task Controller 来分解和调度任务，SubAgent 异步执行子任务。监察循环独立于用户对话上下文运行，通过 Task Controller 进行信息交互。
-
------
-
-2026.4.18
-
-先明确webhack几个高层次的设计。
-
-其一是任务和状态的思维悬浮，这是通用agent的能力方面。通过外部server保存任务（任务树）和状态（考虑是否需要状态服务器）来模拟悬浮状态，但是不指望AI完全自觉地查看server，这是因为AI往往意识不到已经输出了多长的信息，llm会倾向于将当前的最近上下文进一步展开，所以实践来看最好是硬性的注入。
-考虑一下注入的方式，最简单的实现是每次交互时在输入的开头注入，但是这样在单轮长context的场景下效果会很差。另一种也许可行的方式是监测输出长度，到达阈值后直接interrupt，然后注入悬浮信息和continue指令。
-
-有必要吗……？supervisor本身也可以充当悬浮的角色做监察循环，随时中断executors并发送修正指令。
-
-感觉还是有必要，设想这样的场景：executor0完成了请求规范解析工作，executor1随后被分配了参数fuzz任务，但executor1执行的过程中发现了一些参数上的限制，需要executor0继续进一步解析，因为executor0才有这个任务的上下文，他最合适。此时选择有二：一是等待supervisor监测，然后supervisor来继续给executor0发指令，在之后的循环里再交给executor1；二是直接用ACP/A2A协议跟executor0通信。显然后者是效率更好的，那要达成后者的效果，executor1就必须要能把控全局状态，知道executor0的存在，所以悬浮信息向executor的注入应该仍然是有必要的。
-
-否定二，不利于系统状态一致性。
-
-那么在意识到supervisor后再回过头来看注入的方式。感觉这样也许可以：每次executor交互时注入悬浮状态，并且在supervisor的监察循环里，如果判定当前agent已经偏离方向，那么强制打断并注入后continue。
-
-如果偏离方向应该直接结束偏离方向的executor并提取有价值信息，新开一个继续跑。
-
-其二是人机协同，这是黑盒web测试的特化能力方面。因为让现在的ai不好测web站点的重要限制就是业务逻辑，各种认证和交互都刚需现实人类身份，而且不能放心让ai做一切操作，需要人类来决定风险程度是否可以进行某一种操作。首先最容易想到的是开一个带窗口的playwright，agent操作觉得需要被确认的时候给人发信号，人在浏览器里认证或点击或告诉ai可以做。这里的问题是敏感操作本身是不可规则化识别的，而且也需要能always allow某一种操作，不然人类交互没完没了了。感觉这个没有最终解，只能尽可能地让ai多意识到这些东西。
-
-可以让ai请求的同时给出匹配规则，人类同意规则后加入白名单。
-
-人机协同的另一层是人类随时可以和agent交流工作进度，这当然也是supervisor实现的，supervisor实时提取全局状态和executor进度来输出报告，并从人类输入下发任务给executors而不必中断当前流。
-
-supervisor这个角色不打算设计为一个单纯的对话流，而是有个循环在跑一些固定的异步任务，用户跟supervisor的交互和这个循环是独立的，同时还支持单次对话不污染对话流，大概是提供一个命令如/btw <prompt>。
-
-固定的任务：
-
-- 对每个executor，审查其当前进度有没有偏离任务目标，有没有去做一些在其他地方已经得到最终确定结果的重复事情
-- 维护进度文档，处理更改请求，这个文档同时也是状态图，给目标做状态建模，必须要有严格的格式约束，不能写太多“接下来在做什么”“已经完成了什么”之类的内容，因为这些是可以从task server拿的，状态图就应该专注于业务逻辑和站点信息，还有人类给的附加信息如账户凭证
-- 维护任务树，标记已经完成或宣告失败的任务，写入新的子任务并分配executor；对已经完成的任务，附加报告信息，给状态图提交更改请求
-
-----
-
-UPDATE: webhack 和 ctf-solver均已弃用，不会再进行修改
-
-关于“解决复杂问题”的设计，以名为Enkiball-lance的项目开始。/home/pika/work/lance
+发布构建脚本生成 wheel 和源码包，并清除源码归档中的本机文件所有者与时间戳。产物位于 `dist/`。

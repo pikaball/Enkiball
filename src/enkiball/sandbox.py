@@ -97,6 +97,20 @@ class Sandbox:
     def set_approval_handler(self, handler: ApprovalHandler | None) -> None:
         self._approval_handler = handler
 
+    @property
+    def command_context(self) -> dict[str, object]:
+        """Describe current command permissions without exposing environment values."""
+        return {
+            "cwd": str(self.cwd),
+            "execution_mode": "sandbox" if self.enabled else "host",
+            "network": self.network if self.enabled else "host",
+            "writable_directories": [str(p) for p in self.writable_directories],
+            "read_only_directories": [str(p) for p in self.read_only_directories],
+            "privileged_approval_available": (
+                self.enabled and self.approval and self._approval_handler is not None
+            ),
+        }
+
     def resolve_path(self, path: str | Path, operation: str) -> Path:
         raw = Path(path).expanduser()
         target = raw if raw.is_absolute() else self.cwd / raw

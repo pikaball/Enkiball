@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import difflib
 import json
-import re
+from copy import copy
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
-from rich.markdown import Heading, Markdown, TableElement
+from rich.markdown import BlockQuote, CodeBlock, Heading, ListItem, Markdown, Paragraph, TableElement
 from rich.padding import Padding
 from rich.syntax import Syntax
 from rich.table import Table
@@ -16,10 +16,95 @@ from rich.text import Text
 from rich import box
 from rich.segment import Segment
 
+from .cli_math import markdown_parser, render_latex
+
 
 MAX_PREVIEW_LINES = 24
 MAX_PREVIEW_CHARS = 12_000
 MAX_COMMAND_CHARS = 2_000
+
+
+def _syntax_text(code: str, lexer: str, *, line_numbers: bool = False) -> Text:
+    """Highlight logical lines without Syntax's viewport padding or folding."""
+    text = Syntax(
+        code, lexer, theme="ansi_dark", background_color="default",
+    ).highlight(code)
+    if not code.endswith("\n") and text.plain.endswith("\n"):
+        text = text[:-1]
+    if line_numbers and text:
+        lines = text.split("\n", allow_blank=True)
+        if text.plain.endswith("\n"):
+            lines.pop()
+        numbered = Text()
+        width = len(str(len(lines)))
+        for number, line in enumerate(lines, 1):
+            if number > 1:
+                numbered.append("\n")
+            numbered.append(f"{number:>{width}} ", style="dim")
+            numbered.append_text(line)
+        if text.plain.endswith("\n"):
+            numbered.append("\n")
+        text = numbered
+    text.no_wrap = True
+    text.overflow = "ignore"
+    text.end = "" if text.plain.endswith("\n") else "\n"
+    return text
+
+
+def _prefixed_lines(
+    renderable: RenderableType,
+    console: Console,
+    options: ConsoleOptions,
+    first: Segment,
+    continuation: Segment | None = None,
+) -> RenderResult:
+    """Prefix source lines; leave visual wrapping to the terminal."""
+    continuation = first if continuation is None else continuation
+    render_options = options.update(
+        width=max(1, options.max_width - max(first.cell_length, continuation.cell_length)),
+        no_wrap=True,
+        overflow="ignore",
+    )
+    segments = console.render(renderable, render_options)
+    for index, (line, newline) in enumerate(Segment.split_lines_terminator(segments)):
+        yield first if index == 0 else continuation
+        yield from line
+        if newline:
+            yield Segment.line()
+
+
+class TerminalCodeBlock(CodeBlock):
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        yield _syntax_text(self.text.plain, self.lexer_name)
+
+
+class TerminalListItem(ListItem):
+    def render_bullet(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        style = console.get_style("markdown.item.bullet", default="none")
+        yield from _prefixed_lines(
+            self.elements, console, options, Segment(" • ", style), Segment("   ", style),
+        )
+
+    def render_number(
+        self, console: Console, options: ConsoleOptions, number: int, last_number: int
+    ) -> RenderResult:
+        width = len(str(last_number)) + 2
+        style = console.get_style("markdown.item.number", default="none")
+        yield from _prefixed_lines(
+            self.elements, console, options,
+            Segment(f"{number:>{width - 1}} ", style), Segment(" " * width, style),
+        )
+
+
+class TerminalBlockQuote(BlockQuote):
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        yield from _prefixed_lines(
+            self.elements, console, options, Segment("▌ ", self.style),
+        )
 
 
 class FlatHeading(Heading):
@@ -55,7 +140,9 @@ class CompactTable(TableElement):
         if self.body is not None:
             for row in self.body.rows:
                 table.add_row(*(element.content for element in row.cells))
-        yield table
+        # Tables still need a bounded layout even when the surrounding transcript
+        # uses terminal wrapping.
+        yield from console.render(table, options.update(no_wrap=False, overflow="fold"))
 
 
 class TerminalMarkdown(Markdown):
@@ -63,7 +150,41 @@ class TerminalMarkdown(Markdown):
         **Markdown.elements,
         "heading_open": FlatHeading,
         "table_open": CompactTable,
+        "fence": TerminalCodeBlock,
+        "code_block": TerminalCodeBlock,
+        "list_item_open": TerminalListItem,
+        "blockquote_open": TerminalBlockQuote,
+        "math_block": Paragraph,
     }
+
+    def __init__(self, markup: str, *args: Any, leading_gap: bool = False, **kwargs: Any) -> None:
+        # Rich has no parser injection hook; initialize its styles with empty input.
+        super().__init__("", *args, **kwargs)
+        self.markup = markup
+        self.parsed = markdown_parser().parse(markup)
+        self.leading_gap = leading_gap
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        leading_gap = self.leading_gap
+        for segment in super().__rich_console__(console, options):
+            if leading_gap and segment.text:
+                # Lists and quotes may already start with Rich's block separator.
+                if not segment.text.startswith("\n"):
+                    yield Segment.line()
+                leading_gap = False
+            yield segment
+
+    def _flatten_tokens(self, tokens):
+        for token in super()._flatten_tokens(tokens):
+            if token.type in {"math_inline", "math_block"}:
+                token = copy(token)
+                source = token.meta["source"]
+                token.content = (
+                    render_latex(token.content, source) if token.meta["closed"] else source
+                )
+                if token.type == "math_inline":
+                    token.type = "text"
+            yield token
 
 
 class ToolBody:
@@ -73,12 +194,9 @@ class ToolBody:
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
-        body_options = options.update(width=max(1, options.max_width - 3))
-        lines = console.render_lines(self.renderable, body_options, pad=False)
-        for line in lines:
-            yield Segment("│ ", console.get_style("dim cyan"))
-            yield from line
-            yield Segment.line()
+        yield from _prefixed_lines(
+            self.renderable, console, options, Segment("│ ", console.get_style("dim cyan")),
+        )
 
 
 def parse_tool_event(event: str) -> tuple[str, dict[str, Any]]:
@@ -163,13 +281,10 @@ def render_tool_event(event: str, cwd: Path) -> RenderableType:
         body: list[RenderableType] = [
             _tool_header("Write", path),
             _tool_body(
-                Syntax(
+                _syntax_text(
                     preview,
                     _lexer_for_path(path or ""),
-                    theme="ansi_dark",
                     line_numbers=True,
-                    word_wrap=True,
-                    background_color="default",
                 )
             ),
         ]
@@ -196,12 +311,9 @@ def render_tool_event(event: str, cwd: Path) -> RenderableType:
         body = [
             _tool_header("Edit all" if args.get("replace_all") else "Edit", path),
             _tool_body(
-                Syntax(
+                _syntax_text(
                     preview or "(no textual diff)",
                     "diff",
-                    theme="ansi_dark",
-                    word_wrap=True,
-                    background_color="default",
                 )
             ),
         ]
@@ -220,18 +332,17 @@ def render_tool_event(event: str, cwd: Path) -> RenderableType:
         return Group(
             _tool_header(label),
             _tool_body(
-                Syntax(
+                _syntax_text(
                     command,
                     "bash",
-                    theme="ansi_dark",
-                    word_wrap=True,
-                    background_color="default",
                 )
             ),
         )
 
     if name == "read_file":
         return _tool_header("Read", path)
+    if name == "read_image":
+        return _tool_header("Read image", path)
 
     summary = Text("└─ ", style="dim cyan")
     summary.append(name, style="bold cyan")
@@ -254,6 +365,8 @@ class CliRenderer:
         self._live: Live | None = None
         self._mode: str | None = None
         self._response_started = False
+        self._content_printed = False
+        self._last_block_heading = False
 
     def _start_response(self) -> None:
         if self._response_started:
@@ -262,6 +375,8 @@ class CliRenderer:
         marker.append("assistant", style="bold green")
         self.console.print(marker)
         self._response_started = True
+        self._content_printed = False
+        self._last_block_heading = False
 
     def token(self, token: str) -> None:
         if self._mode == "thinking":
@@ -284,7 +399,7 @@ class CliRenderer:
         self.console.print()
         self._mode = None
         self._response_started = False
-        self.console.print(render_tool_event(event, self.cwd))
+        self.console.print(render_tool_event(event, self.cwd), soft_wrap=True)
 
     def retry(self, event: object) -> None:
         self._flush_current()
@@ -359,7 +474,7 @@ class CliRenderer:
         marker.append("you", style="bold blue")
         self.console.print(marker)
         if text:
-            self.console.print(TerminalMarkdown(text))
+            self.console.print(TerminalMarkdown(text), soft_wrap=True)
         for path in images:
             image = Text("  image  ", style="dim blue")
             image.append(_display_path(path, self.cwd), style="dim")
@@ -377,7 +492,7 @@ class CliRenderer:
             marker = Text("● ", style="green")
             marker.append("assistant", style="bold green")
             self.console.print(marker)
-            self.console.print(TerminalMarkdown(content))
+            self.console.print(TerminalMarkdown(content), soft_wrap=True)
 
         tool_calls = message.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -392,7 +507,7 @@ class CliRenderer:
             arguments = function.get("arguments", "{}")
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments, ensure_ascii=False, default=str)
-            self.console.print(render_tool_event(f"{name}({arguments})", self.cwd))
+            self.console.print(render_tool_event(f"{name}({arguments})", self.cwd), soft_wrap=True)
 
     @staticmethod
     def _history_user_content(content: object) -> tuple[str, list[str]]:
@@ -423,8 +538,21 @@ class CliRenderer:
     def _flush_content(self) -> None:
         self._stop_live()
         if self._pending_content:
-            self.console.print(TerminalMarkdown(self._pending_content.rstrip()))
+            self._print_content(self._pending_content.rstrip())
             self._pending_content = ""
+
+    def _print_content(self, content: str) -> None:
+        markdown = TerminalMarkdown(content)
+        if not markdown.parsed:
+            return
+        starts_heading = markdown.parsed[0].type == "heading_open"
+        if self._content_printed and (starts_heading or self._last_block_heading):
+            # Restore the gap Rich would insert if these streamed blocks had
+            # arrived in one Markdown document. A newline adds no copy padding.
+            markdown.leading_gap = True
+        self.console.print(markdown, soft_wrap=True)
+        self._content_printed = True
+        self._last_block_heading = markdown.parsed[-1].type == "heading_close"
 
     def _flush_thinking(self) -> None:
         self._stop_live()
@@ -440,24 +568,22 @@ class CliRenderer:
         self._pending_content = self._pending_content[boundary:]
         self._stop_live()
         if committed:
-            self.console.print(TerminalMarkdown(committed))
+            self._print_content(committed)
 
     @staticmethod
     def _completed_markdown_boundary(content: str) -> int:
         offset = 0
         boundary = 0
-        fence: str | None = None
-        for line in content.splitlines(keepends=True):
-            stripped = line.lstrip()
-            marker = re.match(r"(`{3,}|~{3,})", stripped)
-            if marker:
-                candidate = marker.group(1)
-                if fence is None:
-                    fence = candidate[0]
-                elif candidate[0] == fence:
-                    fence = None
+        protected = [
+            token.map for token in markdown_parser().parse(content)
+            if token.type in {"fence", "code_block", "math_block"} and token.map
+        ]
+        for index, line in enumerate(content.splitlines(keepends=True)):
             offset += len(line)
-            if fence is None and not line.strip() and line.endswith(("\n", "\r")):
+            if (
+                not line.strip() and line.endswith(("\n", "\r"))
+                and not any(start <= index < end for start, end in protected)
+            ):
                 boundary = offset
         return boundary
 
@@ -481,11 +607,11 @@ class CliRenderer:
         else:
             shown = wrapped
             hidden = 0
-        text = Text(prefix, style="dim magenta")
+        text = Text(prefix, style="magenta")
         if hidden:
             text.append(f"… {hidden} earlier lines", style="dim")
             text.append("\n", style="dim")
-        text.append("\n".join(shown), style="dim")
+        text.append("\n".join(shown))
         return text
 
     def _thinking_line_budget(self) -> int:

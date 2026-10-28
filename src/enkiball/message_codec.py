@@ -135,10 +135,29 @@ def drop_orphan_tool_call_messages(messages: list[dict[str, Any]]) -> list[dict[
 
 def prepare_messages_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
+    pending_images: list[dict[str, Any]] = []
     for msg in drop_orphan_tool_call_messages(messages):
+        # Chat Completions accepts images in user content, after all tool replies.
+        if msg.get("role") != "tool" and pending_images:
+            prepared.append({"role": "user", "content": pending_images})
+            pending_images = []
         item = dict(msg)
         item.pop("_compact", None)
         item.pop("_usage", None)
         item["content"] = prepare_content_for_api(item.get("content", ""))
+        if item.get("role") == "tool" and isinstance(item["content"], list):
+            parts = item["content"]
+            images = [part for part in parts if part.get("type") == "image_url"]
+            if images:
+                pending_images.append({
+                    "type": "text",
+                    "text": f"Image returned by tool call {item.get('tool_call_id', '')}",
+                })
+                pending_images.extend(images)
+                item["content"] = "\n".join(
+                    part.get("text", "") for part in parts if part.get("type") == "text"
+                )
         prepared.append(item)
+    if pending_images:
+        prepared.append({"role": "user", "content": pending_images})
     return prepared

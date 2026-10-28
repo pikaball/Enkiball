@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from enkiball import Enkiball, EnkiballCLI
 from enkiball.config import (
+    DEFAULT_CONFIG,
     DEFAULT_STATE_PATH,
+    ensure_config,
     load_config,
     load_state,
     save_config,
@@ -183,6 +185,21 @@ class StatePathTests(unittest.TestCase):
     def test_public_constructor_default_remains_default_state_path(self) -> None:
         default = inspect.signature(Enkiball).parameters["state_path"].default
         self.assertEqual(default, DEFAULT_STATE_PATH)
+
+    def test_missing_config_is_created_with_default_contents(self) -> None:
+        config_path = self.root / "new" / "enki.json"
+
+        self.assertEqual(ensure_config(config_path), config_path)
+        self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), DEFAULT_CONFIG)
+
+        state_path = self.root / "new" / "state.json"
+        config = load_config(config_path, state_path)
+        self.assertEqual(config["providers"]["openai"]["models"], {
+            "gpt-4o": {"temperature": 0.2, "max_tokens": 4096}
+        })
+        self.assertEqual(load_state(state_path), {
+            "active_provider": "openai", "active_model": "gpt-4o"
+        })
 
     def test_custom_agents_isolate_provider_and_model_state(self) -> None:
         first_path = self.root / "agent-one" / "state.json"

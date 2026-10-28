@@ -255,7 +255,8 @@ class EnkiballCLI:
             style="green",
         )
         console.print(
-            f"Config: {agent.config_path}  Provider: {agent.provider}  Model: {agent.model}",
+            f"Config: {agent.config_path}  Provider: {agent.provider}  Model: {agent.model}"
+            f"  Thinking: {'on' if agent.show_thinking else 'off'}",
             style="cyan",
         )
         current = session_store.begin_new(

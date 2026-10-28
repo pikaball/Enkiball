@@ -2,15 +2,50 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import signal
 import subprocess
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections import deque
+from contextlib import contextmanager
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+
+from .interruptible_http import InterruptibleTransport
+from .sandbox import TurnInterrupted
+
+
+class _RequestCancellation:
+    def __init__(self, cancelled: threading.Event | None, closed: threading.Event) -> None:
+        self.cancelled = cancelled
+        self.closed = closed
+
+    def is_set(self) -> bool:
+        return self.closed.is_set() or bool(self.cancelled and self.cancelled.is_set())
+
+
+@contextmanager
+def _http_client(
+    cancelled: threading.Event | None,
+    closed: threading.Event,
+    headers: dict[str, str] | None = None,
+) -> Iterator[httpx.Client]:
+    # Each request owns its I/O so cancelling one call cannot abort another.
+    transport = InterruptibleTransport(_RequestCancellation(cancelled, closed))
+    try:
+        with httpx.Client(transport=transport, timeout=60.0, headers=headers or {}) as client:
+            yield client
+    except TurnInterrupted:
+        if cancelled is not None and cancelled.is_set():
+            raise
+        raise RuntimeError("MCP connection closed") from None
+    finally:
+        transport.close()
 
 
 def _parse_sse_event_lines(lines: list[str]) -> tuple[str, str] | None:
@@ -40,6 +75,8 @@ class MCPClient(ABC):
     def __init__(self, name: str) -> None:
         self.name = name
         self._request_id = 0
+        self._id_lock = threading.Lock()
+        self._closed = threading.Event()
         self._pending_requests: dict[int | str, Queue[dict[str, Any]]] = {}
         self.tools: list[dict[str, Any]] = []
         self.resources: list[dict[str, Any]] = []
@@ -47,8 +84,9 @@ class MCPClient(ABC):
         self.running = False
 
     def _get_next_id(self) -> int:
-        self._request_id += 1
-        return self._request_id
+        with self._id_lock:
+            self._request_id += 1
+            return self._request_id
 
     def _handle_message(self, msg: dict[str, Any]) -> None:
         if "id" not in msg:
@@ -68,7 +106,9 @@ class MCPClient(ABC):
             return
 
     @abstractmethod
-    def _send_payload(self, payload: dict[str, Any]) -> None:
+    def _send_payload(
+        self, payload: dict[str, Any], cancel_event: threading.Event | None = None,
+    ) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -85,7 +125,7 @@ class MCPClient(ABC):
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"roots": {"listChanged": True}, "sampling": {}},
-                "clientInfo": {"name": "enkiball", "version": "0.1.0"},
+                "clientInfo": {"name": "enkiball", "version": "0.1.1"},
             },
         )
         self.send_notification("notifications/initialized")
@@ -111,7 +151,37 @@ class MCPClient(ABC):
         except Exception:
             pass
 
-    def send_request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def _check_cancelled(self, cancel_event: threading.Event | None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TurnInterrupted
+        if self._closed.is_set():
+            raise RuntimeError(f"MCP connection closed: {self.name}")
+
+    def _cancel_request(self, rid: int, method: str) -> None:
+        if method == "initialize" or self._closed.is_set():
+            return
+        # A server may ignore cancellation, including the notification POST.
+        # Bound the entire send/read, not just the socket inactivity timeout.
+        expired = threading.Event()
+        timer = threading.Timer(0.25, expired.set)
+        timer.start()
+        try:
+            self.send_notification(
+                "notifications/cancelled",
+                {"requestId": rid, "reason": "Client stopped waiting for the request"},
+                cancel_event=expired,
+            )
+        except Exception:
+            pass
+        finally:
+            timer.cancel()
+            timer.join()
+
+    def send_request(
+        self, method: str, params: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
+        self._check_cancelled(cancel_event)
         rid = self._get_next_id()
         rid_str = str(rid)
         payload = {
@@ -124,34 +194,51 @@ class MCPClient(ABC):
         self._pending_requests[rid] = q
         self._pending_requests[rid_str] = q
         try:
-            self._send_payload(payload)
-            resp = q.get(timeout=30)
-        except Empty as e:
-            self._pending_requests.pop(rid, None)
-            self._pending_requests.pop(rid_str, None)
-            raise TimeoutError(f"MCP request timed out: {method}") from e
-        except Exception:
-            self._pending_requests.pop(rid, None)
-            self._pending_requests.pop(rid_str, None)
+            self._send_payload(payload, cancel_event=cancel_event)
+            deadline = time.monotonic() + 30
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TurnInterrupted
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"MCP request timed out: {method}")
+                try:
+                    resp = q.get(timeout=min(0.05, remaining))
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TurnInterrupted
+                    break
+                except Empty:
+                    self._check_cancelled(cancel_event)
+        except (TurnInterrupted, TimeoutError, httpx.TimeoutException):
+            self._cancel_request(rid, method)
             raise
+        finally:
+            self._pending_requests.pop(rid, None)
+            self._pending_requests.pop(rid_str, None)
 
-        self._pending_requests.pop(rid, None)
-        self._pending_requests.pop(rid_str, None)
         if "error" in resp:
             err = resp["error"]
             raise RuntimeError(f"MCP error: {err.get('message', 'Unknown error')}")
         return resp.get("result")
 
-    def send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+    def send_notification(
+        self, method: str, params: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         payload = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params or {},
         }
-        self._send_payload(payload)
+        self._send_payload(payload, cancel_event=cancel_event)
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        return self.send_request("tools/call", {"name": name, "arguments": arguments})
+    def call_tool(
+        self, name: str, arguments: dict[str, Any],
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
+        return self.send_request(
+            "tools/call", {"name": name, "arguments": arguments}, cancel_event=cancel_event,
+        )
 
 
 class StdioMCPClient(MCPClient):
@@ -172,9 +259,12 @@ class StdioMCPClient(MCPClient):
         self.thread: threading.Thread | None = None
         self.stderr_thread: threading.Thread | None = None
         self._write_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._process_closed = True
         self._stderr_tail: deque[str] = deque(maxlen=20)
 
     def start(self) -> None:
+        self._closed.clear()
         run_env = os.environ.copy()
         run_env.update(self.env)
 
@@ -186,7 +276,11 @@ class StdioMCPClient(MCPClient):
             text=False,
             bufsize=0,
             env=run_env,
+            start_new_session=True,
         )
+        self._process_closed = False
+        assert self.process.stdin is not None
+        os.set_blocking(self.process.stdin.fileno(), False)
         self.running = True
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
@@ -242,9 +336,12 @@ class StdioMCPClient(MCPClient):
                 if header_line in (b"\r\n", b"\n"):
                     break
 
-            body = self.process.stdout.read(length)
-            if not body or len(body) < length:
-                return None
+            body = bytearray()
+            while len(body) < length:
+                part = self.process.stdout.read(length - len(body))
+                if not part:
+                    return None
+                body.extend(part)
             try:
                 return json.loads(body.decode("utf-8"))
             except json.JSONDecodeError:
@@ -260,6 +357,7 @@ class StdioMCPClient(MCPClient):
                 break
             self._handle_message(msg)
         self.running = False
+        self._closed.set()
 
     def _drain_stderr_loop(self) -> None:
         if not self.process or not self.process.stderr:
@@ -278,43 +376,91 @@ class StdioMCPClient(MCPClient):
     def get_stderr_tail(self) -> str:
         return " | ".join(self._stderr_tail)
 
-    def _send_payload(self, payload: dict[str, Any]) -> None:
+    def _send_payload(
+        self, payload: dict[str, Any], cancel_event: threading.Event | None = None,
+    ) -> None:
+        self._check_cancelled(cancel_event)
         if not self.process or not self.process.stdin:
             raise RuntimeError("MCP process is not running")
-        with self._write_lock:
+        while not self._write_lock.acquire(timeout=0.05):
+            self._check_cancelled(cancel_event)
+        written = 0
+        try:
+            self._check_cancelled(cancel_event)
             if self.transport == "content-length":
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-                self.process.stdin.write(header)
-                self.process.stdin.write(body)
+                data = header + body
             else:
-                line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-                self.process.stdin.write(line)
-            self.process.stdin.flush()
+                data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+            fd = self.process.stdin.fileno()
+            while written < len(data):
+                self._check_cancelled(cancel_event)
+                if not select.select([], [fd], [], 0.05)[1]:
+                    continue
+                try:
+                    written += os.write(fd, data[written:written + 65536])
+                except BlockingIOError:
+                    continue
+        except BaseException:
+            # An incomplete frame would corrupt every later request. Retire it.
+            if written:
+                self.close()
+            raise
+        finally:
+            self._write_lock.release()
 
     def close(self) -> None:
         self.running = False
+        self._closed.set()
+        with self._close_lock:
+            if self._process_closed:
+                return
+            self._close_process()
+            self._process_closed = True
+
+    def _close_process(self) -> None:
         if not self.process:
             return
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
+        # Servers often launch subprocesses. Stop the whole owned process group.
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(self.process.pid, sig)
+            except ProcessLookupError:
+                break
+            if sig == signal.SIGTERM:
+                try:
+                    self.process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+        self.process.wait()
+        for thread in (self.thread, self.stderr_thread):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=0.2)
+        for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 class SSEMCPClient(MCPClient):
-    def __init__(self, name: str, url: str) -> None:
+    def __init__(
+        self, name: str, url: str, headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(name)
         self.url = url
         self.post_url: str | None = None
-        self.client = httpx.Client(timeout=60.0)
+        self.headers = headers or {}
         self.thread: threading.Thread | None = None
         self._connected = threading.Event()
         self._endpoint_ready = threading.Event()
         self._connection_error: Exception | None = None
 
     def start(self) -> None:
+        self._closed.clear()
+        self._connected.clear()
+        self._endpoint_ready.clear()
+        self._connection_error = None
+        self.post_url = None
         self.running = True
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
@@ -341,7 +487,7 @@ class SSEMCPClient(MCPClient):
     def _read_loop(self) -> None:
         buffer: list[str] = []
         try:
-            with self.client.stream(
+            with _http_client(None, self._closed, self.headers) as client, client.stream(
                 "GET",
                 self.url,
                 headers={
@@ -351,8 +497,6 @@ class SSEMCPClient(MCPClient):
                 },
             ) as response:
                 response.raise_for_status()
-                if not self.post_url:
-                    self.post_url = self.url
                 self._connected.set()
 
                 for line in response.iter_lines():
@@ -369,6 +513,8 @@ class SSEMCPClient(MCPClient):
             self._connected.set()
         finally:
             self.running = False
+            self._closed.set()
+            self._endpoint_ready.set()
 
     def _process_sse_event(self, lines: list[str]) -> None:
         parsed = _parse_sse_event_lines(lines)
@@ -392,22 +538,25 @@ class SSEMCPClient(MCPClient):
             return
         self._handle_message(msg)
 
-    def _send_payload(self, payload: dict[str, Any]) -> None:
+    def _send_payload(
+        self, payload: dict[str, Any], cancel_event: threading.Event | None = None,
+    ) -> None:
+        self._check_cancelled(cancel_event)
         if not self.post_url:
             raise RuntimeError("MCP post endpoint unavailable")
-        resp = self.client.post(self.post_url, json=payload)
-        try:
-            resp.raise_for_status()
-        except Exception as e:  # noqa: BLE001
-            body = resp.text[:500] if resp.text else ""
-            raise RuntimeError(f"POST {self.post_url} failed: {resp.status_code} {body}") from e
+        with _http_client(cancel_event, self._closed, self.headers) as client:
+            resp = client.post(self.post_url, json=payload)
+            try:
+                resp.raise_for_status()
+            except Exception as e:  # noqa: BLE001
+                body = resp.text[:500] if resp.text else ""
+                raise RuntimeError(f"POST {self.post_url} failed: {resp.status_code} {body}") from e
 
     def close(self) -> None:
         self.running = False
-        try:
-            self.client.close()
-        except Exception:
-            pass
+        self._closed.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=1)
 
 
 class StreamableHTTPMCPClient(MCPClient):
@@ -420,17 +569,22 @@ class StreamableHTTPMCPClient(MCPClient):
         super().__init__(name)
         self.url = url
         self.session_id: str | None = None
-        self.client = httpx.Client(timeout=60.0, headers=headers or {})
+        self.headers = headers or {}
 
-    def _send_payload(self, payload: dict[str, Any]) -> None:
+    def _send_payload(
+        self, payload: dict[str, Any], cancel_event: threading.Event | None = None,
+    ) -> None:
         raise NotImplementedError("StreamableHTTPMCPClient uses HTTP request-response directly")
 
-    def _request_once(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+    def _request_once(
+        self, payload: dict[str, Any], cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any] | None:
+        self._check_cancelled(cancel_event)
         expected_id = payload.get("id")
         req_headers = {"Accept": "application/json, text/event-stream"}
         if self.session_id:
             req_headers["Mcp-Session-Id"] = self.session_id
-        with self.client.stream(
+        with _http_client(cancel_event, self._closed, self.headers) as client, client.stream(
             "POST",
             self.url,
             json=payload,
@@ -490,7 +644,11 @@ class StreamableHTTPMCPClient(MCPClient):
 
         return None
 
-    def send_request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def send_request(
+        self, method: str, params: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
+        self._check_cancelled(cancel_event)
         rid = self._get_next_id()
         payload = {
             "jsonrpc": "2.0",
@@ -498,7 +656,12 @@ class StreamableHTTPMCPClient(MCPClient):
             "method": method,
             "params": params or {},
         }
-        msg = self._request_once(payload)
+        try:
+            msg = self._request_once(payload, cancel_event=cancel_event)
+            self._check_cancelled(cancel_event)
+        except (TurnInterrupted, httpx.TimeoutException):
+            self._cancel_request(rid, method)
+            raise
         if not msg:
             raise RuntimeError(f"Empty response for MCP request: {method}")
         if "error" in msg:
@@ -510,16 +673,21 @@ class StreamableHTTPMCPClient(MCPClient):
             )
         return msg.get("result")
 
-    def send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+    def send_notification(
+        self, method: str, params: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         payload = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params or {},
         }
         # Notification response is optional; ignore body.
-        self._request_once(payload)
+        self._request_once(payload, cancel_event=cancel_event)
 
     def start(self) -> None:
+        self._closed.clear()
+        self.session_id = None
         self.running = True
         try:
             self.initialize()
@@ -529,7 +697,4 @@ class StreamableHTTPMCPClient(MCPClient):
 
     def close(self) -> None:
         self.running = False
-        try:
-            self.client.close()
-        except Exception:
-            pass
+        self._closed.set()

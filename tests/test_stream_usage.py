@@ -83,7 +83,9 @@ class StreamUsageTests(unittest.TestCase):
                     self.assertEqual(result, "answer")
                     self.assertFalse(engine.show_thinking)
                     self.assertEqual(seen, ["consider"])
-                    self.assertEqual(engine.capture().thinking, "consider")
+                    self.assertEqual(engine.capture().content, "answer")
+                    self.assertEqual(engine.capture(collect_thinking=True).content, "consideranswer")
+                    self.assertFalse(engine.capture().in_progress)
                     self.assertEqual(engine.messages[-1]["reasoning_content"], "consider")
                     self.assertEqual(engine.token_usage.total_tokens, 19)
 

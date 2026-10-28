@@ -5,9 +5,36 @@ import threading
 from typing import Any
 
 from .sandbox import Sandbox, TurnInterrupted
-from .tools import DEFAULT_READ_END, edit_file, read_file, write_file
+from .tools import DEFAULT_READ_END, edit_file, read_file, read_image, write_file
+
+
+class ImageToolResult(str):
+    """Keep binary content separate from textual callbacks and system notices."""
+
+    def __new__(cls, text: str, image_url: str) -> ImageToolResult:
+        result = super().__new__(cls, text)
+        result.image_url = image_url
+        return result
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_image",
+            "description": (
+                "Read a local image and attach its visual content for inspection by "
+                "a vision-capable model. Supports PNG, JPEG, GIF and WebP up to 20 MiB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path or path relative to the working directory."},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -91,7 +118,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "Run a shell command and capture exit_code/stdout/stderr.",
+            "description": (
+                "Run /bin/sh -c in the configured working directory and capture "
+                "exit_code/stdout/stderr. By default commands run inside a Linux "
+                "bubblewrap sandbox: only permitted directories and read-only system "
+                "runtime paths are visible; network is isolated unless configured "
+                "otherwise; environment variables are filtered, HOME is temporary, "
+                "and /tmp is private to each command unless explicitly mounted. "
+                "Writes to writable mounted directories persist. Missing host files, "
+                "credentials, network access or services can be sandbox restrictions. "
+                "When the task requires access blocked by isolation, request a single "
+                "host execution with privilleged=true if approval is available. You "
+                "may request this directly when the need is known, or retry after "
+                "diagnosing a sandbox-related failure; do not repeatedly retry the "
+                "same blocked command. A nonzero exit_code does not by itself prove "
+                "a sandbox issue. Respect a denied approval."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -107,7 +149,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "boolean",
                         "description": (
                             "Request one-time approval to run directly on the host "
-                            "without sandbox isolation."
+                            "without sandbox isolation, using the host environment "
+                            "and network as the current user (not sudo/root). Set true "
+                            "for required host-only files, services, credentials or "
+                            "network access unavailable in the sandbox, or when the "
+                            "sandbox backend is unavailable. This tool call triggers "
+                            "approval; a text-only request does not. Each host command "
+                            "requires fresh approval while sandboxing is enabled. "
+                            "The parameter name is spelled privilleged."
                         ),
                         "default": False,
                     },
@@ -130,6 +179,19 @@ def dispatch_tool(
     try:
         if not isinstance(args, dict):
             raise TypeError("tool arguments must be an object")
+        if name == "read_image":
+            path = args.get("path")
+            if not isinstance(path, str):
+                raise TypeError("path must be a string")
+            if not path.strip():
+                raise ValueError("path must not be empty")
+            target = sandbox.resolve_path(path, "read")
+            image_url = read_image(str(target))
+            return ImageToolResult(
+                json.dumps({"ok": True, "path": str(target)}, ensure_ascii=False),
+                image_url,
+            )
+
         if name == "read_file":
             path = args.get("path")
             start = args.get("start", 0)

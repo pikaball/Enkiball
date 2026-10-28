@@ -1,8 +1,12 @@
+LICENSE
+MANIFEST.in
 README.md
 pyproject.toml
+scripts/build_release.py
 src/enkiball/__init__.py
 src/enkiball/agent.py
 src/enkiball/cli.py
+src/enkiball/cli_math.py
 src/enkiball/cli_renderer.py
 src/enkiball/commands.py
 src/enkiball/config.py
@@ -23,6 +27,7 @@ src/enkiball.egg-info/dependency_links.txt
 src/enkiball.egg-info/entry_points.txt
 src/enkiball.egg-info/requires.txt
 src/enkiball.egg-info/top_level.txt
+tests/test_capture.py
 tests/test_cli_renderer.py
 tests/test_edit_tool.py
 tests/test_efficiency.py
@@ -30,9 +35,12 @@ tests/test_foundation.py
 tests/test_http_interrupt.py
 tests/test_interrupt.py
 tests/test_mcp_config.py
+tests/test_mcp_interrupt.py
 tests/test_mcp_sse.py
 tests/test_notice.py
 tests/test_persistence.py
+tests/test_read_image.py
+tests/test_request_retry.py
 tests/test_sandbox.py
 tests/test_session_history.py
 tests/test_skills.py

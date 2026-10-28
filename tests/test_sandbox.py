@@ -156,6 +156,48 @@ class DirectoryPermissionTests(unittest.TestCase):
         self.assertEqual(result["content"], "visible")
 
 
+class CommandContextTests(unittest.TestCase):
+    @staticmethod
+    def description(engine):
+        return next(
+            schema["function"]["description"] for schema in engine._get_tools()
+            if schema["function"]["name"] == "run_command"
+        )
+
+    def test_schema_tracks_permissions_and_approval_without_mutating_defaults(self):
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as external:
+            sandbox = Sandbox(cwd=workspace, approval=True)
+            engine = ChatEngine({}, state={}, sandbox=sandbox)
+            initial = self.description(engine)
+            self.assertIn('"execution_mode": "sandbox"', initial)
+            self.assertIn('"network": "none"', initial)
+            self.assertIn('"privileged_approval_available": false', initial)
+            sandbox.set_approval_handler(lambda path, operation: "always")
+            sandbox.resolve_path(Path(external) / "file.txt", "read")
+            updated = self.description(engine)
+            self.assertIn('"privileged_approval_available": true', updated)
+            self.assertIn(external, updated)
+            self.assertNotIn(external, initial)
+            sandbox.set_approval_handler(None)
+            self.assertIn('"privileged_approval_available": false', self.description(engine))
+            from enkiball.llm_tools import TOOL_SCHEMAS
+            self.assertNotIn("Current execution context", str(TOOL_SCHEMAS))
+
+    def test_host_and_shared_network_are_reported_accurately(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            sandbox = Sandbox(cwd=workspace, network="host", env={"SECRET": "private-value"})
+            engine = ChatEngine({}, state={}, sandbox=sandbox)
+            description = self.description(engine)
+            self.assertIn('"network": "host"', description)
+            self.assertIn('"execution_mode": "sandbox"', description)
+            self.assertNotIn("private-value", description)
+            sandbox.enabled = False
+            description = self.description(engine)
+            self.assertIn('"execution_mode": "host"', description)
+            self.assertIn("privilleged=true is unnecessary", description)
+            self.assertNotIn("will be denied", description)
+
+
 class CliPermissionTests(unittest.TestCase):
     def _approval_from_input(self, data: str) -> str:
         with create_pipe_input() as pipe_input:

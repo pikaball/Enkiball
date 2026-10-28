@@ -1,13 +1,26 @@
 [project]
 name = "enkiball"
-version = "0.1.0"
-description = "A CLI foundation for Enkiball security research agent"
+version = "0.1.5"
+description = "A Python LLM foundation with a CLI and Python API"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+keywords = ["agent", "cli", "llm", "mcp", "python"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
   "openai>=1.40.0",
   "prompt_toolkit>=3.0.47",
   "rich>=13.7.1",
+  "markdown-it-py>=2.2.0",
+  "pylatexenc>=2.10,<3",
   "httpx>=0.27.0",
   "PyYAML>=6.0",
 ]
@@ -17,10 +30,13 @@ enkiball = "enkiball.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["enkiball", "enkiball.*"]
+namespaces = false
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"

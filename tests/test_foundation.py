@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import threading
 import tempfile
 import time
@@ -285,7 +286,7 @@ class CommandExtensionTests(unittest.TestCase):
         root = Path(self.temp_dir.name)
         self.store = SessionStore._from_paths(root / "sessions", root / "exports")
         self.agent = Enkiball.__new__(Enkiball)
-        self.agent._engine = ChatEngine({})
+        self.agent._engine = ChatEngine({}, state_path=root / "state.json")
         self.agent._config = {}
         self.agent._mcp = MCPManager({})
         self.agent._session_store = self.store
@@ -315,6 +316,21 @@ class CommandExtensionTests(unittest.TestCase):
             self.assertTrue(self.handler.handle("/context value", session))
         self.assertEqual(context_calls[0][0], ["/context", "value"])
         self.assertIs(context_calls[0][1].agent, self.agent)
+
+    def test_thinking_toggle_persists_to_state(self) -> None:
+        from enkiball.config import get_show_thinking
+
+        self.assertFalse(self.agent.show_thinking)
+
+        self.handler._thinking()
+        self.assertTrue(self.agent.show_thinking)
+
+        state = json.loads((self.agent._state_path).read_text())
+        self.assertIs(state.get("show_thinking"), True)
+        self.assertTrue(get_show_thinking(self.agent._state_path))
+
+        engine = ChatEngine({}, state_path=self.agent._state_path)
+        self.assertTrue(engine.show_thinking)
 
     def test_command_completions_are_instance_local_and_removed(self) -> None:
         other = CommandHandler(

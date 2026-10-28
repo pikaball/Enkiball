@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import stat
 import tempfile
@@ -8,6 +9,31 @@ from pathlib import Path
 DEFAULT_READ_END = 1000
 MAX_LENGTH = 50000
 MAX_EDIT_FILE_SIZE = 100000
+MAX_IMAGE_FILE_SIZE = 20 * 1024 * 1024
+
+
+def read_image(path: str) -> str:
+    """Read a local raster image and return a self-contained data URL."""
+    target = Path(path).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(f"Image not found: {target}")
+    if not target.is_file():
+        raise ValueError(f"Not a regular image file: {target}")
+    with target.open("rb") as f:
+        data = f.read(MAX_IMAGE_FILE_SIZE + 1)
+    if len(data) > MAX_IMAGE_FILE_SIZE:
+        raise ValueError(f"Image exceeds {MAX_IMAGE_FILE_SIZE} byte limit")
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif data.startswith((b"GIF87a", b"GIF89a")):
+        mime = "image/gif"
+    elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        raise ValueError("Unsupported image format; expected PNG, JPEG, GIF or WebP")
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def read_file(path: str, start: int = 0, end: int = DEFAULT_READ_END) -> str:

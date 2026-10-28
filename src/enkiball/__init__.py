@@ -1,4 +1,4 @@
-"""Enkiball – security research agent framework.
+"""Enkiball – Python LLM foundation.
 
 Public API::
 

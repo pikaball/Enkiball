@@ -12,6 +12,21 @@ from .persistence import atomic_write_json
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "enkiball" / "enki.json"
 DEFAULT_STATE_PATH = Path.home() / ".config" / "enkiball" / "state.json"
 
+DEFAULT_CONFIG: dict[str, Any] = {
+    "system_prompt": "You are Enkiball, a practical assistant for long-context tasks.",
+    "auto_compact": {"enabled": False, "threshold_ratio": 0.7},
+    "providers": {
+        "openai": {
+            "api_key": "",
+            "base_url": "https://api.openai.com/v1",
+            "models": {"gpt-4o": {"temperature": 0.2, "max_tokens": 4096}},
+        }
+    },
+    "active_provider": "openai",
+    "active_model": "gpt-4o",
+    "mcp": {"servers": {}},
+}
+
 log = logging.getLogger(__name__)
 
 
@@ -40,24 +55,7 @@ def save_state(state: dict[str, Any], path: Path = DEFAULT_STATE_PATH) -> None:
 
 def ensure_config(path: Path = DEFAULT_CONFIG_PATH) -> Path:
     if not path.exists():
-        raise FileNotFoundError(
-            f"Config file not found: {path}\n"
-            f"Create it with at least one provider entry.  Example:\n"
-            f"  mkdir -p {path.parent}\n"
-            f"  cat > {path} << 'EOF'\n"
-            f"{{\n"
-            f'  "providers": {{\n'
-            f'    "my-provider": {{\n'
-            f'      "api_key": "sk-xxx",\n'
-            f'      "base_url": "https://api.openai.com/v1",\n'
-            f'      "models": {{\n'
-            f'        "gpt-4o": {{ "temperature": 0.2, "max_tokens": 4096 }}\n'
-            f"      }}\n"
-            f"    }}\n"
-            f"  }}\n"
-            f"}}\n"
-            f"EOF"
-        )
+        atomic_write_json(path, DEFAULT_CONFIG)
     return path
 
 
@@ -202,6 +200,24 @@ def set_active_model(
 ) -> None:
     state = load_state(state_path) if state is None else state
     state["active_model"] = model
+    save_state(state, state_path)
+
+
+def get_show_thinking(
+    state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
+) -> bool:
+    state = load_state(state_path) if state is None else state
+    return bool(state.get("show_thinking", False))
+
+
+def set_show_thinking(
+    enabled: bool,
+    state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
+) -> None:
+    state = load_state(state_path) if state is None else state
+    state["show_thinking"] = bool(enabled)
     save_state(state, state_path)
 
 

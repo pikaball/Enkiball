@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import Awaitable, TypeVar
+from typing import Awaitable, Protocol, TypeVar
 
 import httpx
 
@@ -13,8 +13,12 @@ from .sandbox import TurnInterrupted
 T = TypeVar("T")
 
 
+class CancellationSignal(Protocol):
+    def is_set(self) -> bool: ...
+
+
 class InterruptibleAsyncTransport(httpx.AsyncBaseTransport):
-    def __init__(self, cancelled: threading.Event) -> None:
+    def __init__(self, cancelled: CancellationSignal) -> None:
         self.cancelled = cancelled
         self.client = httpx.AsyncClient()
 
@@ -67,7 +71,7 @@ class _AsyncBody(httpx.AsyncByteStream):
 class InterruptibleTransport(httpx.BaseTransport):
     """Run only HTTP I/O on an event loop; callbacks and tools stay on the caller."""
 
-    def __init__(self, cancelled: threading.Event) -> None:
+    def __init__(self, cancelled: CancellationSignal) -> None:
         self.transport = InterruptibleAsyncTransport(cancelled)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(
