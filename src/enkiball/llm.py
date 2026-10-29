@@ -19,6 +19,7 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, OpenAI
 from .config import (
     DEFAULT_STATE_PATH,
     get_active_model,
+    get_active_provider,
     get_model_params,
     get_show_thinking,
     get_system_prompt,
@@ -36,6 +37,7 @@ from .message_codec import (
 )
 from .mcp import MCPManager
 from .sandbox import Sandbox, TurnInterrupted
+from .token_estimation import estimate_context_tokens, estimate_tokens
 
 
 SYSTEM_PROMPT = (
@@ -60,7 +62,7 @@ REQUEST_RETRY_DELAYS = (3, 5, 10, 30, 60, 120, 180)
 
 @dataclass
 class TokenUsage:
-    """Accumulated token usage for the session."""
+    """Reported request usage accumulated over the retained session history."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -203,31 +205,65 @@ class ChatEngine:
 
     # -- Auto compact --------------------------------------------------------
 
-    def _api_visible_usage_total(self) -> int:
-        for msg in reversed(self.messages[self.compact_index :]):
+    def _context_messages(self) -> list[dict[str, Any]]:
+        visible = self.messages[self.compact_index :]
+        # Compaction replaces conversation history, not the system instructions.
+        if self.compact_index and self.messages[0].get("role") == "system":
+            return [self.messages[0], *visible]
+        return visible
+
+    def _estimate_context_tokens(self) -> int:
+        return estimate_context_tokens(self._context_messages(), self._get_tools())
+
+    @property
+    def context_tokens(self) -> int:
+        """Estimated current context size, separate from cumulative API usage."""
+        estimate = self._estimate_context_tokens()
+        visible = self._context_messages()
+        for index in range(len(visible) - 1, -1, -1):
+            msg = visible[index]
+            # A summary request's prompt contains the *discarded* history.
+            if msg.get("_compact"):
+                break
             usage = msg.get("_usage")
-            if not isinstance(usage, dict):
+            if not isinstance(usage, dict) or not usage.get("prompt_tokens"):
                 continue
-            return int(usage.get("prompt_tokens", 0) or 0) + int(
-                usage.get("completion_tokens", 0) or 0
-            )
-        return 0
+            if "model" in usage and (
+                usage["model"] != self.model
+                or usage.get("provider") != get_active_provider(self.config, state=self.state)
+            ):
+                break
+            reported = int(usage["prompt_tokens"]) + int(usage.get("completion_tokens", 0) or 0)
+            baseline = usage.get("estimated_context_tokens")
+            if isinstance(baseline, int):
+                # Calibrate the local estimate against the last API report,
+                # then account for changes to messages and tool schemas.
+                calibrated = reported + estimate - baseline
+                return calibrated if calibrated > 0 else estimate
+            # Legacy sessions have no local baseline; account for new messages.
+            return reported + sum(4 + estimate_tokens(item) for item in visible[index + 1 :])
+        return estimate
+
+    @property
+    def context_window(self) -> int | None:
+        params = get_model_params(self.config, self.model, state=self.state)
+        value = params.get("context_window")
+        return int(value) if value is not None and int(value) > 0 else None
+
+    def _api_visible_usage_total(self) -> int:
+        return self.context_tokens
 
     def _auto_compact_effective_threshold_tokens(self) -> int:
         if self.auto_compact_threshold_tokens is not None:
             return self.auto_compact_threshold_tokens
-        model_params = get_model_params(self.config, self.model, state_path=self.state_path, state=self.state)
-        endpoint_max_tokens = int(
-            model_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS)
-            or DEFAULT_ENDPOINT_MAX_TOKENS
-        )
-        return int(endpoint_max_tokens * self.auto_compact_threshold_ratio)
+        return int((self.context_window or 0) * self.auto_compact_threshold_ratio)
 
     def _should_auto_compact(self) -> bool:
         threshold_tokens = self._auto_compact_effective_threshold_tokens()
         return (
             self.auto_compact_enabled
             and threshold_tokens > 0
+            and any(msg.get("role") == "assistant" for msg in self.messages[self.compact_index :])
             and self._api_visible_usage_total() >= threshold_tokens
         )
 
@@ -615,6 +651,24 @@ class ChatEngine:
     def reset_messages(self) -> None:
         self.messages = default_messages(self._system_prompt)
         self.compact_index = 0
+        self.token_usage = TokenUsage()
+
+    def _restore_token_usage(self) -> None:
+        self.token_usage = TokenUsage()
+        for msg in self.messages:
+            usage = msg.get("_usage")
+            if isinstance(usage, dict) and not usage.get("excluded"):
+                self.token_usage.add(
+                    int(usage.get("prompt_tokens", 0) or 0),
+                    int(usage.get("completion_tokens", 0) or 0),
+                )
+
+    def reset_token_usage(self) -> None:
+        # Retain context calibration while persisting the accounting reset.
+        for msg in self.messages:
+            if isinstance(msg.get("_usage"), dict):
+                msg["_usage"]["excluded"] = True
+        self.token_usage = TokenUsage()
 
     def load_messages(self, messages: list[dict[str, Any]]) -> None:
         loaded = copy.deepcopy(messages)
@@ -631,6 +685,7 @@ class ChatEngine:
         for i, msg in enumerate(self.messages):
             if msg.get("role") == "system" and msg.get("_compact"):
                 self.compact_index = i
+        self._restore_token_usage()
 
     def export_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self.messages)
@@ -648,7 +703,7 @@ class ChatEngine:
         return str(target)
 
     def _prepare_messages_for_api(self) -> list[dict[str, Any]]:
-        return prepare_messages_for_api(self.messages[self.compact_index :])
+        return prepare_messages_for_api(self._context_messages())
 
     @staticmethod
     def _prepare_history_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -684,6 +739,7 @@ class ChatEngine:
         for i, msg in enumerate(self.messages):
             if msg.get("role") == "system" and msg.get("_compact"):
                 self.compact_index = i
+        self._restore_token_usage()
         return reverted, prefill, restored_images
 
     def fork_at_turn(self, user_turn_index: int) -> list[dict[str, Any]]:
@@ -789,6 +845,8 @@ class ChatEngine:
                 return json.dumps(
                     {"ok": True, "result": result}, ensure_ascii=False, default=str
                 )
+            except TurnInterrupted:
+                raise
             except Exception as e:  # noqa: BLE001
                 return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
@@ -958,24 +1016,32 @@ class ChatEngine:
     ) -> Literal["interrupted", "complete", "tools"]:
         self.token_usage.add(usage.prompt_tokens, usage.completion_tokens)
         if interrupted or self._should_stop(turn, should_stop):
-            if assistant_content or reasoning_content:
+            if assistant_content or reasoning_content or usage.prompt_tokens or usage.completion_tokens:
                 self._append_assistant_message(
                     self.messages, assistant_content, [], reasoning_content
                 )
-                self.messages[-1]["_usage"] = {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                }
+                self._store_response_usage(usage)
             return "interrupted"
 
         self._append_assistant_message(
             self.messages, assistant_content, tool_calls, reasoning_content
         )
+        self._store_response_usage(usage)
+        return "tools" if tool_calls else "complete"
+
+    def _store_response_usage(self, usage: TurnUsage) -> None:
+        messages = self._context_messages()
+        # The just-produced tool call has no tool replies yet. Include it in
+        # the baseline so completing the group doesn't count its output twice.
+        baseline = estimate_context_tokens(messages[:-1], self._get_tools())
+        baseline += 4 + estimate_tokens(messages[-1])
         self.messages[-1]["_usage"] = {
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
+            "model": self.model,
+            "provider": get_active_provider(self.config, state=self.state),
+            "estimated_context_tokens": baseline,
         }
-        return "tools" if tool_calls else "complete"
 
     def _record_interrupted_tool_calls(
         self, tool_calls: list[ParsedToolCall], start_index: int
@@ -1009,9 +1075,7 @@ class ChatEngine:
         return fallback
 
     def _build_compact_request(self, prompt: str | None) -> dict[str, Any]:
-        temp_msgs = self._prepare_history_for_api(
-            self.messages[self.compact_index :]
-        )
+        temp_msgs = self._prepare_history_for_api(self._context_messages())
         temp_msgs.append({"role": "user", "content": prompt or DEFAULT_COMPACT_PROMPT})
         model_params = get_model_params(self.config, self.model, state_path=self.state_path, state=self.state)
         create_kwargs: dict[str, Any] = {
@@ -1029,6 +1093,10 @@ class ChatEngine:
         return create_kwargs
 
     def _commit_compact_summary(self, summary: str, usage: TurnUsage) -> None:
+        if self._active_turn is not None and self._active_turn.interrupted:
+            raise TurnInterrupted
+        if not summary.strip():
+            raise ValueError("empty compact summary; conversation history was not compacted")
         self.token_usage.add(usage.prompt_tokens, usage.completion_tokens)
         compact_marker: dict[str, Any] = {
             "role": "system",
@@ -1052,6 +1120,8 @@ class ChatEngine:
         turn = self._begin_turn()
         watcher = self._start_stop_watcher(turn, should_stop)
         try:
+            if self._should_stop(turn, should_stop):
+                raise TurnInterrupted
             return self._compact_impl(prompt, on_token, on_retry)
         finally:
             if watcher is not None:
@@ -1069,7 +1139,8 @@ class ChatEngine:
         """Summarize conversation history and set compact boundary.
 
         Messages before the boundary are preserved in ``self.messages`` (for
-        session persistence) but excluded from future LLM calls.
+        session persistence) but excluded from future LLM calls, except for
+        the original system prompt.
 
         Returns the summary text.
         """
@@ -1128,11 +1199,17 @@ class ChatEngine:
         on_retry: Callable[[RetryEvent], None] | None = None,
         system_context: str | None = None,
         should_stop: Callable[[], bool] | None = None,
+        *,
+        temporary: bool = False,
     ) -> str:
         turn = self._begin_turn()
-        self._live_reset()
-        watcher = self._start_stop_watcher(turn, should_stop)
+        saved_state: tuple[list[dict[str, Any]], TokenUsage] | None = None
+        watcher = None
         try:
+            if temporary:
+                saved_state = self.export_messages(), copy.copy(self.token_usage)
+            self._live_reset()
+            watcher = self._start_stop_watcher(turn, should_stop)
             return self._stream_reply_impl(
                 user_input,
                 image_paths,
@@ -1149,8 +1226,13 @@ class ChatEngine:
                 stopped, thread = watcher
                 stopped.set()
                 thread.join(timeout=0.2)
-            self._live_finish()
-            self._end_turn(turn)
+            try:
+                if saved_state is not None:
+                    self.load_messages(saved_state[0])
+                    self.token_usage = saved_state[1]
+            finally:
+                self._live_finish()
+                self._end_turn(turn)
 
     def _stream_reply_impl(
         self,
@@ -1258,10 +1340,9 @@ class ChatEngine:
                             raise TurnInterrupted
                         result = self._dispatch_tool(tc.name, args, turn)
                     except TurnInterrupted:
+                        turn.cancel()
                         self._record_interrupted_tool_calls(tool_calls, index)
-                        if turn.interrupted:
-                            return assistant_content
-                        raise
+                        return assistant_content
                     self._append_tool_result(tc.tool_call_id, result)
                     self._live_append_tool_result(tc.name, result)
 
@@ -1387,6 +1468,8 @@ class ChatEngine:
             if should_stop is not None else None
         )
         try:
+            if self._should_stop(turn, should_stop):
+                raise TurnInterrupted
             return await self._acompact_impl(prompt, on_token, on_retry)
         except asyncio.CancelledError:
             turn.cancel()
@@ -1619,12 +1702,11 @@ class ChatEngine:
                             raise TurnInterrupted
                         result = await self._adispatch_tool(tc.name, args, turn)
                     except (TurnInterrupted, asyncio.CancelledError) as exc:
+                        turn.cancel()
                         self._record_interrupted_tool_calls(tool_calls, index)
                         if isinstance(exc, asyncio.CancelledError):
                             raise
-                        if turn.interrupted:
-                            return assistant_content
-                        raise
+                        return assistant_content
                     self._append_tool_result(tc.tool_call_id, result)
                     self._live_append_tool_result(tc.name, result)
 

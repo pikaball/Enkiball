@@ -237,12 +237,12 @@ class AgentCallbackTests(unittest.TestCase):
         original_usage = agent._engine.token_usage.to_dict()
         agent._engine._last_turn_interrupted = False
 
-        def fake_reply(**kwargs) -> str:
+        def fake_reply(*args, **kwargs) -> str:
             agent._engine.messages.append({"role": "assistant", "content": "btw"})
             agent._engine.token_usage.add(100, 20)
             return "answer"
 
-        with patch.object(agent._engine, "stream_reply", side_effect=fake_reply):
+        with patch.object(agent._engine, "_stream_reply_impl", side_effect=fake_reply):
             result = agent.btw("question")
 
         self.assertEqual(result.content, "answer")

@@ -20,6 +20,7 @@ src/enkiball/persistence.py
 src/enkiball/sandbox.py
 src/enkiball/session_store.py
 src/enkiball/skills.py
+src/enkiball/token_estimation.py
 src/enkiball/tools.py
 src/enkiball.egg-info/PKG-INFO
 src/enkiball.egg-info/SOURCES.txt
@@ -34,6 +35,7 @@ tests/test_efficiency.py
 tests/test_foundation.py
 tests/test_http_interrupt.py
 tests/test_interrupt.py
+tests/test_lifecycle_regressions.py
 tests/test_mcp_config.py
 tests/test_mcp_interrupt.py
 tests/test_mcp_sse.py
@@ -45,3 +47,4 @@ tests/test_sandbox.py
 tests/test_session_history.py
 tests/test_skills.py
 tests/test_stream_usage.py
+tests/test_token_accounting.py

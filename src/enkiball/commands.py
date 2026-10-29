@@ -87,7 +87,7 @@ Slash commands:
   /autocompact [on|off]      Show or toggle automatic compaction
   /revert [n]                Revert last n user turns and edit/resend
   /thinking                  Toggle thinking/reasoning output
-  /tokens                    Show accumulated token usage
+  /tokens                    Show estimated context and cumulative API usage
   /btw <prompt...>           Ask a one-off question without changing history
   /debug <python>            Execute Python in the CLI process
   /notice show               Show queued system notices
@@ -454,7 +454,7 @@ class CommandHandler:
                 f"auto_compact={self.agent.auto_compact_enabled} "
                 f"threshold_ratio={self.agent.auto_compact_threshold_ratio} "
                 "effective_threshold_tokens="
-                f"{self.agent.auto_compact_effective_threshold_tokens}",
+                f"{self.agent.auto_compact_effective_threshold_tokens or 'unavailable (configure model context_window)'}",
                 style="cyan",
             )
             return True
@@ -462,6 +462,8 @@ class CommandHandler:
             self.agent.auto_compact_enabled = argv[1] == "on"
             state = "enabled" if self.agent.auto_compact_enabled else "disabled"
             self.console.print(f"auto_compact {state}", style="green")
+            if self.agent.auto_compact_enabled and not self.agent.auto_compact_effective_threshold_tokens:
+                self.console.print("Set models.<name>.context_window or auto_compact.threshold_tokens to activate it.", style="yellow")
             return True
         self.console.print("usage: /autocompact [on|off]", style="bold yellow")
         return True
@@ -521,8 +523,13 @@ class CommandHandler:
 
     def _tokens(self) -> bool:
         u = self.agent.token_usage
+        context = self.agent.context_tokens
+        window = self.agent.context_window
+        limit = f" / {window:,} ({context / window:.1%})" if window else " (window unknown)"
+        self.console.print(f"context≈{context:,}{limit} tokens (estimate)", style="cyan")
         self.console.print(
-            f"prompt={u.prompt_tokens}  completion={u.completion_tokens}  total={u.total_tokens}",
+            f"cumulative API usage: prompt={u.prompt_tokens:,}  "
+            f"completion={u.completion_tokens:,}  total={u.total_tokens:,}",
             style="cyan",
         )
         return True

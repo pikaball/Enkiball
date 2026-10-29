@@ -236,6 +236,15 @@ class EnkiballCLI:
     # -- Main loop ----------------------------------------------------------
 
     def run(self) -> None:
+        try:
+            self._run()
+        finally:
+            try:
+                self.session_store.save_current_messages(self.agent.messages)
+            finally:
+                self.agent.shutdown()
+
+    def _run(self) -> None:
         agent = self.agent
         console = self.console
         handler = self.handler
@@ -293,6 +302,9 @@ class EnkiballCLI:
                         keep_running = handler.handle(text, session)
                     except TurnInterrupted:
                         console.print("\n[interrupted]", style="bold yellow")
+                        keep_running = True
+                    except Exception as exc:  # noqa: BLE001
+                        console.print(f"command error: {exc}", style="bold red")
                         keep_running = True
                     finally:
                         handler.set_stop_callback(None)
@@ -405,9 +417,6 @@ class EnkiballCLI:
             finally:
                 renderer.finish()
                 agent._set_approval_handler(None)
-
-        session_store.save_current_messages(agent.messages)
-        agent.shutdown()
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

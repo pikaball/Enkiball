@@ -167,8 +167,8 @@ class StatePathTests(unittest.TestCase):
         save_config(
             {
                 "providers": {
-                    "first": {"models": {"one": {"max_tokens": 100}}},
-                    "second": {"models": {"two": {"max_tokens": 200}}},
+                    "first": {"models": {"one": {"max_tokens": 100, "context_window": 1000}}},
+                    "second": {"models": {"two": {"max_tokens": 200, "context_window": 2000}}},
                 }
             },
             self.config_path,
@@ -181,6 +181,20 @@ class StatePathTests(unittest.TestCase):
             session_dir=state_path.parent / f"{state_path.stem}-sessions",
             auto_start_mcp=False,
         )
+
+    def test_fresh_config_selects_a_model_without_a_state_file(self) -> None:
+        agent = self.build_agent(self.root / "fresh-state.json")
+        self.addCleanup(agent.shutdown)
+        self.assertEqual(agent.provider, "first")
+        self.assertEqual(agent.model, "one")
+        self.assertEqual(agent._engine._build_stream_request({})["model"], "one")
+
+    def test_saved_remote_only_model_is_not_replaced_by_config_default(self) -> None:
+        state_path = self.root / "remote-state.json"
+        save_state({"active_provider": "second", "active_model": "remote-only"}, state_path)
+        agent = self.build_agent(state_path)
+        self.addCleanup(agent.shutdown)
+        self.assertEqual(agent.model, "remote-only")
 
     def test_public_constructor_default_remains_default_state_path(self) -> None:
         default = inspect.signature(Enkiball).parameters["state_path"].default
@@ -220,8 +234,8 @@ class StatePathTests(unittest.TestCase):
 
         first.model = "two"
         second.model = "one"
-        self.assertEqual(first._engine._auto_compact_effective_threshold_tokens(), 140)
-        self.assertEqual(second._engine._auto_compact_effective_threshold_tokens(), 70)
+        self.assertEqual(first._engine._auto_compact_effective_threshold_tokens(), 1400)
+        self.assertEqual(second._engine._auto_compact_effective_threshold_tokens(), 700)
 
     def test_command_handler_uses_agent_state_path(self) -> None:
         state_path = self.root / "cli-agent" / "state.json"

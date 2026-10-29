@@ -165,7 +165,7 @@ class StdioInterruptTests(unittest.TestCase):
             while time.monotonic() < deadline:
                 try:
                     state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     break
                 if state == "Z":
                     break

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import select
 import shutil
 import signal
 import subprocess
@@ -154,6 +155,8 @@ class Sandbox:
             raise ValueError("timeout_sec must be between 1 and 600")
         if not isinstance(privileged, bool):
             raise TypeError("privileged must be a boolean")
+        if cancel_event is not None and cancel_event.is_set():
+            raise TurnInterrupted
 
         run_on_host = not self.enabled or privileged
         if privileged and self.enabled:
@@ -168,6 +171,8 @@ class Sandbox:
             if run_on_host
             else self._build_bwrap_command(command)
         )
+        if cancel_event is not None and cancel_event.is_set():
+            raise TurnInterrupted
         process = subprocess.Popen(
             argv,
             cwd=self.cwd,
@@ -178,33 +183,37 @@ class Sandbox:
         )
         stdout_parts: list[bytes] = []
         stderr_parts: list[bytes] = []
-        stdout_thread = self._drain_output(process.stdout, stdout_parts)
-        stderr_thread = self._drain_output(process.stderr, stderr_parts)
+        stop_reading = threading.Event()
+        stdout_thread = self._drain_output(process.stdout, stdout_parts, stop_reading)
+        stderr_thread = self._drain_output(process.stderr, stderr_parts, stop_reading)
         deadline = time.monotonic() + timeout_sec
         try:
-            while process.poll() is None:
-                if cancel_event is not None and cancel_event.wait(0.1):
-                    self._kill_process_group(process)
+            # A shell may exit while its descendants still hold the pipes.
+            # Keep enforcing cancellation/deadlines until output is drained.
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
                     raise TurnInterrupted
+                if process.poll() is not None and not stdout_thread.is_alive() and not stderr_thread.is_alive():
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self._kill_process_group(process)
                     raise subprocess.TimeoutExpired(
                         command,
                         timeout_sec,
                         self._decode_output(stdout_parts),
                         self._decode_output(stderr_parts),
                     ) from None
-                if cancel_event is None:
-                    try:
-                        process.wait(timeout=min(0.1, remaining))
-                    except subprocess.TimeoutExpired:
-                        pass
+                if cancel_event is not None:
+                    cancel_event.wait(min(0.05, remaining))
+                else:
+                    time.sleep(min(0.05, remaining))
         except BaseException:
-            if process.poll() is None:
-                self._kill_process_group(process)
+            # Descendants can outlive the group leader; kill the owned group
+            # even when the original shell has already been reaped.
+            self._kill_process_group(process)
             raise
         finally:
+            stop_reading.set()
             stdout_thread.join()
             stderr_thread.join()
         return (
@@ -225,12 +234,15 @@ class Sandbox:
     def _drain_output(
         stream: BinaryIO,
         parts: list[bytes],
+        stop_reading: threading.Event,
     ) -> threading.Thread:
         def _read() -> None:
             remaining = MAX_OUTPUT_BYTES + 1
             try:
-                while True:
-                    chunk = stream.read(65536)
+                while not stop_reading.is_set():
+                    if not select.select([stream], [], [], 0.05)[0]:
+                        continue
+                    chunk = os.read(stream.fileno(), 65536)
                     if not chunk:
                         break
                     if remaining > 0:

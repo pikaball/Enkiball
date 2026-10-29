@@ -170,7 +170,12 @@ def get_active_model(
     *, state: dict[str, Any] | None = None,
 ) -> str:
     state = load_state(state_path) if state is None else state
-    return str(state.get("active_model", ""))
+    model = state.get("active_model")
+    if isinstance(model, str) and model:
+        return model
+    provider = get_active_provider(config, state_path, state=state)
+    models = config.get("providers", {}).get(provider, {}).get("models", {})
+    return next(iter(models), "")
 
 
 def set_active_provider(

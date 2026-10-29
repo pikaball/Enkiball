@@ -111,7 +111,8 @@ class StreamUsageTests(unittest.TestCase):
 
     def test_model_override_uses_its_own_parameters(self):
         engine = ChatEngine({"providers": {"p": {"models": {
-            "one": {"max_tokens": 100}, "two": {"max_tokens": 200}
+            "one": {"max_tokens": 100, "context_window": 1000},
+            "two": {"max_tokens": 200, "context_window": 2000}
         }}}}, state={"active_provider": "p", "active_model": "one"}, model="two")
         self.assertEqual(engine._build_compact_request(None)["max_tokens"], 200)
-        self.assertEqual(engine._auto_compact_effective_threshold_tokens(), 140)
+        self.assertEqual(engine._auto_compact_effective_threshold_tokens(), 1400)

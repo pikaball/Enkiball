@@ -47,6 +47,7 @@ import json
 import queue
 import threading
 import time
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -539,11 +540,22 @@ class Enkiball:
 
     @property
     def token_usage(self) -> TokenUsage:
-        """Accumulated token usage across all turns."""
+        """Reported API usage accumulated over retained history; not context size."""
         return self._engine.token_usage
 
     def reset_token_usage(self) -> None:
-        self._engine.token_usage = TokenUsage()
+        """Reset accumulated usage without discarding history or context estimates."""
+        self._engine.reset_token_usage()
+
+    @property
+    def context_tokens(self) -> int:
+        """Estimated current context tokens, calibrated against API usage if available."""
+        return self._engine.context_tokens
+
+    @property
+    def context_window(self) -> int | None:
+        """Configured model context window, or None if unknown."""
+        return self._engine.context_window
 
     @property
     def auto_compact_enabled(self) -> bool:
@@ -556,7 +568,7 @@ class Enkiball:
 
     @property
     def auto_compact_threshold_ratio(self) -> float:
-        """Fraction of model max_tokens that triggers auto compact."""
+        """Fraction of model context_window that triggers auto compact."""
         return self._engine.auto_compact_threshold_ratio
 
     @auto_compact_threshold_ratio.setter
@@ -566,7 +578,7 @@ class Enkiball:
 
     @property
     def auto_compact_effective_threshold_tokens(self) -> int:
-        """Current concrete token threshold derived from model max_tokens."""
+        """Configured threshold, or zero when the context window is unknown."""
         return self._engine._auto_compact_effective_threshold_tokens()
 
     # ========================================================================
@@ -583,7 +595,8 @@ class Enkiball:
         """Summarize prior conversation and set a compact boundary.
 
         Messages before the boundary are kept in history (visible in session
-        replay) but excluded from future LLM API calls.
+        replay) but excluded from future LLM API calls, except for the original
+        system prompt, which is retained alongside the summary.
 
         Parameters
         ----------
@@ -733,6 +746,25 @@ class Enkiball:
         should_stop: Callable[[], bool] | None = None,
     ) -> ChatResult:
         """Send *message* and block until the full reply is collected."""
+        return self._chat(
+            message, images, on_token=on_token, on_tool_event=on_tool_event,
+            on_thinking=on_thinking, on_retry=on_retry,
+            system_context=system_context, should_stop=should_stop,
+        )
+
+    def _chat(
+        self,
+        message: str,
+        images: list[str] | None = None,
+        *,
+        on_token: Callable[[str], None] | None = None,
+        on_tool_event: Callable[[str], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        on_retry: Callable[[RetryEvent], None] | None = None,
+        system_context: str | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        temporary: bool = False,
+    ) -> ChatResult:
         def _emit_tool(event: str) -> None:
             if self._on_tool_event:
                 self._on_tool_event(event)
@@ -754,6 +786,7 @@ class Enkiball:
             on_retry=on_retry,
             system_context=system_context,
             should_stop=should_stop,
+            temporary=temporary,
         )
         return collector.result(content, interrupted=self._engine.interrupted())
 
@@ -776,24 +809,11 @@ class Enkiball:
         effects are intentionally preserved; only conversation messages and
         token accounting are restored after the turn.
         """
-        messages = self._engine.export_messages()
-        usage = TokenUsage(**self._engine.token_usage.to_dict())
-        last_interrupted = self._engine.interrupted()
-        try:
-            return self.chat(
-                message,
-                images,
-                on_token=on_token,
-                on_tool_event=on_tool_event,
-                on_thinking=on_thinking,
-                on_retry=on_retry,
-                system_context=system_context,
-                should_stop=should_stop,
-            )
-        finally:
-            self._engine.load_messages(messages)
-            self._engine.token_usage = usage
-            self._engine._last_turn_interrupted = last_interrupted
+        return self._chat(
+            message, images, on_token=on_token, on_tool_event=on_tool_event,
+            on_thinking=on_thinking, on_retry=on_retry,
+            system_context=system_context, should_stop=should_stop, temporary=True,
+        )
 
     def stream(
         self,
@@ -915,15 +935,16 @@ class Enkiball:
         via :attr:`history`.  To capture them live, use
         :meth:`astream_events` instead.
         """
-        async for event in self.astream_events(
+        async with aclosing(self.astream_events(
             message,
             images,
             on_retry=on_retry,
             system_context=system_context,
             should_stop=should_stop,
-        ):
-            if event["type"] == "token":
-                yield event["data"]
+        )) as events:
+            async for event in events:
+                if event["type"] == "token":
+                    yield event["data"]
 
     async def astream_events(
         self,
@@ -972,6 +993,10 @@ class Enkiball:
             await q.put({"type": "retry", "data": event})
 
         result_box: list[str] = []
+        abandon_event = threading.Event()
+
+        def _should_stop() -> bool:
+            return abandon_event.is_set() or bool(should_stop and should_stop())
 
         async def _run() -> None:
             try:
@@ -983,30 +1008,29 @@ class Enkiball:
                     on_thinking=_on_thinking,
                     on_retry=_on_retry,
                     system_context=system_context,
-                    should_stop=should_stop,
+                    should_stop=_should_stop,
                 )
                 result_box.append(r)
             finally:
                 await q.put(sentinel)
 
         task = asyncio.create_task(_run())
+        completed = False
         try:
             while True:
                 item = await q.get()
                 if item is sentinel:
+                    completed = True
                     break
                 yield item  # type: ignore[misc]
         finally:
-            if not task.done():
-                self._engine.interrupt()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            else:
-                exc = task.exception()
-                if exc is not None:
-                    raise exc
+            if not completed:
+                abandon_event.set()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                if completed:
+                    raise
 
         content = result_box[0] if result_box else "".join(tokens)
         interrupted = self._engine.interrupted()
