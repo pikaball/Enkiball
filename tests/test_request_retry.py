@@ -32,7 +32,7 @@ class RequestRetryTests(unittest.TestCase):
     def request(self, async_mode, effects, *, compact=False, **callbacks):
         engine = ChatEngine({}, state={}, model="test")
         client = Mock()
-        client.chat.completions.create = (AsyncMock if async_mode else Mock)(side_effect=effects)
+        client.create = (AsyncMock if async_mode else Mock)(side_effect=effects)
         if async_mode:
             client.close = AsyncMock()
 
@@ -67,7 +67,7 @@ class RequestRetryTests(unittest.TestCase):
                         effects = [error, Stream([chunk({"content": "ok"})])]
                         with self.request(async_mode, effects, compact=compact, on_retry=retries.append) as (_, client, run):
                             self.assertEqual(run(), "ok")
-                            self.assertEqual(client.chat.completions.create.call_count, 2)
+                            self.assertEqual(client.create.call_count, 2)
                             self.assertEqual(len(retries), 1)
 
     def test_permanent_and_application_errors_do_not_retry(self):
@@ -82,7 +82,7 @@ class RequestRetryTests(unittest.TestCase):
                             with self.assertRaises(type(error)) as raised:
                                 run()
                             self.assertIs(raised.exception, error)
-                            self.assertEqual(client.chat.completions.create.call_count, 1)
+                            self.assertEqual(client.create.call_count, 1)
                             self.assertEqual(retries, [])
 
     def test_disconnect_after_text_or_thinking_does_not_replay_output(self):
@@ -97,7 +97,7 @@ class RequestRetryTests(unittest.TestCase):
                             run()
                         self.assertEqual(emitted, ["partial"])
                         self.assertEqual(retries, [])
-                        self.assertEqual(client.chat.completions.create.call_count, 1)
+                        self.assertEqual(client.create.call_count, 1)
                         self.assertEqual(engine.capture(True).content, "partial")
 
     def test_partial_compact_is_not_retried_or_committed(self):
@@ -111,7 +111,7 @@ class RequestRetryTests(unittest.TestCase):
                         run()
                     self.assertEqual(emitted, ["partial"])
                     self.assertEqual(engine.messages, original)
-                    self.assertEqual(client.chat.completions.create.call_count, 1)
+                    self.assertEqual(client.create.call_count, 1)
 
     def test_callback_error_is_not_treated_as_a_connection_failure(self):
         for async_mode in (False, True):
@@ -123,7 +123,7 @@ class RequestRetryTests(unittest.TestCase):
                         with self.assertRaisesRegex(httpx.ReadError, "callback failed"):
                             run()
                         callback.assert_called_once_with("partial")
-                        self.assertEqual(client.chat.completions.create.call_count, 1)
+                        self.assertEqual(client.create.call_count, 1)
 
     def test_retry_state_resets_for_next_request_after_tool_execution(self):
         for async_mode in (False, True):
@@ -143,7 +143,7 @@ class RequestRetryTests(unittest.TestCase):
                     }}, tool)
                     self.assertEqual(run(), "after")
                     tool.assert_called_once_with({})
-                    self.assertEqual(client.chat.completions.create.call_count, 3)
+                    self.assertEqual(client.create.call_count, 3)
 
     def test_retry_limit_still_applies(self):
         for async_mode in (False, True):
@@ -152,7 +152,7 @@ class RequestRetryTests(unittest.TestCase):
                 with self.request(async_mode, [error, error, error]) as (_, client, run):
                     with self.assertRaises(httpx.ReadError):
                         run()
-                    self.assertEqual(client.chat.completions.create.call_count, 3)
+                    self.assertEqual(client.create.call_count, 3)
 
     def test_retry_callback_failure_still_closes_client(self):
         for async_mode in (False, True):
@@ -163,4 +163,4 @@ class RequestRetryTests(unittest.TestCase):
                                       compact=compact, on_retry=on_retry) as (_, client, run):
                         with self.assertRaisesRegex(RuntimeError, "retry callback failed"):
                             run()
-                        self.assertEqual(client.chat.completions.create.call_count, 1)
+                        self.assertEqual(client.create.call_count, 1)

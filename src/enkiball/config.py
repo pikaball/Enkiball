@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -11,12 +12,15 @@ from .persistence import atomic_write_json
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "enkiball" / "enki.json"
 DEFAULT_STATE_PATH = Path.home() / ".config" / "enkiball" / "state.json"
+PROTOCOLS = ("chat-completions", "responses", "anthropic")
+DEFAULT_PROTOCOL = "responses"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "system_prompt": "You are Enkiball, a practical assistant for long-context tasks.",
     "auto_compact": {"enabled": False, "threshold_ratio": 0.7},
     "providers": {
         "openai": {
+            "protocol": DEFAULT_PROTOCOL,
             "api_key": "",
             "base_url": "https://api.openai.com/v1",
             "models": {"gpt-4o": {"temperature": 0.2, "max_tokens": 4096}},
@@ -35,6 +39,7 @@ log = logging.getLogger(__name__)
 
 def load_state(path: Path = DEFAULT_STATE_PATH) -> dict[str, Any]:
     """Load the runtime state file.  Returns empty dict if missing."""
+    path = Path(path).expanduser()
     if not path.exists():
         return {}
     try:
@@ -45,15 +50,16 @@ def load_state(path: Path = DEFAULT_STATE_PATH) -> dict[str, Any]:
         return {}
 
 
-def save_state(state: dict[str, Any], path: Path = DEFAULT_STATE_PATH) -> None:
+def save_state(state: dict[str, Any], path: Path | str = DEFAULT_STATE_PATH) -> None:
     """Persist the runtime state (active_provider, active_model, etc.)."""
-    atomic_write_json(path, state)
+    atomic_write_json(Path(path).expanduser(), state)
 
 
 # -- Load / save -------------------------------------------------------------
 
 
 def ensure_config(path: Path = DEFAULT_CONFIG_PATH) -> Path:
+    path = Path(path).expanduser()
     if not path.exists():
         atomic_write_json(path, DEFAULT_CONFIG)
     return path
@@ -72,6 +78,8 @@ def _migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
             provider_entry["api_key"] = old_llm["api_key"]
         if old_llm.get("api_base"):
             provider_entry["base_url"] = old_llm["api_base"]
+        if "protocol" in old_llm:
+            provider_entry["protocol"] = old_llm["protocol"]
         if model:
             model_params: dict[str, Any] = {}
             if "temperature" in old_llm:
@@ -114,18 +122,24 @@ def _migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
-def load_config(
-    path: Path = DEFAULT_CONFIG_PATH,
+def prepare_config(
+    raw: dict[str, Any],
+    path: Path | None = None,
     state_path: Path = DEFAULT_STATE_PATH,
     *,
     state: dict[str, Any] | None = None,
+    persist: bool = True,
 ) -> dict[str, Any]:
-    ensure_config(path)
-    with path.open("r", encoding="utf-8") as f:
-        loaded = json.load(f)
-    config = _migrate_config(loaded)
+    """Migrate and validate an in-memory config mapping.
 
-    # Migrate active_provider / active_model from config to state file
+    ``active_provider`` / ``active_model`` are moved into *state*. Nothing is
+    written to disk unless *persist* is true and a migration was required.
+    *path* is only written when given (in-memory configs pass ``None``).
+    """
+    config = _migrate_config(copy.deepcopy(raw))
+    for name, provider in config.get("providers", {}).items():
+        validate_protocol(provider.get("protocol", DEFAULT_PROTOCOL), name)
+
     migrated = False
     state = load_state(state_path) if state is None else state
     for key in ("active_provider", "active_model"):
@@ -134,15 +148,41 @@ def load_config(
                 state[key] = config[key]
             del config[key]
             migrated = True
-    if migrated:
+    if migrated and persist:
         save_state(state, state_path)
-        save_config(config, path)
+        if path is not None:
+            save_config(config, path)
 
     return config
 
 
-def save_config(config: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> None:
-    atomic_write_json(path, config)
+def load_config(
+    path: Path = DEFAULT_CONFIG_PATH,
+    state_path: Path = DEFAULT_STATE_PATH,
+    *,
+    state: dict[str, Any] | None = None,
+    persist: bool = True,
+    create_if_missing: bool = True,
+) -> dict[str, Any]:
+    path = Path(path).expanduser()
+    state_path = Path(state_path).expanduser()
+    if not path.exists():
+        if not create_if_missing:
+            raise FileNotFoundError(f"config file not found: {path}")
+        if not persist:
+            return prepare_config(
+                DEFAULT_CONFIG, path, state_path, state=state, persist=False
+            )
+        ensure_config(path)
+    with path.open("r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    return prepare_config(
+        loaded, path, state_path, state=state, persist=persist
+    )
+
+
+def save_config(config: dict[str, Any], path: Path | str = DEFAULT_CONFIG_PATH) -> None:
+    atomic_write_json(Path(path).expanduser(), config)
 
 
 # -- Provider helpers --------------------------------------------------------
@@ -150,6 +190,21 @@ def save_config(config: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> Non
 
 def get_providers(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return config.get("providers", {})
+
+
+def validate_protocol(value: Any, provider: str = "") -> str:
+    if value not in PROTOCOLS:
+        raise ValueError(f"invalid protocol for provider {provider!r}: {value!r}; expected one of {PROTOCOLS}")
+    return value
+
+
+def get_provider_protocol(
+    config: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH,
+    *, state: dict[str, Any] | None = None,
+) -> str:
+    name = get_active_provider(config, state_path, state=state)
+    provider = config.get("providers", {}).get(name, {})
+    return validate_protocol(provider.get("protocol", DEFAULT_PROTOCOL), name)
 
 
 def get_active_provider(
@@ -182,7 +237,7 @@ def set_active_provider(
     config: dict[str, Any],
     name: str,
     state_path: Path = DEFAULT_STATE_PATH,
-    *, state: dict[str, Any] | None = None,
+    *, state: dict[str, Any] | None = None, persist: bool = True,
 ) -> bool:
     if name not in config.get("providers", {}):
         return False
@@ -193,7 +248,8 @@ def set_active_provider(
     current_model = state.get("active_model", "")
     if models and current_model not in models:
         state["active_model"] = next(iter(models))
-    save_state(state, state_path)
+    if persist:
+        save_state(state, state_path)
     return True
 
 
@@ -201,11 +257,12 @@ def set_active_model(
     config: dict[str, Any],
     model: str,
     state_path: Path = DEFAULT_STATE_PATH,
-    *, state: dict[str, Any] | None = None,
+    *, state: dict[str, Any] | None = None, persist: bool = True,
 ) -> None:
     state = load_state(state_path) if state is None else state
     state["active_model"] = model
-    save_state(state, state_path)
+    if persist:
+        save_state(state, state_path)
 
 
 def get_show_thinking(
@@ -219,11 +276,12 @@ def get_show_thinking(
 def set_show_thinking(
     enabled: bool,
     state_path: Path = DEFAULT_STATE_PATH,
-    *, state: dict[str, Any] | None = None,
+    *, state: dict[str, Any] | None = None, persist: bool = True,
 ) -> None:
     state = load_state(state_path) if state is None else state
     state["show_thinking"] = bool(enabled)
-    save_state(state, state_path)
+    if persist:
+        save_state(state, state_path)
 
 
 def get_model_params(
@@ -281,21 +339,28 @@ def get_system_prompt(config: dict[str, Any]) -> str | None:
 # -- Remote model fetching ---------------------------------------------------
 
 
-def fetch_remote_models(api_key: str, base_url: str, timeout: float = 5.0) -> list[str]:
+def fetch_remote_models(
+    api_key: str, base_url: str, timeout: float = 5.0, *, protocol: str = DEFAULT_PROTOCOL,
+) -> list[str]:
     """Query ``/v1/models`` (or ``/models``) and return a sorted list of model IDs.
 
+    An empty *api_key* is allowed for endpoints that do not require auth (for
+    example local Ollama / LM Studio); no auth header is sent in that case.
     Returns an empty list on any network or parse error (never raises).
     """
-    if not api_key:
-        return []
+    from .protocols import api_base_url
 
-    url = base_url.rstrip("/") if base_url else "https://api.openai.com/v1"
+    url = api_base_url(protocol, base_url)
     models_url = f"{url}/models"
+    headers: dict[str, str] = {}
+    if api_key:
+        headers = ({"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+                   if protocol == "anthropic" else {"Authorization": f"Bearer {api_key}"})
 
     try:
         resp = httpx.get(
             models_url,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             timeout=timeout,
         )
         resp.raise_for_status()
@@ -317,9 +382,13 @@ def get_provider_models(
     state_path: Path = DEFAULT_STATE_PATH,
     state: dict[str, Any] | None = None,
 ) -> list[str]:
-    """Return merged model list for a provider: config-defined + remote.
+    """Return the merged model list for a provider.
 
-    Config-defined models appear first, followed by remote-only models sorted.
+    The endpoint (``/models``) is the source of truth for what is available;
+    manually configured ``models`` entries are merged on top so they can carry
+    explicit parameters (``max_tokens`` etc.) or name models the endpoint does
+    not advertise. Remote models come first, configured-only models are
+    appended; on a name collision the configured entry wins.
     """
     name = provider_name or get_active_provider(config, state_path, state=state)
     prov = config.get("providers", {}).get(name, {})
@@ -332,14 +401,15 @@ def get_provider_models(
         return config_models
 
     api_key, base_url = _resolve_credentials_for(config, name)
-    remote_models = fetch_remote_models(api_key, base_url, timeout=timeout)
+    remote_models = fetch_remote_models(api_key, base_url, timeout=timeout,
+                                       protocol=validate_protocol(prov.get("protocol", DEFAULT_PROTOCOL), name))
 
-    seen = set(config_models)
-    merged = list(config_models)
-    for m in remote_models:
-        if m not in seen:
-            merged.append(m)
-            seen.add(m)
+    merged = list(remote_models)
+    seen = set(merged)
+    for model in config_models:
+        if model not in seen:
+            merged.append(model)
+            seen.add(model)
     return merged
 
 

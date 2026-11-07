@@ -21,11 +21,13 @@ from .config import (
     get_active_model,
     get_active_provider,
     get_model_params,
+    get_provider_protocol,
     get_show_thinking,
     get_system_prompt,
     load_state,
     resolve_provider_credentials,
     set_active_model,
+    set_active_provider,
 )
 from .llm_tools import ImageToolResult, TOOL_SCHEMAS, dispatch_tool
 from .interruptible_http import InterruptibleAsyncTransport, InterruptibleTransport
@@ -38,6 +40,7 @@ from .message_codec import (
 from .mcp import MCPManager
 from .sandbox import Sandbox, TurnInterrupted
 from .token_estimation import estimate_context_tokens, estimate_tokens
+from .protocols import AsyncProtocolClient, ProtocolClient, api_base_url, message_fingerprint
 
 
 SYSTEM_PROMPT = (
@@ -97,8 +100,12 @@ class TurnUsage:
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    provider_data: dict[str, Any] | None = None
 
     def update(self, event: Any) -> None:
+        data = getattr(event, "provider_data", None)
+        if isinstance(data, dict):
+            self.provider_data = data
         usage = getattr(event, "usage", None)
         if usage is None:
             return
@@ -153,13 +160,20 @@ class ChatEngine:
         config: dict[str, Any],
         mcp_manager: MCPManager | None = None,
         sandbox: Sandbox | None = None,
-        state_path: Path = DEFAULT_STATE_PATH,
+        state_path: Path | None = DEFAULT_STATE_PATH,
         model: str | None = None,
         state: dict[str, Any] | None = None,
+        *,
+        persist_state: bool = True,
     ) -> None:
         self.config = config
-        self.state_path = Path(state_path)
-        self.state = copy.deepcopy(load_state(self.state_path) if state is None else state)
+        self.state_path = Path(state_path).expanduser() if state_path is not None else None
+        # With no state path the engine keeps the selection in memory only.
+        self._persist_state = bool(persist_state) and self.state_path is not None
+        if state is None:
+            state = load_state(self.state_path) if self.state_path is not None else {}
+        self.state = copy.deepcopy(state)
+        get_provider_protocol(config, self.state_path, state=self.state)
         self._model_override = model
         self.mcp_manager = mcp_manager
         self.sandbox = sandbox or Sandbox()
@@ -499,38 +513,78 @@ class ChatEngine:
         # Constructor-level overrides (used by isolated solver roles) avoid
         # touching the shared active-model state.
         self._model_override = None
-        set_active_model(self.config, new_model, self.state_path, state=self.state)
+        self.set_model(new_model)
 
-    def _client(self) -> OpenAI:
-        api_key, base_url = resolve_provider_credentials(self.config, self.state_path, state=self.state)
-        if not api_key:
-            raise RuntimeError(
-                "Missing API key. Set the appropriate env var or configure "
-                "api_key_env in your provider config."
+    def set_model(self, new_model: str, *, persist: bool | None = None) -> None:
+        """Select *new_model*, persisting the choice unless persistence is off."""
+        self._model_override = None
+        self.state["active_model"] = new_model
+        set_active_model(
+            self.config,
+            new_model,
+            self.state_path,
+            state=self.state,
+            persist=self._resolve_persist(persist),
+        )
+
+    def set_provider(self, name: str, *, persist: bool | None = None) -> bool:
+        """Switch to provider *name*. Returns False if it is not configured."""
+        switched = set_active_provider(
+            self.config,
+            name,
+            self.state_path,
+            state=self.state,
+            persist=self._resolve_persist(persist),
+        )
+        if switched:
+            self._model_override = None
+        return switched
+
+    def _resolve_persist(self, persist: bool | None) -> bool:
+        return self._persist_state if persist is None else bool(persist) and self._persist_state
+
+    @property
+    def protocol(self) -> str:
+        return get_provider_protocol(self.config, self.state_path, state=self.state)
+
+    def _client_options(self) -> dict[str, Any]:
+        api_key, base_url = resolve_provider_credentials(self.config, state=self.state)
+        # An empty key is valid for local endpoints that do not require auth;
+        # the SDK then omits the Authorization header entirely.
+        kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "base_url": api_base_url(self.protocol, base_url),
+        }
+        headers: dict[str, str] = {}
+        if api_key:
+            headers = (
+                {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+                if self.protocol == "anthropic"
+                else {"Authorization": f"Bearer {api_key}"}
             )
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
+        if self.protocol == "anthropic":
+            headers.setdefault("anthropic-version", "2023-06-01")
+        if headers:
+            kwargs["default_headers"] = headers
+        return kwargs
+
+    def _client(self) -> ProtocolClient:
+        kwargs = self._client_options()
         turn = self._active_turn
         transport = InterruptibleTransport(turn.cancel_event if turn else threading.Event())
-        return OpenAI(**kwargs, max_retries=0, http_client=httpx.Client(
+        client = OpenAI(**kwargs, max_retries=0, http_client=httpx.Client(
             transport=transport, trust_env=False, timeout=httpx.Timeout(600, connect=5),
         ))
+        return ProtocolClient(client, self.protocol, get_active_provider(self.config, state=self.state))
 
-    def _async_client(self) -> AsyncOpenAI:
-        api_key, base_url = resolve_provider_credentials(self.config, self.state_path, state=self.state)
-        if not api_key:
-            raise RuntimeError(
-                "Missing API key. Configure api_key in your provider config."
-            )
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
+    def _async_client(self) -> AsyncProtocolClient:
+        kwargs = self._client_options()
         turn = self._active_turn
         transport = InterruptibleAsyncTransport(turn.cancel_event if turn else threading.Event())
-        return AsyncOpenAI(**kwargs, max_retries=0, http_client=httpx.AsyncClient(
+        client = AsyncOpenAI(**kwargs, max_retries=0, http_client=httpx.AsyncClient(
             transport=transport, trust_env=False, timeout=httpx.Timeout(600, connect=5),
         ))
+        return AsyncProtocolClient(client, self.protocol, get_active_provider(self.config, state=self.state))
 
     def _get_tools(self) -> list[dict[str, Any]]:
         tools = copy.deepcopy(TOOL_SCHEMAS)
@@ -702,8 +756,8 @@ class ChatEngine:
         target.write_bytes(raw)
         return str(target)
 
-    def _prepare_messages_for_api(self) -> list[dict[str, Any]]:
-        return prepare_messages_for_api(self._context_messages())
+    def _prepare_messages_for_api(self, *, preserve_provider_data: bool = False) -> list[dict[str, Any]]:
+        return prepare_messages_for_api(self._context_messages(), preserve_provider_data=preserve_provider_data)
 
     @staticmethod
     def _prepare_history_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -990,7 +1044,7 @@ class ChatEngine:
     def _build_stream_request(self, llm_params: dict[str, Any]) -> dict[str, Any]:
         create_kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": self._prepare_messages_for_api(),
+            "messages": self._prepare_messages_for_api(preserve_provider_data=True),
             "temperature": llm_params.get("temperature", 1),
             "max_tokens": llm_params.get("max_tokens", DEFAULT_ENDPOINT_MAX_TOKENS),
             "stream": True,
@@ -1016,6 +1070,7 @@ class ChatEngine:
     ) -> Literal["interrupted", "complete", "tools"]:
         self.token_usage.add(usage.prompt_tokens, usage.completion_tokens)
         if interrupted or self._should_stop(turn, should_stop):
+            usage.provider_data = None
             if assistant_content or reasoning_content or usage.prompt_tokens or usage.completion_tokens:
                 self._append_assistant_message(
                     self.messages, assistant_content, [], reasoning_content
@@ -1030,6 +1085,9 @@ class ChatEngine:
         return "tools" if tool_calls else "complete"
 
     def _store_response_usage(self, usage: TurnUsage) -> None:
+        if usage.provider_data is not None:
+            self.messages[-1]["_provider_data"] = copy.deepcopy(usage.provider_data)
+            self.messages[-1]["_provider_data"]["message_hash"] = message_fingerprint(self.messages[-1])
         messages = self._context_messages()
         # The just-produced tool call has no tool replies yet. Include it in
         # the baseline so completing the group doesn't count its output twice.
@@ -1075,7 +1133,7 @@ class ChatEngine:
         return fallback
 
     def _build_compact_request(self, prompt: str | None) -> dict[str, Any]:
-        temp_msgs = self._prepare_history_for_api(self._context_messages())
+        temp_msgs = prepare_messages_for_api(self._context_messages(), preserve_provider_data=True)
         temp_msgs.append({"role": "user", "content": prompt or DEFAULT_COMPACT_PROMPT})
         model_params = get_model_params(self.config, self.model, state_path=self.state_path, state=self.state)
         create_kwargs: dict[str, Any] = {
@@ -1151,7 +1209,7 @@ class ChatEngine:
                 summary_parts: list[str] = []
                 usage = TurnUsage()
                 try:
-                    stream: Any = client.chat.completions.create(**create_kwargs)
+                    stream: Any = client.create(**create_kwargs)
                     try:
                         for event in stream:
                             usage.update(event)
@@ -1286,7 +1344,7 @@ class ChatEngine:
                 for attempt in range(MAX_REQUEST_RETRIES + 1):
                     request_emitted = False
                     try:
-                        stream: Any = client.chat.completions.create(**create_kwargs)
+                        stream: Any = client.create(**create_kwargs)
                         (
                             assistant_content,
                             reasoning_content,
@@ -1504,7 +1562,7 @@ class ChatEngine:
                 summary_parts: list[str] = []
                 usage = TurnUsage()
                 try:
-                    stream: Any = await client.chat.completions.create(**create_kwargs)
+                    stream: Any = await client.create(**create_kwargs)
                     try:
                         async for event in stream:
                             usage.update(event)
@@ -1646,7 +1704,7 @@ class ChatEngine:
                 for attempt in range(MAX_REQUEST_RETRIES + 1):
                     request_emitted = False
                     try:
-                        stream: Any = await client.chat.completions.create(**create_kwargs)
+                        stream: Any = await client.create(**create_kwargs)
                         (
                             assistant_content,
                             reasoning_content,

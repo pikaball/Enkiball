@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import json
 import queue
 import threading
@@ -62,20 +63,21 @@ from typing import (
 )
 
 from .config import (
+    DEFAULT_CONFIG,
     DEFAULT_CONFIG_PATH,
+    DEFAULT_PROTOCOL,
     DEFAULT_STATE_PATH,
-    ensure_config,
     get_active_model,
     get_active_provider,
     get_provider_models,
     get_providers,
     load_config,
     load_state,
+    prepare_config,
     save_config,
-    set_active_model,
-    set_active_provider,
     set_mcp_enabled,
     set_show_thinking,
+    validate_protocol,
 )
 from .llm import (
     ChatEngine,
@@ -179,18 +181,37 @@ class _NoticeQueue(list[str]):
 class Enkiball:
     """High-level programmatic interface to the Enkiball agent.
 
+    The configuration can come from a file (``config_path``), an in-memory
+    mapping (``config``), or a minimal set of keyword arguments
+    (``api_key`` / ``base_url`` / ``protocol``).  The three are mutually
+    exclusive.
+
     Parameters
     ----------
-    config_path : str | Path
-        Path to ``agent.json``.  Defaults to ``config/agent.json``.
-    state_path : str | Path
+    config_path : str | Path | None
+        Path to the JSON config file. Defaults to
+        ``~/.config/enkiball/enki.json``; that default is created on first use.
+        A path passed explicitly must already exist.
+    config : Mapping[str, Any] | None
+        In-memory configuration, same schema as the JSON file. The config
+        itself is never written back; runtime state still follows *persist*.
+    api_key, base_url, protocol : str | None
+        Shorthand for a single-provider configuration. ``model`` and
+        ``extra_config`` are merged into the generated config.
+    persist : bool
+        Persist runtime choices (active provider/model, thinking toggle) and
+        session data. Defaults to *True*. Set to *False* for a fully
+        in-memory agent that never writes to the user's config directory.
+    state_path : str | Path | None
         Path for active provider/model state. Defaults to the shared Enkiball
-        state file. Loaded once at startup; persisted switches do not affect
-        other running instances.
+        state file when *persist* is true, and to memory only otherwise.
+        Loaded once at startup; persisted switches do not affect other
+        running instances.
     system_prompt : str | None
         Override the default system prompt.
     auto_start_mcp : bool
-        If *True* (default), enabled MCP servers are started on init.
+        If *True*, enabled MCP servers are started on init. Defaults to
+        *False*; the CLI passes *True*.
     on_tool_event : callable | None
         Optional callback ``(event_str) -> None`` fired before each tool
         execution.  Useful for logging / auditing.
@@ -220,11 +241,24 @@ class Enkiball:
         ``~/.config/enkiball/skills``. Pass an empty list to disable skills.
     """
 
+    # Class-level defaults keep instances built via ``__new__`` (tests, embedding
+    # shims) usable without running the real constructor.
+    _persist: bool = True
+    _config_path: Path | None = None
+    _state_path: Path | None = None
+
     def __init__(
         self,
-        config_path: str | Path = DEFAULT_CONFIG_PATH,
+        config_path: str | Path | None = None,
+        *,
+        config: Mapping[str, Any] | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        protocol: str | None = None,
+        extra_config: Mapping[str, Any] | None = None,
+        persist: bool = True,
         system_prompt: str | None = None,
-        auto_start_mcp: bool = True,
+        auto_start_mcp: bool = False,
         on_tool_event: Callable[[str], None] | None = None,
         session_dir: str | Path | None = None,
         cwd: str | Path | None = None,
@@ -235,15 +269,42 @@ class Enkiball:
         sandbox_env: Mapping[str, str] | None = None,
         sandbox_inherit_env: Iterable[str] | None = None,
         model: str | None = None,
-        state_path: str | Path = DEFAULT_STATE_PATH,
+        state_path: str | Path | None = None,
         skill_dirs: list[str | Path] | None = None,
         ro_permissions: list[str | Path] | None = None,
     ) -> None:
-        self._config_path = Path(config_path)
-        self._state_path = Path(state_path)
-        ensure_config(self._config_path)
-        state = load_state(self._state_path)
-        self._config = load_config(self._config_path, self._state_path, state=state)
+        inline = [config is not None, api_key is not None or base_url is not None]
+        if config_path is not None and any(inline):
+            raise ValueError("pass either config_path, config, or api_key/base_url — not several")
+        if config is not None and any((api_key is not None, base_url is not None, protocol is not None)):
+            raise ValueError("pass either config or api_key/base_url/protocol — not both")
+
+        self._persist = bool(persist)
+        if self._persist:
+            self._config_path = Path(
+                config_path if config_path is not None else DEFAULT_CONFIG_PATH
+            ).expanduser()
+            self._state_path: Path | None = Path(
+                state_path if state_path is not None else DEFAULT_STATE_PATH
+            ).expanduser()
+        else:
+            self._config_path = (
+                Path(config_path).expanduser() if config_path is not None else None
+            )
+            self._state_path = (
+                Path(state_path).expanduser() if state_path is not None else None
+            )
+        state = load_state(self._state_path) if self._state_path is not None else {}
+        self._config = self._load_config(
+            config_path=config_path,
+            config=config,
+            api_key=api_key,
+            base_url=base_url,
+            protocol=protocol,
+            extra_config=extra_config,
+            model=model,
+            state=state,
+        )
 
         self._sandbox = Sandbox(
             cwd,
@@ -263,14 +324,16 @@ class Enkiball:
         self.notice_queue: list[str] = _NoticeQueue()
         self._engine = ChatEngine(
             self._config, self._mcp, self._sandbox, state_path=self._state_path,
-            model=model, state=state,
+            model=model, state=state, persist_state=self._persist,
         )
         self._engine.notice_queue = self.notice_queue
         self._on_tool_event = on_tool_event
         self._bg_lock = threading.Lock()
         self._bg_exec: concurrent.futures.ThreadPoolExecutor | None = None
         self._bg_futures: list[concurrent.futures.Future[ChatResult]] = []
-        self._session_store = self._build_session_store(session_dir, self.cwd)
+        self._session_store = self._build_session_store(
+            session_dir, self.cwd, persist=self._persist
+        )
         self._sync_skill_tool()
 
         if system_prompt is not None:
@@ -284,12 +347,95 @@ class Enkiball:
         return self._sandbox.cwd
 
     @property
-    def config_path(self) -> Path:
+    def config_path(self) -> Path | None:
+        """Config file used by this agent, or *None* for in-memory config."""
         return self._config_path
 
     @property
-    def state_path(self) -> Path:
+    def state_path(self) -> Path | None:
+        """State file used by this agent, or *None* when nothing is persisted."""
         return self._state_path
+
+    @property
+    def persist(self) -> bool:
+        """Whether runtime choices and session data are written to disk."""
+        return self._persist
+
+    @staticmethod
+    def _builder_config(
+        *,
+        api_key: str | None,
+        base_url: str | None,
+        protocol: str | None,
+        extra_config: Mapping[str, Any] | None,
+        model: str | None,
+    ) -> dict[str, Any]:
+        """Build a single-provider config from shorthand arguments."""
+        provider: dict[str, Any] = {
+            "protocol": protocol or DEFAULT_PROTOCOL,
+            "api_key": "" if api_key is None else api_key,
+            "base_url": (
+                base_url
+                if base_url is not None
+                else ("https://api.anthropic.com/v1"
+                      if (protocol or DEFAULT_PROTOCOL) == "anthropic"
+                      else "https://api.openai.com/v1")
+            ),
+            "models": {model: {}} if model else {},
+        }
+        config: dict[str, Any] = {
+            "providers": {"default": provider},
+            "active_provider": "default",
+        }
+        if model:
+            config["active_model"] = model
+        if extra_config:
+            config.update(copy.deepcopy(dict(extra_config)))
+        return config
+
+    def _load_config(
+        self,
+        *,
+        config_path: str | Path | None,
+        config: Mapping[str, Any] | None,
+        api_key: str | None,
+        base_url: str | None,
+        protocol: str | None,
+        extra_config: Mapping[str, Any] | None,
+        model: str | None,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        state_path = self._state_path if self._state_path is not None else DEFAULT_STATE_PATH
+        if api_key is not None or base_url is not None:
+            if protocol is not None:
+                validate_protocol(protocol)
+            raw = self._builder_config(
+                api_key=api_key,
+                base_url=base_url,
+                protocol=protocol,
+                extra_config=extra_config,
+                model=model,
+            )
+            # Inline configs must not leave a partial state file behind; the
+            # migrated selection is handed to the engine through *state*.
+            return prepare_config(raw, state_path=state_path, state=state, persist=False)
+        if config is not None:
+            return prepare_config(
+                dict(config), state_path=state_path, state=state, persist=False
+            )
+        if self._config_path is None:
+            return prepare_config(
+                DEFAULT_CONFIG, state_path=state_path, state=state, persist=False
+            )
+        # An explicitly supplied path must exist; only the default path is
+        # auto-created so a typo cannot silently yield a default config.
+        return load_config(
+            self._config_path,
+            state_path,
+            state=state,
+            persist=self._persist,
+            create_if_missing=config_path is None,
+        )
 
     @property
     def dir_permissions(self) -> tuple[Path, ...]:
@@ -304,8 +450,10 @@ class Enkiball:
 
     @staticmethod
     def _build_session_store(
-        session_dir: str | Path | None, cwd: Path
+        session_dir: str | Path | None, cwd: Path, *, persist: bool = True
     ) -> SessionStore:
+        if not persist:
+            return SessionStore._memory(cwd=cwd)
         if session_dir is None:
             return SessionStore(cwd=cwd)
         base_dir = Path(session_dir).expanduser().resolve()
@@ -447,8 +595,8 @@ class Enkiball:
 
     @property
     def config(self) -> dict[str, Any]:
-        """Return a *copy* of the active configuration."""
-        return json.loads(json.dumps(self._config))
+        """Return a deep copy of the active configuration."""
+        return copy.deepcopy(self._config)
 
     @property
     def model(self) -> str:
@@ -461,31 +609,34 @@ class Enkiball:
     @property
     def provider(self) -> str:
         """Name of the active provider."""
-        return get_active_provider(self._config, self._state_path, state=self._engine.state)
+        return get_active_provider(self._config, state=self._engine.state)
+
+    @property
+    def protocol(self) -> str:
+        """Wire protocol used by the active provider."""
+        return self._engine.protocol
 
     @property
     def providers(self) -> dict[str, dict[str, Any]]:
         """Return a copy of all configured providers and their settings."""
-        return json.loads(json.dumps(get_providers(self._config)))
+        return copy.deepcopy(get_providers(self._config))
 
-    def switch_provider(self, name: str) -> bool:
+    def switch_provider(self, name: str, *, persist: bool | None = None) -> bool:
         """Switch to a different provider.  Returns False if not found.
 
-        The selection is always persisted to ``state.json``.
+        The selection is persisted to ``state.json`` when the agent persists
+        state. Pass ``persist=False`` for a one-off switch that must not change
+        the default for future processes.
         """
-        switched = set_active_provider(
-            self._config, name, self._state_path, state=self._engine.state
-        )
-        if switched:
-            self._engine._model_override = None
-        return switched
+        return self._engine.set_provider(name, persist=persist)
 
-    def switch_model(self, model: str) -> None:
+    def switch_model(self, model: str, *, persist: bool | None = None) -> None:
         """Switch model (within current provider).
 
-        The selection is always persisted to ``state.json``.
+        The selection is persisted to ``state.json`` when the agent persists
+        state. Pass ``persist=False`` for a one-off switch.
         """
-        self._engine.model = model
+        self._engine.set_model(model, persist=persist)
 
     def list_models(
         self,
@@ -528,10 +679,11 @@ class Enkiball:
         self._engine.show_thinking = value
 
     def set_show_thinking(self, enabled: bool) -> None:
-        """Toggle thinking output and persist the choice to ``state.json``."""
+        """Toggle thinking output and persist it when the agent persists state."""
         self._engine.show_thinking = bool(enabled)
         set_show_thinking(
-            bool(enabled), self._state_path, state=self._engine.state
+            bool(enabled), self._state_path, state=self._engine.state,
+            persist=self._persist,
         )
 
     # ========================================================================
@@ -1121,7 +1273,7 @@ class Enkiball:
             set_mcp_enabled(self._config, name, False)
             return False
         if save:
-            save_config(self._config, self._config_path)
+            self._save_config()
         return True
 
     def mcp_disable(self, name: str, save: bool = False) -> bool:
@@ -1131,7 +1283,14 @@ class Enkiball:
             return False
         self._mcp.stop(name)
         if save:
-            save_config(self._config, self._config_path)
+            self._save_config()
+        return True
+
+    def _save_config(self) -> bool:
+        """Write the in-memory config back to its file, if there is one."""
+        if self._config_path is None:
+            return False
+        save_config(self._config, self._config_path)
         return True
 
     # ========================================================================

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from rich.console import Console
 
 from enkiball import Enkiball, EnkiballCLI
+from enkiball.config import save_config
 from enkiball.llm import ChatEngine
 from enkiball.sandbox import Sandbox, TurnInterrupted
 from test_stream_usage import Stream, chunk
@@ -29,7 +30,7 @@ class TemporaryTurnTests(unittest.TestCase):
         agent = make_agent()
         before = agent.messages
         client = Mock()
-        client.chat.completions.create.side_effect = ValueError("bad request")
+        client.create.side_effect = ValueError("bad request")
         with patch.object(agent._engine, "_client", return_value=client):
             with self.assertRaisesRegex(ValueError, "bad request"):
                 agent.btw("temporary question")
@@ -59,7 +60,7 @@ class TemporaryTurnTests(unittest.TestCase):
         engine = agent._engine
         before = engine.export_messages()
         client = Mock()
-        client.chat.completions.create.return_value = Stream([chunk({"content": "answer"})])
+        client.create.return_value = Stream([chunk({"content": "answer"})])
         restore = engine.load_messages
 
         def checked_restore(messages):
@@ -85,7 +86,7 @@ class AsyncStreamCleanupTests(unittest.TestCase):
 
         async def run():
             client = Mock()
-            client.chat.completions.create = AsyncMock(return_value=WaitingStream([]))
+            client.create = AsyncMock(return_value=WaitingStream([]))
             client.close = AsyncMock()
             with patch.object(agent._engine, "_async_client", return_value=client):
                 stream = agent.astream("hi")
@@ -211,7 +212,7 @@ class CancellationBoundaryTests(unittest.TestCase):
                 engine = ChatEngine({}, state={}, model="test")
                 before = engine.export_messages()
                 client = Mock()
-                client.chat.completions.create = (AsyncMock if async_mode else Mock)(
+                client.create = (AsyncMock if async_mode else Mock)(
                     return_value=Stream([chunk({"content": "summary"})])
                 )
                 if async_mode:
@@ -240,7 +241,7 @@ class CancellationBoundaryTests(unittest.TestCase):
                     "name": "stop", "parameters": {"type": "object"},
                 }}, Mock(side_effect=TurnInterrupted))
                 client = Mock()
-                client.chat.completions.create = (AsyncMock if async_mode else Mock)(return_value=Stream([
+                client.create = (AsyncMock if async_mode else Mock)(return_value=Stream([
                     chunk({"tool_calls": [{"index": i, "id": f"call-{i}", "type": "function",
                           "function": {"name": "stop", "arguments": "{}"}} for i in range(2)]}),
                 ]))
@@ -253,7 +254,7 @@ class CancellationBoundaryTests(unittest.TestCase):
                         engine.stream_reply("hi", [], lambda _: None)
                 self.assertTrue(engine.interrupted())
                 self.assertEqual([msg.get("tool_call_id") for msg in engine.messages[-2:]], ["call-0", "call-1"])
-                client.chat.completions.create.assert_called_once()
+                client.create.assert_called_once()
 
 
 class CliFailureTests(unittest.TestCase):
@@ -261,6 +262,7 @@ class CliFailureTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
+        save_config({}, root / "config.json")
         self.agent = Enkiball(
             config_path=root / "config.json", state_path=root / "state.json",
             session_dir=root / "sessions", cwd=root, skill_dirs=[], auto_start_mcp=False,

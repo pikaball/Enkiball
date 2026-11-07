@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 from dataclasses import dataclass
@@ -57,25 +58,45 @@ class SessionRecord:
 
 
 class SessionStore:
-    def __init__(self, cwd: str | Path | None = None) -> None:
-        self._init_paths(SESSION_DIR, EXPORT_DIR, cwd)
+    def __init__(self, cwd: str | Path | None = None, *, persist: bool = True) -> None:
+        self._init_paths(SESSION_DIR, EXPORT_DIR, cwd, persist=persist)
 
     @classmethod
     def _from_paths(
-        cls, base_dir: Path, export_dir: Path, cwd: str | Path | None = None
+        cls,
+        base_dir: Path,
+        export_dir: Path,
+        cwd: str | Path | None = None,
+        *,
+        persist: bool = True,
     ) -> SessionStore:
         store = cls.__new__(cls)
-        store._init_paths(base_dir, export_dir, cwd)
+        store._init_paths(base_dir, export_dir, cwd, persist=persist)
+        return store
+
+    @classmethod
+    def _memory(cls, cwd: str | Path | None = None) -> SessionStore:
+        """Create a store whose sessions live in memory only."""
+        store = cls.__new__(cls)
+        store._init_paths(SESSION_DIR, EXPORT_DIR, cwd, persist=False)
         return store
 
     def _init_paths(
-        self, base_dir: Path, export_dir: Path, cwd: str | Path | None
+        self,
+        base_dir: Path,
+        export_dir: Path,
+        cwd: str | Path | None,
+        *,
+        persist: bool = True,
     ) -> None:
         self.base_dir = base_dir
         self.export_dir = export_dir
+        self.persist = bool(persist)
         self.cwd = Path.cwd().resolve() if cwd is None else Path(cwd).expanduser().resolve()
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        self.export_dir.mkdir(parents=True, exist_ok=True)
+        if self.persist:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self.export_dir.mkdir(parents=True, exist_ok=True)
+        self._records: dict[str, SessionRecord] = {}
         self.current_session_id: str | None = None
         self.current_session_name: str | None = None
         self.current_session_persisted: bool = False
@@ -114,11 +135,19 @@ class SessionStore:
             self.current_session_persisted = True
         return record
 
-    def _path(self, session_id: str) -> Path:
+    def _validate_id(self, session_id: str) -> None:
         if not isinstance(session_id, str) or not _SESSION_ID_PATTERN.fullmatch(
             session_id
         ):
             raise ValueError(f"invalid session id: {session_id!r}")
+
+    def _exists(self, session_id: str) -> bool:
+        if not self.persist:
+            return session_id in self._records
+        return self._path(session_id).exists()
+
+    def _path(self, session_id: str) -> Path:
+        self._validate_id(session_id)
         base_dir = self.base_dir.resolve()
         path = (base_dir / f"{session_id}.json").resolve()
         if path.parent != base_dir:
@@ -126,6 +155,14 @@ class SessionStore:
         return path
 
     def list_sessions(self) -> list[SessionRecord]:
+        if not self.persist:
+            out = [
+                copy.deepcopy(record)
+                for record in self._records.values()
+                if self._belongs_to_cwd_scope(record)
+            ]
+            out.sort(key=lambda s: s.updated_at, reverse=True)
+            return out
         out: list[SessionRecord] = []
         for fp in sorted(self.base_dir.glob("*.json")):
             try:
@@ -153,6 +190,16 @@ class SessionStore:
         )
 
     def load(self, session_id: str) -> SessionRecord:
+        if not self.persist:
+            self._validate_id(session_id)
+            record = self._records.get(session_id)
+            if record is None:
+                raise FileNotFoundError(f"session not found: {session_id}")
+            if not self._belongs_to_cwd_scope(record):
+                raise PermissionError(
+                    f"session does not belong to cwd or an ancestor: {session_id}"
+                )
+            return copy.deepcopy(record)
         fp = self._path(session_id)
         if not fp.exists():
             raise FileNotFoundError(f"session not found: {session_id}")
@@ -168,6 +215,10 @@ class SessionStore:
         record.updated_at = _now_iso()
         if record.cwd is None:
             record.cwd = str(self.cwd)
+        if not self.persist:
+            self._validate_id(record.session_id)
+            self._records[record.session_id] = copy.deepcopy(record)
+            return
         fp = self._path(record.session_id)
         atomic_write_json(fp, record.to_dict())
 
@@ -182,8 +233,7 @@ class SessionStore:
         if not self.current_session_persisted:
             return True
 
-        fp = self._path(sid)
-        if not fp.exists():
+        if not self._exists(sid):
             return True
         record = self.load(sid)
         record.name = cleaned
@@ -193,7 +243,7 @@ class SessionStore:
     def save_messages(
         self, session_id: str, messages: list[dict[str, Any]]
     ) -> SessionRecord:
-        if self._path(session_id).exists():
+        if self._exists(session_id):
             record = self.load(session_id)
         else:
             record = SessionRecord(
@@ -260,6 +310,10 @@ class SessionStore:
 
     def export_session(self, session_id: str, out_path: str | None = None) -> Path:
         record = self.load(session_id)
+        if out_path is None and not self.persist:
+            raise ValueError(
+                "an in-memory session store needs an explicit out_path to export"
+            )
         target = Path(out_path) if out_path else self.export_dir / f"{session_id}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
 

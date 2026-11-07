@@ -198,7 +198,7 @@ class EnkiballCLI:
         self.console = console or Console()
         if agent is None:
             try:
-                agent = Enkiball(config_path=DEFAULT_CONFIG_PATH, approval=True)
+                agent = Enkiball(approval=True, auto_start_mcp=True)
             except FileNotFoundError as e:
                 self.console.print(str(e), style="bold red")
                 raise
@@ -264,7 +264,8 @@ class EnkiballCLI:
             style="green",
         )
         console.print(
-            f"Config: {agent.config_path}  Provider: {agent.provider}  Model: {agent.model}"
+            f"Config: {agent.config_path or '(in-memory)'}  Provider: {agent.provider}"
+            f"  Model: {agent.model}"
             f"  Thinking: {'on' if agent.show_thinking else 'off'}",
             style="cyan",
         )
@@ -421,7 +422,12 @@ class EnkiballCLI:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Enkiball interactive CLI")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=f"config file (default: {DEFAULT_CONFIG_PATH})",
+    )
     parser.add_argument("--cwd", type=Path, default=Path.cwd())
     parser.add_argument(
         "--dir-permission",
@@ -477,6 +483,7 @@ def main(argv: list[str] | None = None) -> None:
             sandbox_network=args.sandbox_network,
             sandbox_inherit_env=args.sandbox_env,
             ro_permissions=args.ro_permission,
+            auto_start_mcp=True,
         )
         cli = EnkiballCLI(agent)
     except FileNotFoundError:

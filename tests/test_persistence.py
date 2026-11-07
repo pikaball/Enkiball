@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -196,9 +197,27 @@ class StatePathTests(unittest.TestCase):
         self.addCleanup(agent.shutdown)
         self.assertEqual(agent.model, "remote-only")
 
-    def test_public_constructor_default_remains_default_state_path(self) -> None:
+    def test_public_constructor_resolves_default_state_path_when_persisting(self) -> None:
         default = inspect.signature(Enkiball).parameters["state_path"].default
-        self.assertEqual(default, DEFAULT_STATE_PATH)
+        self.assertIsNone(default)
+        with patch("enkiball.agent.load_state", return_value={}), patch(
+            "enkiball.config.load_state", return_value={}
+        ):
+            agent = Enkiball(
+                config={},
+                session_dir=self.root / "default-state-sessions",
+                skill_dirs=[],
+            )
+        self.addCleanup(agent.shutdown)
+        self.assertEqual(agent.state_path, DEFAULT_STATE_PATH)
+
+    def test_in_memory_agents_never_touch_the_config_directory(self) -> None:
+        agent = Enkiball(config={}, persist=False, cwd=self.root, skill_dirs=[])
+        self.addCleanup(agent.shutdown)
+        self.assertIsNone(agent.config_path)
+        self.assertIsNone(agent.state_path)
+        self.assertFalse(agent.session_store.persist)
+        self.assertFalse((self.root / ".config").exists())
 
     def test_missing_config_is_created_with_default_contents(self) -> None:
         config_path = self.root / "new" / "enki.json"
@@ -303,6 +322,124 @@ class StatePathTests(unittest.TestCase):
             json.loads(state_path.read_text(encoding="utf-8")),
             {"active_provider": "legacy", "active_model": "old-model"},
         )
+
+
+class InlineConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+
+    def build(self, **kwargs) -> Enkiball:
+        kwargs.setdefault("session_dir", self.root / "sessions")
+        kwargs.setdefault("cwd", self.root)
+        kwargs.setdefault("skill_dirs", [])
+        kwargs.setdefault("persist", False)
+        agent = Enkiball(**kwargs)
+        self.addCleanup(agent.shutdown)
+        return agent
+
+    def test_inline_config_mapping_is_used_without_touching_disk(self) -> None:
+        agent = self.build(
+            config={
+                "providers": {
+                    "local": {
+                        "protocol": "chat-completions",
+                        "api_key": "",
+                        "base_url": "http://127.0.0.1:11434/v1",
+                        "models": {"qwen3:9b": {"max_tokens": 2048}},
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(agent.provider, "local")
+        self.assertEqual(agent.model, "qwen3:9b")
+        self.assertEqual(agent.protocol, "chat-completions")
+        self.assertIsNone(agent.config_path)
+        self.assertFalse((self.root / ".config").exists())
+
+    def test_shorthand_arguments_build_a_single_provider(self) -> None:
+        agent = self.build(
+            api_key="sk-test",
+            base_url="http://127.0.0.1:4011/v1",
+            model="provider/model",
+            protocol="responses",
+        )
+
+        self.assertEqual(agent.provider, "default")
+        self.assertEqual(agent.model, "provider/model")
+        self.assertEqual(agent.protocol, "responses")
+        provider = agent.providers["default"]
+        self.assertEqual(provider["api_key"], "sk-test")
+        self.assertEqual(provider["base_url"], "http://127.0.0.1:4011/v1")
+        self.assertEqual(provider["models"], {"provider/model": {}})
+
+    def test_shorthand_defaults_anthropic_base_url(self) -> None:
+        agent = self.build(api_key="k", protocol="anthropic", model="claude-sonnet-5-5")
+        self.assertEqual(
+            agent.providers["default"]["base_url"], "https://api.anthropic.com/v1"
+        )
+
+    def test_conflicting_config_sources_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not several"):
+            Enkiball(config_path=self.root / "enki.json", api_key="k")
+        with self.assertRaisesRegex(ValueError, "not both"):
+            Enkiball(config={}, api_key="k")
+
+    def test_missing_explicit_config_path_raises(self) -> None:
+        missing = self.root / "typo" / "enki.json"
+        with self.assertRaises(FileNotFoundError):
+            Enkiball(config_path=missing, skill_dirs=[], session_dir=self.root / "s")
+        self.assertFalse(missing.exists())
+        self.assertFalse((self.root / "typo").exists())
+
+    def test_config_path_expands_the_home_directory(self) -> None:
+        config_file = self.root / "custom.json"
+        save_config({}, config_file)
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            agent = Enkiball(
+                config_path="~/custom.json",
+                state_path="~/state.json",
+                session_dir=self.root / "sessions",
+                cwd=self.root,
+                skill_dirs=[],
+            )
+            self.addCleanup(agent.shutdown)
+            self.assertEqual(agent.config_path, config_file)
+            self.assertEqual(agent.state_path, self.root / "state.json")
+
+    def test_in_memory_agent_switches_do_not_write_state(self) -> None:
+        agent = self.build(
+            config={
+                "providers": {
+                    "a": {"models": {"one": {}}},
+                    "b": {"models": {"two": {}}},
+                }
+            }
+        )
+
+        self.assertTrue(agent.switch_provider("b"))
+        agent.switch_model("two")
+        agent.set_show_thinking(True)
+
+        self.assertEqual((agent.provider, agent.model), ("b", "two"))
+        self.assertIsNone(agent.state_path)
+
+    def test_in_memory_sessions_live_in_process(self) -> None:
+        agent = self.build(config={})
+        agent.load_messages([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ])
+
+        record = agent.save_session("inline")
+
+        self.assertIsNotNone(record)
+        self.assertEqual(len(agent.list_sessions()), 1)
+        self.assertFalse(list((self.root / "sessions").glob("*.json")))
+        with self.assertRaises(ValueError):
+            agent.session_store.export_session(record.session_id or "")
 
 
 if __name__ == "__main__":

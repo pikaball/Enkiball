@@ -67,13 +67,13 @@ class StreamUsageTests(unittest.TestCase):
                     seen = []
                     events = self.events(reasoning_key)
                     client = Mock()
-                    client.chat.completions.create.return_value = Stream(events)
+                    client.create.return_value = Stream(events)
                     if async_mode:
                         async def create(**kwargs):
                             return Stream(events)
                         async def close():
                             pass
-                        client.chat.completions.create = create
+                        client.create = create
                         client.close = close
                     with patch.object(engine, "_async_client" if async_mode else "_client", return_value=client):
                         reply = engine.astream_reply if async_mode else engine.stream_reply
@@ -94,13 +94,13 @@ class StreamUsageTests(unittest.TestCase):
             with self.subTest(async_mode=async_mode):
                 engine = ChatEngine({}, state={}, model="test")
                 client = Mock()
-                client.chat.completions.create.return_value = Stream(self.events()[:-1])
+                client.create.return_value = Stream(self.events()[:-1])
                 if async_mode:
                     async def create(**kwargs):
                         return Stream(self.events()[:-1])
                     async def close():
                         pass
-                    client.chat.completions.create = create
+                    client.create = create
                     client.close = close
                 with patch.object(engine, "_async_client" if async_mode else "_client", return_value=client):
                     result = engine.acompact() if async_mode else engine.compact()

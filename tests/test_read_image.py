@@ -77,7 +77,7 @@ class ReadImageTests(unittest.TestCase):
                     return Stream([chunk({"content": "image seen"})])
 
                 client = Mock()
-                client.chat.completions.create = create
+                client.create = create
                 if async_mode:
                     async def acreate(**kwargs):
                         return create(**kwargs)
@@ -85,7 +85,7 @@ class ReadImageTests(unittest.TestCase):
                     async def close():
                         pass
 
-                    client.chat.completions.create = acreate
+                    client.create = acreate
                     client.close = close
                 with patch.object(engine, "_async_client" if async_mode else "_client", return_value=client):
                     reply = engine.astream_reply if async_mode else engine.stream_reply

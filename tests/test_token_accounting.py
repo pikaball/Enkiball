@@ -97,13 +97,13 @@ class TokenAccountingTests(unittest.TestCase):
             usage = {"prompt_tokens": 1000, "completion_tokens": 10, "total_tokens": 1010}
             events = [chunk({"content": "answer"}, usage), chunk(usage=usage)]
         client = Mock()
-        client.chat.completions.create.return_value = Stream(events)
+        client.create.return_value = Stream(events)
         if async_mode:
             async def create(**kwargs):
                 return Stream(events)
             async def close():
                 pass
-            client.chat.completions.create = create
+            client.create = create
             client.close = close
         return client
 

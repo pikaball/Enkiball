@@ -211,7 +211,7 @@ class StdioInterruptTests(unittest.TestCase):
                     for i in range(2)
                 ]})]
                 llm = Mock()
-                llm.chat.completions.create.return_value = Stream(events)
+                llm.create.return_value = Stream(events)
                 stop = threading.Event()
                 cancel = stop.set if async_mode else engine.interrupt
                 worker = threading.Thread(target=lambda: (ready.wait(3), cancel()))
@@ -221,7 +221,7 @@ class StdioInterruptTests(unittest.TestCase):
                         return Stream(events)
                     async def close():
                         pass
-                    llm.chat.completions.create = create
+                    llm.create = create
                     llm.close = close
                 try:
                     with patch.object(engine, "_async_client" if async_mode else "_client", return_value=llm):

@@ -391,7 +391,7 @@ class CommandHandler:
     def _provider(self, argv: list[str]) -> bool:
         if len(argv) == 1:
             self.console.print(
-                f"active provider: {self.agent.provider}",
+                f"active provider: {self.agent.provider}  protocol: {self.agent.protocol}",
                 style="cyan",
             )
             return True
@@ -703,7 +703,12 @@ class CommandHandler:
                 self.console.print(f"{name:16} {status}")
             return
         if action == "path":
-            self.console.print(str(self.agent.config_path), style="cyan")
+            self.console.print(
+                str(self.agent.config_path)
+                if self.agent.config_path is not None
+                else "(in-memory config, no file)",
+                style="cyan",
+            )
             return
         if action == "list":
             self._print_mcp_list()

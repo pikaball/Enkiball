@@ -41,15 +41,22 @@ class HTTPInterruptTests(unittest.TestCase):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.end_headers()
+                    terminal = b"data: [DONE]\n\n"
                     if test.stage == "body":
                         payload = {"id": "test", "object": "chat.completion.chunk",
                                    "created": 0, "model": "test", "choices": [{
                                        "index": 0, "delta": {"content": "partial"}}]}
-                        self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                        if test.engine.protocol == "chat-completions":
+                            self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                        else:
+                            from test_protocols import events, sse
+                            frames = events(test.engine.protocol, text="partial")
+                            self.wfile.write(sse(frames[:-1]))
+                            terminal = sse(frames[-1:])
                         self.wfile.flush()
                         test.ready.set()
                         test.release.wait(5)
-                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.write(terminal)
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
@@ -59,6 +66,7 @@ class HTTPInterruptTests(unittest.TestCase):
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
         self.engine = ChatEngine({"providers": {"local": {
+            "protocol": "chat-completions",
             "api_key": "test-key",
             "base_url": f"http://127.0.0.1:{self.server.server_port}/v1",
         }}}, state={}, model="test")
@@ -198,6 +206,17 @@ class HTTPInterruptTests(unittest.TestCase):
             self.assertTrue(self.engine.interrupted())
             self.assertFalse(self.engine.capture().in_progress)
         asyncio.run(run())
+
+    def test_native_protocol_interrupts_preserve_partial_output(self):
+        self.stage = "body"
+        for protocol in ("responses", "anthropic"):
+            for async_mode in (False, True):
+                with self.subTest(protocol=protocol, async_mode=async_mode):
+                    self.engine.config["providers"]["local"]["protocol"] = protocol
+                    self.requests = 0
+                    self.ready.clear()
+                    self.release.clear()
+                    self.run_interrupted(async_mode=async_mode)
 
     def test_normal_requests_still_work_after_an_interruption(self):
         self.run_interrupted()

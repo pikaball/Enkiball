@@ -133,7 +133,9 @@ def drop_orphan_tool_call_messages(messages: list[dict[str, Any]]) -> list[dict[
     return out
 
 
-def prepare_messages_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def prepare_messages_for_api(
+    messages: list[dict[str, Any]], *, preserve_provider_data: bool = False,
+) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     pending_images: list[dict[str, Any]] = []
     for msg in drop_orphan_tool_call_messages(messages):
@@ -144,6 +146,8 @@ def prepare_messages_for_api(messages: list[dict[str, Any]]) -> list[dict[str, A
         item = dict(msg)
         item.pop("_compact", None)
         item.pop("_usage", None)
+        if not preserve_provider_data:
+            item.pop("_provider_data", None)
         item["content"] = prepare_content_for_api(item.get("content", ""))
         if item.get("role") == "tool" and isinstance(item["content"], list):
             parts = item["content"]

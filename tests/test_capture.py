@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from enkiball import Enkiball
+from enkiball.config import save_config
 from enkiball.llm import ChatEngine
 from test_stream_usage import Stream, chunk
 
@@ -55,7 +56,7 @@ class CaptureTests(unittest.TestCase):
                     return next(streams)
 
                 client = Mock()
-                client.chat.completions.create = AsyncMock(side_effect=create) if async_mode else Mock(side_effect=create)
+                client.create = AsyncMock(side_effect=create) if async_mode else Mock(side_effect=create)
                 if async_mode:
                     client.close = AsyncMock()
                 with patch.object(engine, "_async_client" if async_mode else "_client", return_value=client):
@@ -86,7 +87,7 @@ class CaptureTests(unittest.TestCase):
                 engine = ChatEngine({}, state={}, model="test")
                 client = Mock()
                 create = AsyncMock if async_mode else Mock
-                client.chat.completions.create = create(return_value=Stream([chunk({"content": "old"})]))
+                client.create = create(return_value=Stream([chunk({"content": "old"})]))
                 if async_mode:
                     client.close = AsyncMock()
                 client_method = "_async_client" if async_mode else "_client"
@@ -113,6 +114,7 @@ class WaitTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
+        save_config({}, root / "config.json")
         self.agent = Enkiball(
             config_path=root / "config.json", state_path=root / "state.json",
             session_dir=root / "sessions", cwd=root, skill_dirs=[], auto_start_mcp=False,
@@ -134,7 +136,7 @@ class WaitTests(unittest.TestCase):
         entered, release, block = self.gate()
         original_chat = self.agent.chat
         client = Mock()
-        client.chat.completions.create.return_value = Stream([chunk({"content": "done"})])
+        client.create.return_value = Stream([chunk({"content": "done"})])
 
         def delayed_chat(*args, **kwargs):
             block()
@@ -160,7 +162,7 @@ class WaitTests(unittest.TestCase):
                     closing, close, block_close = self.gate()
                     client = Mock()
                     create = AsyncMock if async_mode else Mock
-                    client.chat.completions.create = create(return_value=Stream([chunk({"content": "done"})]))
+                    client.create = create(return_value=Stream([chunk({"content": "done"})]))
                     client.close = AsyncMock(side_effect=block_close) if async_mode else Mock(side_effect=block_close)
 
                     def make_client():
