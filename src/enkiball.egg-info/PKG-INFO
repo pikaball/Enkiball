@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: enkiball
-Version: 0.1.6
+Version: 0.1.7
 Summary: A Python LLM foundation with a CLI and Python API
 License-Expression: GPL-3.0-only
 Keywords: agent,cli,llm,mcp,python
@@ -70,6 +70,7 @@ pip install -e .
   },
   "providers": {
     "ollama": {
+      "protocol": "chat-completions",
       "api_key": "123",
       "base_url": "http://127.0.0.1:11434/v1",
       "models": {
@@ -80,6 +81,7 @@ pip install -e .
       }
     },
     "openai": {
+      "protocol": "responses",
       "api_key": "sk-xxx",
       "base_url": "https://api.openai.com/v1",
       "models": {
@@ -112,7 +114,7 @@ pip install -e .
 
 - `system_prompt` — 自定义系统提示词，省略则使用内置默认值
 - `auto_compact.threshold_ratio` — 自动压缩触发比例，默认 `0.7`；按 `models.<name>.context_window * threshold_ratio` 计算 compact 触发点。也可直接配置 `auto_compact.threshold_tokens`，优先于比例。未配置窗口或绝对阈值时不自动压缩，`/autocompact` 会提示配置
-- `providers` — 多 provider 支持，每个 provider 直接写 `api_key` 和 `base_url`
+- `providers` — 多 provider 支持，每个 provider 可设置 `protocol`、`api_key` 和 `base_url`；`protocol` 支持 `chat-completions`、`responses`、`anthropic`，省略时默认 `responses`
 - `models` — dict 格式，key 为模型名，value 为该模型的参数（`temperature`、`max_tokens` 等）；`max_tokens` 控制单次输出上限。另用 `context_window` 声明端点实际支持的上下文窗口（输入与输出合计），只供本地统计和自动压缩使用，不发送给 API；例如窗口为 128000 的端点可配置 `{"max_tokens": 4096, "context_window": 128000}`
 - 未在 config 中定义的模型也可使用（通过 `/v1/models` 端点自动发现），使用默认参数
 - 当前选中的 provider 和 model 保存在 `~/.config/enkiball/state.json`（运行时状态，与配置分离）
@@ -142,11 +144,54 @@ pip install -e .
 }
 ```
 
-- `api_key` 和 `base_url` 会传给 OpenAI-compatible client。
+- `api_key` 和 `base_url` 用于所选协议的端点；Anthropic 使用 `x-api-key` 和 `anthropic-version` 请求头。
 - `models` 中定义的参数会在请求该模型时使用。
 - 未定义但远程 `/models` 端点可发现的模型也可以切换使用，此时使用默认请求参数。
 - 当前 provider/model 不写回主配置文件，而是写入 `~/.config/enkiball/state.json`。
 - 尚无保存的模型选择时，默认使用当前 provider 配置中的第一个模型；已保存的远程模型选择仍会保留。
+
+`protocol` 决定请求格式及流式响应解析，支持以下值：
+
+| protocol | API 路径（相对 base_url） | base_url 默认值 |
+| --- | --- | --- |
+| `responses`（默认） | `/responses` | `https://api.openai.com/v1` |
+| `chat-completions` | `/chat/completions` | `https://api.openai.com/v1` |
+| `anthropic` | `/messages` | `https://api.anthropic.com/v1` |
+
+**旧配置省略 `protocol` 时也会改走 Responses API。仅支持 Chat Completions 的端点需要显式填写 `"protocol": "chat-completions"`。** 不支持的值会在加载配置时报错。`base_url` 应填写 API 前缀，不包含 `responses` / `messages` / `chat/completions`；纯主机地址会补 `/v1`，Anthropic 的根地址或集成前缀也会补 `/v1`。
+
+三种协议均支持同步和异步流、文本与图片输入、自定义工具/MCP 工具循环、thinking 回调、取消、重试和 compact。`models.<name>.max_tokens` 会映射为 Responses 的 `max_output_tokens`，另外两种协议仍用 `max_tokens`；协议特有参数通过 `extra_body` 原样传入，例如 Responses 的 `reasoning`、Anthropic 的 `thinking`。请按端点能力设置输出上限及相关参数。
+
+Responses 使用 `store=false` 并将原生输出保存到本地 session；重载时可回放 reasoning items 和工具调用。Anthropic 保存原生 content blocks（包括 thinking signature）。原生数据仅在 provider、model 和 protocol 均匹配，且消息未被编辑时回放；否则使用通用消息和工具历史。Anthropic 的 system/developer 消息会合并到顶层 `system`。
+
+本机 Bifrost 的配置示例（模型名换成已配置且可用的 `provider/model`）：
+
+```json
+{
+  "providers": {
+    "bifrost-responses": {
+      "protocol": "responses",
+      "api_key": "local",
+      "base_url": "http://127.0.0.1:4011/v1",
+      "models": {"provider/model": {"max_tokens": 4096}}
+    },
+    "bifrost-chat": {
+      "protocol": "chat-completions",
+      "api_key": "local",
+      "base_url": "http://127.0.0.1:4011/v1",
+      "models": {"provider/model": {"max_tokens": 4096}}
+    },
+    "bifrost-anthropic": {
+      "protocol": "anthropic",
+      "api_key": "local",
+      "base_url": "http://127.0.0.1:4011/anthropic",
+      "models": {"provider/model": {"max_tokens": 4096}}
+    }
+  }
+}
+```
+
+若网关启用了鉴权，将 `api_key` 改为网关要求的 key。协议定义参考 [OpenAI Responses 工具调用](https://developers.openai.com/api/docs/guides/function-calling) 和 [Anthropic 流式消息](https://platform.claude.com/docs/en/build-with-claude/streaming)。
 
 ### MCP 服务器
 
@@ -182,7 +227,7 @@ pip install -e .
 }
 ```
 
-- `enabled=true` 的服务器会在 `Enkiball(auto_start_mcp=True)` 初始化时自动启动。
+- `enabled=true` 的服务器会在 `Enkiball(auto_start_mcp=True)` 初始化时自动启动（CLI 默认如此；库构造参数默认为 `False`）。
 - Stdio server 使用 `command`、`args`、`transport`，以及可选的环境变量映射 `environment`（兼容旧字段 `env`）；配置值会覆盖同名宿主环境变量。
 - 远程 server 使用 `url`；`type=streamable-http` 时走 Streamable HTTP，否则默认按 SSE 处理。
 
@@ -300,19 +345,59 @@ with Enkiball() as agent:
 全部内容会作为 `<sys-notice>` 附加到工具结果中并一次性消费；如果模型没有调用
 工具，通知会继续留在队列中，不会插入或中断当前对话流。
 
-配置文件路径可通过构造参数覆盖：
+配置有四种传入方式，互斥：
 
 ```python
+# 1. 默认：读取（首次运行时创建）~/.config/enkiball/enki.json
+agent = Enkiball()
+
+# 2. 指定文件；显式传入的路径必须已存在，否则抛 FileNotFoundError
 agent = Enkiball(config_path="/path/to/custom/enki.json")
+
+# 3. 内存配置，不读写配置文件
+agent = Enkiball(config={
+    "providers": {
+        "local": {
+            "protocol": "chat-completions",
+            "api_key": "",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "models": {"qwen3:9b": {"max_tokens": 2048}},
+        }
+    }
+})
+
+# 4. 单 provider 快捷参数
+agent = Enkiball(
+    api_key="sk-xxx",
+    base_url="https://api.openai.com/v1",
+    model="gpt-4o",
+    protocol="responses",
+)
+```
+
+快捷参数会生成一个名为 `default` 的 provider；`protocol` 省略时为 `responses`，`base_url` 省略时按协议取默认值。`extra_config` 可把 `system_prompt`、`auto_compact`、`mcp` 等字段合并进生成的配置。`api_key` 允许为空串，用于 Ollama、LM Studio 这类不校验鉴权的本地端点（此时不发送鉴权头）。
+
+`persist=False` 会让实例完全不写用户配置目录：不创建 config/state 文件，运行时的 provider/model/thinking 选择只留在内存，session 也只在进程内保存（导出需要显式 `out_path`）。适合测试和嵌入式场景。
+
+```python
+agent = Enkiball(config={...}, persist=False)
 ```
 
 ### Enkiball 构造参数
 
+`config_path` 之后的所有参数均为 keyword-only。
+
 ```python
 agent = Enkiball(
-    config_path="~/.config/enkiball/enki.json",
+    config_path=None,          # 省略则用默认路径；显式传入时必须存在
+    config=None,
+    api_key=None,
+    base_url=None,
+    protocol=None,
+    extra_config=None,
+    persist=True,
     system_prompt=None,
-    auto_start_mcp=True,
+    auto_start_mcp=False,
     on_tool_event=None,
     session_dir=None,
     cwd=None,
@@ -323,14 +408,17 @@ agent = Enkiball(
     sandbox_network="none",
     sandbox_env=None,
     sandbox_inherit_env=None,
-    state_path="~/.config/enkiball/state.json",
+    model=None,
+    state_path=None,
     skill_dirs=None,
 )
 ```
 
-- `config_path` — 配置文件路径，默认 `~/.config/enkiball/enki.json`。
+- `config_path` — 配置文件路径，默认 `~/.config/enkiball/enki.json`（首次使用时自动创建）。显式传入但不存在的路径会抛 `FileNotFoundError`，避免拼错目录名时静默得到一份默认配置。所有路径参数都会展开 `~`。
+- `config` / `api_key` / `base_url` / `protocol` / `extra_config` — 见上文；不能与 `config_path` 同时使用。
+- `persist` — 是否把运行时状态和 session 写入磁盘，默认 `True`。
 - `system_prompt` — 覆盖配置文件中的 system prompt。
-- `auto_start_mcp` — 初始化时是否启动配置中 `enabled=true` 的 MCP server。
+- `auto_start_mcp` — 初始化时是否启动配置中 `enabled=true` 的 MCP server，默认 `False`；CLI 会显式启用。
 - `on_tool_event` — 工具调用事件回调，签名为 `(event: str) -> None`。
 - `session_dir` — session JSON 文件存储目录。session 存储位置只允许通过这个构造参数自定义。
 - `cwd` — 内置文件和命令工具的工作目录，默认是创建 agent 时的当前目录。
@@ -341,8 +429,9 @@ agent = Enkiball(
 - `sandbox_network` — 沙箱命令的网络模式：`"none"`（默认，隔离网络）或 `"host"`（共享宿主网络，包括 localhost、LAN 和互联网）。
 - `sandbox_env` — 显式传给沙箱命令的环境变量映射。
 - `sandbox_inherit_env` — 允许从宿主继承的环境变量名称列表；名称不存在时拒绝执行。
-- `state_path` — active provider/model 的持久化状态文件。已启动实例始终独立；不同 harness 可传不同路径，进一步隔离下次启动的默认选择。
+- `state_path` — active provider/model 的持久化状态文件；`persist=True` 且未指定时使用默认路径，`persist=False` 时只留在内存。已启动实例始终独立；不同 harness 可传不同路径，进一步隔离下次启动的默认选择。
 - `skill_dirs` — 包含 skill 子目录的目录列表。默认扫描 `~/.config/enkiball/skills`；传入空列表可禁用 skills。
+- `model` — 构造时的模型覆盖，不写入 state。
 
 `Enkiball` 支持 context manager。退出 `with` 块时会调用 `shutdown()` 停止后台 executor 和 MCP server。
 
@@ -488,11 +577,12 @@ print(agent.list_models(remote=False))
 
 - `config` — 当前配置的深拷贝。
 - `provider` — 当前 provider 名称。
+- `protocol` — 当前 provider 的协议，只读；切换 provider 时随之更新。CLI `/provider` 同时显示协议。
 - `providers` — 所有 provider 配置。
 - `model` — 当前模型名，可读写。
-- `switch_provider(name)` — 切换 provider，返回是否成功并持久化选择。
-- `switch_model(model)` — 切换模型并持久化选择。
-- `list_models(provider_name=None, remote=True, timeout=5.0)` — 返回 config 模型和远程发现模型的合并列表。
+- `switch_provider(name, persist=None)` — 切换 provider，返回是否成功。`persist` 省略时跟随构造参数；agent 持久化状态时写入 `state.json`，传 `False` 可只在本进程内切换。
+- `switch_model(model, persist=None)` — 切换模型，持久化语义同上。
+- `list_models(provider_name=None, remote=True, timeout=5.0)` — 以端点 `/models` 结果为准，再合并 config 中手写的模型：远程模型在前，仅 config 中出现的模型追加在后，同名以 config 条目为准。手写条目的典型用途是为个别模型指定 `max_tokens`、`context_window` 等参数，而不是限制可选范围。`api_key` 为空时仍会请求端点，只是不发送鉴权头。传 `remote=False` 时只返回 config 中的条目。
 
 ### System prompt、thinking 和 token 统计
 
@@ -587,7 +677,7 @@ sessions = agent.list_sessions()
 record = agent.load_session(sessions[0].session_id)
 ```
 
-- `session_store` — 当前绑定的 `SessionStore`。
+- `session_store` — 当前绑定的 `SessionStore`。`persist=False` 的 agent 使用内存 store（`store.persist is False`），session 不落盘，`export_session` 需要显式 `out_path`。
 - `save_session(name=None)` — 保存当前消息为 session。
 - `load_session(session_id)` — 加载 session，恢复消息历史、compact 边界和累计用量。
 - `list_sessions()` — 列出已持久化 session。
@@ -893,6 +983,7 @@ src/enkiball/
 ├── mcp.py               MCPManager
 ├── mcp_client.py        MCP transport client
 ├── message_codec.py     消息、图片和 API payload 编解码
+├── protocols.py         三种 provider 协议的请求转换与流式事件适配
 ├── sandbox.py           目录权限和 Linux 命令沙箱
 ├── session_store.py     会话持久化和导出
 ├── skills.py            Agent Skills 发现、验证和按需加载
@@ -913,3 +1004,11 @@ uvx twine check --strict dist/*
 ```
 
 发布构建脚本生成 wheel 和源码包，并清除源码归档中的本机文件所有者与时间戳。产物位于 `dist/`。
+
+手动运行 Bifrost 联调（会调用真实模型；不包含在默认测试集中）：
+
+```bash
+python scripts/test_bifrost_protocols.py --base-url http://127.0.0.1:4011 --model provider/model
+```
+
+可用 `--protocol responses` 仅测试一个协议，`BIFROST_API_KEY` 环境变量用于传入网关 key。联调覆盖工具循环、会话保存/重载、异步回复、异步 compact 和 usage。

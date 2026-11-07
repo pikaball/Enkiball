@@ -3,6 +3,7 @@ MANIFEST.in
 README.md
 pyproject.toml
 scripts/build_release.py
+scripts/test_bifrost_protocols.py
 src/enkiball/__init__.py
 src/enkiball/agent.py
 src/enkiball/cli.py
@@ -17,6 +18,7 @@ src/enkiball/mcp.py
 src/enkiball/mcp_client.py
 src/enkiball/message_codec.py
 src/enkiball/persistence.py
+src/enkiball/protocols.py
 src/enkiball/sandbox.py
 src/enkiball/session_store.py
 src/enkiball/skills.py
@@ -41,6 +43,7 @@ tests/test_mcp_interrupt.py
 tests/test_mcp_sse.py
 tests/test_notice.py
 tests/test_persistence.py
+tests/test_protocols.py
 tests/test_read_image.py
 tests/test_request_retry.py
 tests/test_sandbox.py
