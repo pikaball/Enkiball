@@ -1,11 +1,274 @@
 from __future__ import annotations
 
+import inspect
 import json
+import re
 import threading
-from typing import Any
+import types
+import typing
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from .sandbox import Sandbox, TurnInterrupted
 from .tools import DEFAULT_READ_END, edit_file, read_file, read_image, write_file
+
+BUILTIN_TOOL_NAMES = frozenset({"read_image", "read_file", "write_file", "edit", "run_command"})
+
+
+@dataclass
+class ToolCallContext:
+    """Context passed to tool execution before-hooks."""
+
+    name: str
+    args: dict[str, Any]
+    call_id: str = ""
+    agent: Any = None
+
+
+@dataclass
+class ToolResultContext:
+    """Context passed to tool execution after-hooks."""
+
+    name: str
+    args: dict[str, Any]
+    call_id: str = ""
+    result: Any = None
+    duration_sec: float = 0.0
+    error: Exception | None = None
+    agent: Any = None
+
+
+@dataclass
+class ToolHook:
+    """Lifecycle hook for intercepting tool calls before and after execution."""
+
+    before: Callable[[ToolCallContext], None] | None = None
+    after: Callable[[ToolResultContext], None] | None = None
+
+
+def _type_to_json_type(ann: Any) -> str:
+    if ann is inspect.Parameter.empty or ann is typing.Any:
+        return "string"
+    if isinstance(ann, str):
+        low = ann.lower().strip()
+        if low in ("int", "integer"):
+            return "integer"
+        if low in ("float", "number"):
+            return "number"
+        if low in ("bool", "boolean"):
+            return "boolean"
+        if low.startswith(("list", "sequence", "iterable", "tuple")):
+            return "array"
+        if low.startswith(("dict", "mapping")):
+            return "object"
+        if "optional[" in low or "union[" in low:
+            for candidate in ("int", "float", "bool", "list", "dict", "str"):
+                if candidate in low:
+                    return _type_to_json_type(candidate)
+        return "string"
+
+    origin = typing.get_origin(ann)
+    if origin in (typing.Union, getattr(types, "UnionType", None)):
+        args = [a for a in typing.get_args(ann) if a is not type(None)]
+        if len(args) == 1:
+            return _type_to_json_type(args[0])
+        return "string"
+    if origin in (list, tuple, typing.Sequence, typing.Iterable):
+        return "array"
+    if origin in (dict, typing.Mapping):
+        return "object"
+    if isinstance(ann, type):
+        if issubclass(ann, str):
+            return "string"
+        if issubclass(ann, bool):
+            return "boolean"
+        if issubclass(ann, int):
+            return "integer"
+        if issubclass(ann, float):
+            return "number"
+    return "string"
+
+
+def _parse_docstring(doc: str) -> tuple[str, dict[str, str]]:
+    if not doc:
+        return "", {}
+    lines = doc.strip().splitlines()
+    desc_lines: list[str] = []
+    param_docs: dict[str, str] = {}
+    current_param: str | None = None
+    in_args = False
+
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^(?:Args|Arguments|Parameters):\s*$", stripped, re.IGNORECASE):
+            in_args = True
+            current_param = None
+            continue
+
+        sphinx_match = re.match(r"^:param\s+(\w+):\s*(.*)$", stripped)
+        if sphinx_match:
+            current_param = sphinx_match.group(1)
+            param_docs[current_param] = sphinx_match.group(2).strip()
+            in_args = False
+            continue
+
+        if in_args:
+            m = re.match(r"^(\w+)(?:\s*\([^)]*\))?:\s*(.*)$", stripped)
+            if m:
+                current_param = m.group(1)
+                param_docs[current_param] = m.group(2).strip()
+                continue
+            elif current_param and (line.startswith(" ") or line.startswith("\t")):
+                param_docs[current_param] += " " + stripped
+                continue
+            elif not stripped:
+                continue
+            else:
+                in_args = False
+
+        if not in_args:
+            desc_lines.append(line)
+
+    summary = "\n".join(desc_lines).strip()
+    return summary, param_docs
+
+
+def _is_single_dict_param(params: list[inspect.Parameter]) -> bool:
+    if len(params) != 1:
+        return False
+    p = params[0]
+    if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+        return False
+    if p.name in ("args", "_args", "arguments", "payload", "data", "params"):
+        return True
+    if p.annotation in (dict, typing.Mapping, Any):
+        return True
+    origin = typing.get_origin(p.annotation)
+    if origin in (dict, typing.Mapping):
+        return True
+    if p.annotation is inspect.Parameter.empty:
+        return True
+    return False
+
+
+def generate_tool_schema(
+    fn: Callable[..., Any],
+    name: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Derive an OpenAI-compatible function schema from a callable's signature and docstring."""
+    tool_name = name or getattr(fn, "__name__", "unnamed_tool")
+    doc_summary, param_docs = _parse_docstring(fn.__doc__ or "")
+    tool_desc = description or doc_summary or f"Custom tool: {tool_name}"
+
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": tool_desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": True,
+                },
+            },
+        }
+
+    params = list(sig.parameters.values())
+
+    if _is_single_dict_param(params):
+        return {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": tool_desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": True,
+                },
+            },
+        }
+
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+
+    try:
+        hints = typing.get_type_hints(fn)
+    except Exception:
+        hints = {}
+
+    for param in params:
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+
+        ann = hints.get(param.name, param.annotation)
+        p_type = _type_to_json_type(ann)
+        p_desc = param_docs.get(param.name, "")
+        p_spec: dict[str, Any] = {"type": p_type}
+        if p_desc:
+            p_spec["description"] = p_desc
+
+        if param.default is inspect.Parameter.empty:
+            origin = typing.get_origin(ann)
+            if origin in (typing.Union, getattr(types, "UnionType", None)) and type(None) in typing.get_args(ann):
+                pass
+            else:
+                required.append(param.name)
+        else:
+            p_spec["default"] = param.default
+
+        properties[param.name] = p_spec
+
+    return {
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": tool_desc,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def wrap_tool_callable(fn: Callable[..., Any]) -> tuple[Callable[[dict[str, Any]], Any], bool]:
+    """Wrap a tool callable to handle argument unpacking and preserve async status."""
+    is_async = inspect.iscoroutinefunction(fn)
+
+    try:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+    except (ValueError, TypeError):
+        return fn, is_async
+
+    if _is_single_dict_param(params):
+        return fn, is_async
+
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+    accepted = {p.name for p in params if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)}
+
+    if is_async:
+        async def async_unpacker(args: dict[str, Any]) -> Any:
+            kwargs = args if has_var_kw else {k: v for k, v in args.items() if k in accepted}
+            return await fn(**kwargs)
+
+        async_unpacker._is_async = True  # type: ignore[attr-defined]
+        async_unpacker.__name__ = getattr(fn, "__name__", "async_tool")
+        return async_unpacker, True
+    else:
+        def sync_unpacker(args: dict[str, Any]) -> Any:
+            kwargs = args if has_var_kw else {k: v for k, v in args.items() if k in accepted}
+            return fn(**kwargs)
+
+        sync_unpacker.__name__ = getattr(fn, "__name__", "sync_tool")
+        return sync_unpacker, False
 
 
 class ImageToolResult(str):

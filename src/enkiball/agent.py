@@ -87,7 +87,21 @@ from .llm import (
     SYSTEM_PROMPT,
     TokenUsage,
 )
-from .mcp import MCPManager
+from .llm_tools import (
+    ToolCallContext,
+    ToolHook,
+    ToolResultContext,
+    generate_tool_schema,
+    wrap_tool_callable,
+)
+from .mcp import (
+    MCPManager,
+    MCPServerConfig,
+    SSEMCPServer,
+    StdioMCPServer,
+    StreamableHTTPMCPServer,
+)
+from .mcp_client import MCPClient
 from .sandbox import ApprovalHandler, Sandbox
 from .session_store import SessionRecord, SessionStore
 from .skills import DEFAULT_SKILL_DIR, Skill, SkillRegistry
@@ -272,6 +286,8 @@ class Enkiball:
         state_path: str | Path | None = None,
         skill_dirs: list[str | Path] | None = None,
         ro_permissions: list[str | Path] | None = None,
+        builtin_tools: bool | Iterable[str] | None = None,
+        tool_hooks: list[ToolHook] | None = None,
     ) -> None:
         inline = [config is not None, api_key is not None or base_url is not None]
         if config_path is not None and any(inline):
@@ -323,8 +339,16 @@ class Enkiball:
         self._mcp = MCPManager(self._config)
         self.notice_queue: list[str] = _NoticeQueue()
         self._engine = ChatEngine(
-            self._config, self._mcp, self._sandbox, state_path=self._state_path,
-            model=model, state=state, persist_state=self._persist,
+            self._config,
+            self._mcp,
+            self._sandbox,
+            state_path=self._state_path,
+            model=model,
+            state=state,
+            persist_state=self._persist,
+            builtin_tools=builtin_tools,
+            tool_hooks=tool_hooks,
+            agent=self,
         )
         self._engine.notice_queue = self.notice_queue
         self._on_tool_event = on_tool_event
@@ -546,8 +570,10 @@ class Enkiball:
                 return subprocess.check_output(["ping", "-c1", args["host"]]).decode()
         """
 
-        def _do_register(fn: Callable[[dict[str, Any]], Any]) -> Callable[[dict[str, Any]], Any]:
-            tool_name = name or fn.__name__
+        def _do_register(fn: Callable[..., Any]) -> Callable[..., Any]:
+            tool_name = name or getattr(fn, "__name__", "unnamed_tool")
+            wrapped_fn, _ = wrap_tool_callable(fn)
+
             if schema is not None:
                 full_schema = schema
                 # Normalize and extract canonical name
@@ -556,30 +582,56 @@ class Enkiball:
                     tool_name_eff = fn_block.get("name", tool_name)
                 else:
                     tool_name_eff = tool_name
-            else:
-                params = parameters or {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": True,
-                }
+            elif parameters is not None:
                 full_schema = {
                     "type": "function",
                     "function": {
                         "name": tool_name,
                         "description": description or (fn.__doc__ or "").strip()
                         or f"Custom tool: {tool_name}",
-                        "parameters": params,
+                        "parameters": parameters,
                     },
                 }
                 tool_name_eff = tool_name
+            else:
+                full_schema = generate_tool_schema(fn, name=tool_name, description=description)
+                tool_name_eff = tool_name
 
-            self._engine.register_tool(tool_name_eff, full_schema, fn)
+            self._engine.register_tool(tool_name_eff, full_schema, wrapped_fn)
             return fn
 
         if func is None:
             # Used as decorator with kwargs
             return _do_register  # type: ignore[return-value]
         return _do_register(func)
+
+    def tool(
+        self,
+        func: Callable[..., Any] | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        parameters: dict[str, Any] | None = None,
+        schema: dict[str, Any] | None = None,
+    ) -> Any:
+        """Register a tool with auto-derived schema, type validation, and kwargs unpacking."""
+        return self.register_tool(
+            func,
+            name=name,
+            description=description,
+            parameters=parameters,
+            schema=schema,
+        )
+
+    def add_tool_hook(
+        self,
+        before: Callable[[ToolCallContext], None] | None = None,
+        after: Callable[[ToolResultContext], None] | None = None,
+    ) -> ToolHook:
+        """Register a lifecycle hook for tool execution."""
+        hook = ToolHook(before=before, after=after)
+        self._engine.add_tool_hook(hook)
+        return hook
 
     def unregister_tool(self, name: str) -> bool:
         """Remove a previously registered custom tool.  Returns True if found."""
@@ -1262,6 +1314,35 @@ class Enkiball:
     def mcp(self) -> MCPManager:
         """Direct access to the MCP manager."""
         return self._mcp
+
+    def add_mcp_server(
+        self,
+        name: str,
+        config: MCPServerConfig | Mapping[str, Any],
+        start: bool = False,
+        save: bool = False,
+    ) -> tuple[bool, str]:
+        """Add an MCP server definition and optionally start it or persist to config."""
+        ok, msg = self._mcp.add_server(name, config, start=start)
+        if ok and save:
+            self._save_config()
+        return ok, msg
+
+    def remove_mcp_server(self, name: str, save: bool = False) -> bool:
+        """Remove an MCP server definition and stop it."""
+        existed = self._mcp.remove_server(name)
+        if existed and save:
+            self._save_config()
+        return existed
+
+    def register_mcp_client(
+        self,
+        name: str,
+        client: MCPClient,
+        start: bool = True,
+    ) -> tuple[bool, str]:
+        """Directly register an existing MCPClient instance."""
+        return self._mcp.register_client(name, client, start=start)
 
     def mcp_enable(self, name: str, save: bool = False) -> bool:
         """Enable an MCP server in config and start it."""

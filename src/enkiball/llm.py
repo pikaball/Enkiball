@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import copy
+import inspect
 import json
 import mimetypes
 import threading
@@ -29,7 +31,15 @@ from .config import (
     set_active_model,
     set_active_provider,
 )
-from .llm_tools import ImageToolResult, TOOL_SCHEMAS, dispatch_tool
+from .llm_tools import (
+    BUILTIN_TOOL_NAMES,
+    ImageToolResult,
+    TOOL_SCHEMAS,
+    ToolCallContext,
+    ToolHook,
+    ToolResultContext,
+    dispatch_tool,
+)
 from .interruptible_http import InterruptibleAsyncTransport, InterruptibleTransport
 from .message_codec import (
     build_user_content,
@@ -165,6 +175,9 @@ class ChatEngine:
         state: dict[str, Any] | None = None,
         *,
         persist_state: bool = True,
+        builtin_tools: bool | Iterable[str] | None = None,
+        tool_hooks: list[ToolHook] | None = None,
+        agent: Any = None,
     ) -> None:
         self.config = config
         self.state_path = Path(state_path).expanduser() if state_path is not None else None
@@ -177,6 +190,13 @@ class ChatEngine:
         self._model_override = model
         self.mcp_manager = mcp_manager
         self.sandbox = sandbox or Sandbox()
+        self.agent = agent
+        self.builtin_tools = builtin_tools
+        if isinstance(builtin_tools, (list, tuple, set, frozenset)):
+            self._enabled_builtin_names: set[str] = set(builtin_tools)
+        else:
+            self._enabled_builtin_names = set(BUILTIN_TOOL_NAMES)
+        self.tool_hooks: list[ToolHook] = list(tool_hooks) if tool_hooks else []
         # Use system prompt from config if set, otherwise use default
         prompt = get_system_prompt(config) or SYSTEM_PROMPT
         self._system_prompt = prompt
@@ -586,10 +606,23 @@ class ChatEngine:
         ))
         return AsyncProtocolClient(client, self.protocol, get_active_provider(self.config, state=self.state))
 
+    def _is_builtin_tool_enabled(self, name: str) -> bool:
+        if self.builtin_tools is False:
+            return False
+        if self.builtin_tools is True or self.builtin_tools is None:
+            return True
+        return name in self._enabled_builtin_names
+
+    def add_tool_hook(self, hook: ToolHook) -> None:
+        self.tool_hooks.append(hook)
+
     def _get_tools(self) -> list[dict[str, Any]]:
-        tools = copy.deepcopy(TOOL_SCHEMAS)
-        for schema in tools:
-            if self._tool_schema_name(schema) == "run_command":
+        tools: list[dict[str, Any]] = []
+        for schema in copy.deepcopy(TOOL_SCHEMAS):
+            tool_name = self._tool_schema_name(schema)
+            if not self._is_builtin_tool_enabled(tool_name):
+                continue
+            if tool_name == "run_command":
                 context = self.sandbox.command_context
                 schema["function"]["description"] += (
                     " Current execution context (overrides defaults above): "
@@ -607,6 +640,7 @@ class ChatEngine:
                         " Host execution approval is unavailable: privilleged=true "
                         "will be denied. Report the access requirement if it blocks the task."
                     )
+            tools.append(schema)
         tools.extend(copy.deepcopy(list(self._internal_tools.values())))
         tools.extend(self._custom_tool_schemas)
         if self.mcp_manager:
@@ -877,11 +911,46 @@ class ChatEngine:
         name: str,
         args: dict[str, Any],
         turn: TurnContext | None = None,
+        call_id: str = "",
     ) -> str:
-        result = self._dispatch_tool_raw(name, args, turn)
-        if isinstance(result, ImageToolResult):
-            return ImageToolResult(self._attach_sys_notices(result), result.image_url)
-        return self._attach_sys_notices(result)
+        call_ctx = ToolCallContext(name=name, args=args, call_id=call_id, agent=self.agent)
+        for hook in self.tool_hooks:
+            if hook.before:
+                try:
+                    hook.before(call_ctx)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("tool hook 'before' error: %s", exc)
+
+        t0 = time.perf_counter()
+        err: Exception | None = None
+        raw_res: Any = None
+        try:
+            raw_res = self._dispatch_tool_raw(name, args, turn)
+            if isinstance(raw_res, ImageToolResult):
+                final_res = ImageToolResult(self._attach_sys_notices(raw_res), raw_res.image_url)
+            else:
+                final_res = self._attach_sys_notices(raw_res)
+            return final_res
+        except Exception as exc:
+            err = exc
+            raise
+        finally:
+            duration = time.perf_counter() - t0
+            res_ctx = ToolResultContext(
+                name=name,
+                args=args,
+                call_id=call_id,
+                result=raw_res,
+                duration_sec=duration,
+                error=err,
+                agent=self.agent,
+            )
+            for hook in self.tool_hooks:
+                if hook.after:
+                    try:
+                        hook.after(res_ctx)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("tool hook 'after' error: %s", exc)
 
     def _dispatch_tool_raw(
         self,
@@ -892,7 +961,30 @@ class ChatEngine:
         handler = self._internal_tool_handlers.get(name) or self._tool_handlers.get(name)
         if handler is not None:
             try:
-                result = handler(args)
+                if inspect.iscoroutinefunction(handler):
+                    coro = handler(args)
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    if loop and loop.is_running():
+                        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                            result = pool.submit(asyncio.run, coro).result()
+                    else:
+                        result = asyncio.run(coro)
+                else:
+                    result = handler(args)
+                    if inspect.iscoroutine(result):
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            loop = None
+                        if loop and loop.is_running():
+                            with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                                result = pool.submit(asyncio.run, result).result()
+                        else:
+                            result = asyncio.run(result)
+
                 if isinstance(result, str):
                     return result
                 # Allow returning dict/list — JSON-encode for the LLM
@@ -905,6 +997,11 @@ class ChatEngine:
                 return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
         if not name.startswith("mcp__"):
+            if not self._is_builtin_tool_enabled(name):
+                return json.dumps(
+                    {"ok": False, "error": f"tool '{name}' is not enabled"},
+                    ensure_ascii=False,
+                )
             return dispatch_tool(
                 name,
                 args,
@@ -1396,7 +1493,7 @@ class ChatEngine:
                     try:
                         if self._should_stop(turn, should_stop):
                             raise TurnInterrupted
-                        result = self._dispatch_tool(tc.name, args, turn)
+                        result = self._dispatch_tool(tc.name, args, turn, call_id=tc.tool_call_id)
                     except TurnInterrupted:
                         turn.cancel()
                         self._record_interrupted_tool_calls(tool_calls, index)
@@ -1415,23 +1512,82 @@ class ChatEngine:
     # ========================================================================
 
     async def _adispatch_tool(
-        self, name: str, args: dict[str, Any], turn: TurnContext
+        self,
+        name: str,
+        args: dict[str, Any],
+        turn: TurnContext,
+        call_id: str = "",
     ) -> str:
-        """Async tool dispatch.  Local tools run in a thread pool to avoid
-        blocking the event loop; MCP calls run via to_thread for now (the MCP
-        client is sync)."""
-        task = asyncio.create_task(
-            asyncio.to_thread(self._dispatch_tool, name, args, turn)
-        )
+        """Async tool dispatch with lifecycle hooks and native async tool support."""
+        call_ctx = ToolCallContext(name=name, args=args, call_id=call_id, agent=self.agent)
+        for hook in self.tool_hooks:
+            if hook.before:
+                try:
+                    hook.before(call_ctx)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("tool hook 'before' error: %s", exc)
+
+        t0 = time.perf_counter()
+        err: Exception | None = None
+        raw_res: Any = None
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            turn.cancel()
-            try:
-                await asyncio.shield(task)
-            except TurnInterrupted:
-                pass
+            handler = self._internal_tool_handlers.get(name) or self._tool_handlers.get(name)
+            if handler is not None and (
+                inspect.iscoroutinefunction(handler) or getattr(handler, "_is_async", False)
+            ):
+                try:
+                    res = handler(args)
+                    if inspect.iscoroutine(res):
+                        res = await res
+                    if isinstance(res, str):
+                        raw_res = res
+                    else:
+                        raw_res = json.dumps(
+                            {"ok": True, "result": res}, ensure_ascii=False, default=str
+                        )
+                except TurnInterrupted:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    raw_res = json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+            else:
+                task = asyncio.create_task(
+                    asyncio.to_thread(self._dispatch_tool_raw, name, args, turn)
+                )
+                try:
+                    raw_res = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    turn.cancel()
+                    try:
+                        await asyncio.shield(task)
+                    except TurnInterrupted:
+                        pass
+                    raise
+
+            if isinstance(raw_res, ImageToolResult):
+                final_res = ImageToolResult(self._attach_sys_notices(raw_res), raw_res.image_url)
+            else:
+                final_res = self._attach_sys_notices(raw_res)
+            return final_res
+        except Exception as exc:
+            err = exc
             raise
+        finally:
+            duration = time.perf_counter() - t0
+            res_ctx = ToolResultContext(
+                name=name,
+                args=args,
+                call_id=call_id,
+                result=raw_res,
+                duration_sec=duration,
+                error=err,
+                agent=self.agent,
+            )
+            for hook in self.tool_hooks:
+                if hook.after:
+                    try:
+                        hook.after(res_ctx)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("tool hook 'after' error: %s", exc)
 
     @staticmethod
     async def _acollect_stream_output(
@@ -1758,7 +1914,7 @@ class ChatEngine:
                     try:
                         if self._should_stop(turn, should_stop):
                             raise TurnInterrupted
-                        result = await self._adispatch_tool(tc.name, args, turn)
+                        result = await self._adispatch_tool(tc.name, args, turn, call_id=tc.tool_call_id)
                     except (TurnInterrupted, asyncio.CancelledError) as exc:
                         turn.cancel()
                         self._record_interrupted_tool_calls(tool_calls, index)

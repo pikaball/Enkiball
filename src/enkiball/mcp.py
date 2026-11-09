@@ -1,9 +1,81 @@
 from __future__ import annotations
 
 import threading
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal, Mapping
 
 from .mcp_client import MCPClient, SSEMCPClient, StdioMCPClient, StreamableHTTPMCPClient
+
+
+@dataclass
+class MCPServerConfig:
+    """Base class for MCP server configuration."""
+
+    enabled: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"enabled": self.enabled}
+
+
+@dataclass
+class StdioMCPServer(MCPServerConfig):
+    """Configuration for a local MCP server running via standard I/O."""
+
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    environment: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] | None = None
+    transport: Literal["jsonl", "content-length"] = "jsonl"
+
+    def to_dict(self) -> dict[str, Any]:
+        env_map = dict(self.environment)
+        if self.env:
+            env_map.update(self.env)
+        return {
+            "command": self.command,
+            "args": list(self.args),
+            "environment": env_map,
+            "transport": self.transport,
+            "enabled": self.enabled,
+        }
+
+
+@dataclass
+class SSEMCPServer(MCPServerConfig):
+    """Configuration for a remote MCP server using Server-Sent Events (SSE)."""
+
+    url: str = ""
+    headers: dict[str, str] | None = None
+    type: str = "sse"
+
+    def to_dict(self) -> dict[str, Any]:
+        res: dict[str, Any] = {
+            "url": self.url,
+            "type": self.type,
+            "enabled": self.enabled,
+        }
+        if self.headers:
+            res["headers"] = dict(self.headers)
+        return res
+
+
+@dataclass
+class StreamableHTTPMCPServer(MCPServerConfig):
+    """Configuration for a remote MCP server using Streamable HTTP."""
+
+    url: str = ""
+    headers: dict[str, str] | None = None
+    type: str = "streamable-http"
+
+    def to_dict(self) -> dict[str, Any]:
+        res: dict[str, Any] = {
+            "url": self.url,
+            "type": self.type,
+            "enabled": self.enabled,
+        }
+        if self.headers:
+            res["headers"] = dict(self.headers)
+        return res
 
 
 class MCPManager:
@@ -33,6 +105,75 @@ class MCPManager:
             if not isinstance(value, str) or "\0" in value:
                 raise ValueError(f"invalid MCP environment value for {name!r}")
         return merged
+
+    def add_server(
+        self,
+        name: str,
+        config: MCPServerConfig | Mapping[str, Any],
+        start: bool = False,
+    ) -> tuple[bool, str]:
+        """Add or update an MCP server in configuration and optionally start it."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("server name must be a non-empty string")
+        name = name.strip()
+
+        if isinstance(config, MCPServerConfig):
+            cfg_dict = config.to_dict()
+        elif isinstance(config, Mapping):
+            cfg_dict = dict(config)
+        else:
+            raise TypeError("config must be an MCPServerConfig or mapping")
+
+        servers = self.config.setdefault("mcp", {}).setdefault("servers", {})
+        servers[name] = cfg_dict
+
+        if start:
+            return self.start(name)
+        return True, f"server '{name}' added"
+
+    def remove_server(self, name: str) -> bool:
+        """Stop and remove a server from configuration and active clients."""
+        servers = self._servers()
+        existed = name in servers or name in self.clients
+        self.stop(name)
+        servers.pop(name, None)
+        return existed
+
+    def register_client(
+        self,
+        name: str,
+        client: MCPClient,
+        start: bool = True,
+    ) -> tuple[bool, str]:
+        """Directly register an existing MCPClient instance without modifying config."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("client name must be a non-empty string")
+        name = name.strip()
+        if not isinstance(client, MCPClient):
+            raise TypeError(f"expected MCPClient instance, got {type(client).__name__}")
+
+        if name in self.clients:
+            old = self.clients[name]
+            if old is not client and old.running:
+                old.close()
+
+        if start and not client.running:
+            try:
+                client.start()
+            except Exception as e:
+                return False, f"{name} failed to start: {e}"
+
+        self.clients[name] = client
+
+        summary = []
+        if client.tools:
+            summary.append(f"{len(client.tools)} tools")
+        if client.resources:
+            summary.append(f"{len(client.resources)} resources")
+        if client.prompts:
+            summary.append(f"{len(client.prompts)} prompts")
+        summary_str = ", ".join(summary) if summary else "no capabilities"
+        return True, f"{name} registered with {summary_str}"
 
     def start(self, name: str) -> tuple[bool, str]:
         if name in self.clients:
