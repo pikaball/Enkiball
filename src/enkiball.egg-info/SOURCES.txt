@@ -41,6 +41,7 @@ tests/test_lifecycle_regressions.py
 tests/test_mcp_config.py
 tests/test_mcp_interrupt.py
 tests/test_mcp_sse.py
+tests/test_modern_api.py
 tests/test_notice.py
 tests/test_persistence.py
 tests/test_protocols.py
