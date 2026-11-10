@@ -51,7 +51,9 @@ def read_file(path: str, start: int = 0, end: int = DEFAULT_READ_END) -> str:
     if end < start:
         raise ValueError("end must be greater than or equal to start")
     if end - start > MAX_LENGTH:
-        raise ValueError(f"length must be less than {MAX_LENGTH} for each read_file tool call")
+        raise ValueError(
+            f"length must be less than {MAX_LENGTH} for each read_file tool call"
+        )
     with target.open("r", encoding="utf-8") as f:
         remaining = start
         while remaining:
@@ -109,6 +111,15 @@ def edit_file(
 
     replacement_count = occurrences if replace_all else 1
     updated = content.replace(old_text, new_text, replacement_count)
+    # A file bind mount cannot be replaced by rename. Its contents remain
+    # writable according to the mount policy, so edit the mounted inode.
+    if _is_mountpoint(target):
+        with target.open("w", encoding="utf-8", newline="") as f:
+            f.write(updated)
+            f.flush()
+            os.fsync(f.fileno())
+        return str(target), replacement_count
+
     original_mode = stat.S_IMODE(target.stat().st_mode)
     temp_path: Path | None = None
     try:
@@ -132,3 +143,25 @@ def edit_file(
             temp_path.unlink()
 
     return str(target), replacement_count
+
+
+def _is_mountpoint(target: Path) -> bool:
+    if os.path.ismount(target):
+        return True
+    # ismount compares device numbers and misses same-filesystem bind mounts.
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+            for line in mounts:
+                path = line.split()[4]
+                for escaped, literal in (
+                    ("\\040", " "),
+                    ("\\011", "\t"),
+                    ("\\012", "\n"),
+                    ("\\134", "\\"),
+                ):
+                    path = path.replace(escaped, literal)
+                if path == str(target):
+                    return True
+    except FileNotFoundError:
+        pass
+    return False

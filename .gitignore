@@ -17,3 +17,7 @@ build/
 .coverage
 htmlcov/
 *.ipynb
+
+# Standalone sandbox build output
+sandbox/build/
+sandbox/*.egg-info/

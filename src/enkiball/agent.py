@@ -102,7 +102,7 @@ from .mcp import (
     StreamableHTTPMCPServer,
 )
 from .mcp_client import MCPClient
-from .sandbox import ApprovalHandler, Sandbox
+from .sandbox import ApprovalHandler, EnkiSandbox, Sandbox
 from .session_store import SessionRecord, SessionStore
 from .skills import DEFAULT_SKILL_DIR, Skill, SkillRegistry
 
@@ -241,9 +241,11 @@ class Enkiball:
     approval : bool
         Allow an interactive frontend to request access outside configured
         directories. Without a frontend, access is denied.
-    sandbox : bool
-        Use the command sandbox. When false, commands run directly in the host
-        environment. Defaults to true.
+    sandbox : EnkiSandbox | bool
+        Shared sandbox instance. True uses legacy directory configuration;
+        False explicitly runs on the host. A missing client uses host fallback.
+    sandbox_policy : Mapping[str, Any] | None
+        Filesystem, device, network, capability, seccomp and resource rules.
     sandbox_network : {"none", "host"}
         Network access for sandboxed commands. Defaults to ``"none"``.
     sandbox_env : Mapping[str, str] | None
@@ -278,7 +280,8 @@ class Enkiball:
         cwd: str | Path | None = None,
         dir_permissions: list[str | Path] | None = None,
         approval: bool = False,
-        sandbox: bool = True,
+        sandbox: bool | EnkiSandbox = True,
+        sandbox_policy: Mapping[str, Any] | None = None,
         sandbox_network: Literal["none", "host"] = "none",
         sandbox_env: Mapping[str, str] | None = None,
         sandbox_inherit_env: Iterable[str] | None = None,
@@ -322,6 +325,7 @@ class Enkiball:
             state=state,
         )
 
+        self._retired_sandbox_adapters = []
         self._sandbox = Sandbox(
             cwd,
             dir_permissions,
@@ -331,6 +335,7 @@ class Enkiball:
             env=sandbox_env,
             inherit_env=sandbox_inherit_env,
             ro_permissions=ro_permissions,
+            policy=sandbox_policy,
         )
         self._skill_registry = SkillRegistry(
             [DEFAULT_SKILL_DIR] if skill_dirs is None else skill_dirs
@@ -468,6 +473,34 @@ class Enkiball:
     @property
     def ro_permissions(self) -> tuple[Path, ...]:
         return self._sandbox.read_only_directories
+
+    @property
+    def sandbox_context(self) -> dict[str, object]:
+        """Current command sandbox settings."""
+        return self._sandbox.command_context
+
+    @property
+    def sandbox(self) -> EnkiSandbox:
+        """Sandbox used by subsequent built-in tool calls."""
+        return self._sandbox.runtime
+
+    @sandbox.setter
+    def sandbox(self, value: EnkiSandbox) -> None:
+        if not isinstance(value, EnkiSandbox):
+            raise TypeError('sandbox must be an EnkiSandbox')
+        value._check_open()
+        previous = self._sandbox
+        adapter = Sandbox(cwd=previous.cwd, sandbox=value,
+                          env=previous._env, inherit_env=previous._inherit_env)
+        self._sandbox = adapter
+        self._engine.sandbox = adapter
+        # Existing executions retain their adapter and sandbox identity.
+        if previous._binding is None:
+            self._retired_sandbox_adapters.append(previous)
+
+    def configure_sandbox(self, **settings: Any) -> None:
+        """Update sandbox settings for subsequent tool calls."""
+        self._sandbox.configure(**settings)
 
     def _set_approval_handler(self, handler: ApprovalHandler | None) -> None:
         self._sandbox.set_approval_handler(handler)
@@ -1415,7 +1448,14 @@ class Enkiball:
             self._bg_exec = None
         if ex is not None:
             ex.shutdown(wait=True, cancel_futures=True)
-        return self._mcp.stop_all()
+        errors = self._mcp.stop_all()
+        for adapter in [*self._retired_sandbox_adapters, self._sandbox]:
+            try:
+                adapter.close()
+            except Exception as error:
+                errors.append(str(error))
+        self._retired_sandbox_adapters.clear()
+        return errors
 
     def __enter__(self) -> Enkiball:
         return self

@@ -2,6 +2,21 @@ LICENSE
 MANIFEST.in
 README.md
 pyproject.toml
+sandbox/LICENSE
+sandbox/Makefile
+sandbox/README.md
+sandbox/install.sh
+sandbox/pyproject.toml
+sandbox/uninstall.sh
+sandbox/enkisandbox_runtime/__init__.py
+sandbox/enkisandbox_runtime/backend.py
+sandbox/enkisandbox_runtime/bpf.py
+sandbox/enkisandbox_runtime/isolation.py
+sandbox/enkisandbox_runtime/launcher.py
+sandbox/enkisandbox_runtime/policy.py
+sandbox/enkisandbox_runtime/resources.py
+sandbox/native/client.c
+sandbox/systemd/enkisandbox.service
 scripts/build_release.py
 scripts/test_bifrost_protocols.py
 src/enkiball/__init__.py
@@ -20,6 +35,7 @@ src/enkiball/message_codec.py
 src/enkiball/persistence.py
 src/enkiball/protocols.py
 src/enkiball/sandbox.py
+src/enkiball/sandbox_policy.py
 src/enkiball/session_store.py
 src/enkiball/skills.py
 src/enkiball/token_estimation.py
@@ -34,6 +50,7 @@ tests/test_capture.py
 tests/test_cli_renderer.py
 tests/test_edit_tool.py
 tests/test_efficiency.py
+tests/test_enkisandbox.py
 tests/test_foundation.py
 tests/test_http_interrupt.py
 tests/test_interrupt.py
@@ -48,6 +65,9 @@ tests/test_protocols.py
 tests/test_read_image.py
 tests/test_request_retry.py
 tests/test_sandbox.py
+tests/test_sandbox_backend.py
+tests/test_sandbox_integration.py
+tests/test_sandbox_policy.py
 tests/test_session_history.py
 tests/test_skills.py
 tests/test_stream_usage.py

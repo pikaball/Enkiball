@@ -1,0 +1,17 @@
+[Unit]
+Description=EnkiSandbox backend
+After=local-fs.target
+
+[Service]
+Type=exec
+ExecStart=/opt/enkisandbox/bin/enkisandbox-backend --authorization /etc/enkisandbox/authorization.json --socket-group ENKISANDBOX_GID
+Delegate=memory cpuset
+RuntimeDirectory=enkisandbox
+RuntimeDirectoryMode=0755
+KillMode=control-group
+TimeoutStopSec=30
+Restart=on-failure
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -33,11 +33,15 @@ from .mcp_client import (
     StdioMCPClient,
     StreamableHTTPMCPClient,
 )
+from .sandbox import EnkiSandbox, PermissionDeniedError, SandboxUnavailableError
 from .session_store import SessionRecord, SessionStore
 from .skills import Skill, SkillRegistry
 
 __all__ = [
     "Enkiball",
+    "EnkiSandbox",
+    "PermissionDeniedError",
+    "SandboxUnavailableError",
     "EnkiballCLI",
     "CommandHandler",
     "CommandContext",

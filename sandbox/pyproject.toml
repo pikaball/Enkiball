@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enkisandbox-runtime"
+version = "1.0.0"
+requires-python = ">=3.10"
+description = "Standalone local sandbox backend for Enkiball"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.scripts]
+enkisandbox-backend = "enkisandbox_runtime.backend:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["enkisandbox_runtime*"]

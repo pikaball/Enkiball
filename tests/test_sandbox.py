@@ -25,6 +25,7 @@ from enkiball.llm import ChatEngine
 from enkiball.llm_tools import dispatch_tool
 from enkiball.sandbox import (
     MAX_OUTPUT_BYTES,
+    EnkiSandbox,
     PermissionDeniedError,
     Sandbox,
     SandboxUnavailableError,
@@ -45,6 +46,23 @@ class DirectoryPermissionTests(unittest.TestCase):
         target = sandbox.resolve_path("nested/file.txt", "write")
 
         self.assertEqual(target, Path(self.workspace.name) / "nested/file.txt")
+
+    def test_reconfigure_changes_access_and_execution_context(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name)
+        target = Path(self.external.name) / "file.txt"
+        sandbox.configure(dir_permissions=[self.external.name], network="host", enabled=False)
+        self.assertEqual(sandbox.resolve_path(target, "write"), target)
+        self.assertEqual(sandbox.command_context["execution_mode"], "host")
+        sandbox.configure(dir_permissions=[], enabled=True, network="none")
+        with self.assertRaises(PermissionDeniedError):
+            sandbox.resolve_path(target, "read")
+        self.assertEqual(sandbox.command_context["network"], "host")  # Missing client: actual host mode.
+
+    def test_reconfigure_validation_is_atomic(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name)
+        with self.assertRaises(ValueError):
+            sandbox.configure(enabled=False, network="invalid")
+        self.assertTrue(sandbox.enabled)
 
     def test_external_path_is_denied_without_approval(self) -> None:
         sandbox = Sandbox(cwd=self.workspace.name)
@@ -157,6 +175,18 @@ class DirectoryPermissionTests(unittest.TestCase):
 
 
 class CommandContextTests(unittest.TestCase):
+    def setUp(self):
+        client = patch('enkiball.sandbox.shutil.which', return_value='/client')
+        client.start()
+        self.addCleanup(client.stop)
+        def rpc(op, **data):
+            if op == 'create':
+                return {'execution_mode': 'sandbox', 'sandbox_id': 'a' * 32, 'effective_policy': data['policy']}
+            return {'state': 'destroyed'}
+        backend = patch.object(EnkiSandbox, '_rpc', side_effect=rpc)
+        backend.start()
+        self.addCleanup(backend.stop)
+
     @staticmethod
     def description(engine):
         return next(
@@ -170,7 +200,7 @@ class CommandContextTests(unittest.TestCase):
             engine = ChatEngine({}, state={}, sandbox=sandbox)
             initial = self.description(engine)
             self.assertIn('"execution_mode": "sandbox"', initial)
-            self.assertIn('"network": "none"', initial)
+            self.assertIn('"network": {"outbound": []}', initial)
             self.assertIn('"privileged_approval_available": false', initial)
             sandbox.set_approval_handler(lambda path, operation: "always")
             sandbox.resolve_path(Path(external) / "file.txt", "read")
@@ -188,7 +218,7 @@ class CommandContextTests(unittest.TestCase):
             sandbox = Sandbox(cwd=workspace, network="host", env={"SECRET": "private-value"})
             engine = ChatEngine({}, state={}, sandbox=sandbox)
             description = self.description(engine)
-            self.assertIn('"network": "host"', description)
+            self.assertIn('"network": "all"', description)
             self.assertIn('"execution_mode": "sandbox"', description)
             self.assertNotIn("private-value", description)
             sandbox.enabled = False
@@ -302,158 +332,6 @@ class CliPermissionTests(unittest.TestCase):
             self._approval_from_input("\x03")
 
 
-@unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is not installed")
-class ExecSandboxTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.workspace = tempfile.TemporaryDirectory()
-        self.external = tempfile.TemporaryDirectory()
-        self.addCleanup(self.workspace.cleanup)
-        self.addCleanup(self.external.cleanup)
-        self.sandbox = Sandbox(cwd=self.workspace.name)
-
-    def test_command_runs_in_cwd_and_can_write_there(self) -> None:
-        code, stdout, stderr = self.sandbox.run("pwd; printf content > output.txt")
-
-        self.assertEqual(code, 0)
-        self.assertEqual(stdout.strip(), self.workspace.name)
-        self.assertEqual(stderr, "")
-        self.assertEqual(
-            (Path(self.workspace.name) / "output.txt").read_text(encoding="utf-8"),
-            "content",
-        )
-
-    def test_command_cannot_read_unconfigured_external_path(self) -> None:
-        secret = Path(self.external.name) / "secret.txt"
-        secret.write_text("secret", encoding="utf-8")
-
-        code, stdout, _ = self.sandbox.run(f"cat {secret} 2>/dev/null")
-
-        self.assertNotEqual(code, 0)
-        self.assertEqual(stdout, "")
-
-    def test_command_can_use_configured_external_directory(self) -> None:
-        secret = Path(self.external.name) / "data.txt"
-        secret.write_text("visible", encoding="utf-8")
-        sandbox = Sandbox(self.workspace.name, [self.external.name])
-
-        code, stdout, _ = sandbox.run(f"cat {secret}")
-
-        self.assertEqual(code, 0)
-        self.assertEqual(stdout, "visible")
-
-    def test_read_only_directory_is_mounted_read_only(self) -> None:
-        secret = Path(self.external.name) / "data.txt"
-        secret.write_text("visible", encoding="utf-8")
-        sandbox = Sandbox(self.workspace.name, approval=True)
-        sandbox.set_approval_handler(lambda path, operation: "always")
-        sandbox.resolve_path(secret, "read")
-
-        code, stdout, _ = sandbox.run(f"cat {secret}; printf changed > {secret}")
-
-        self.assertNotEqual(code, 0)
-        self.assertEqual(stdout, "visible")
-        self.assertEqual(secret.read_text(encoding="utf-8"), "visible")
-
-    def test_nested_read_only_directory_overrides_writable_cwd_mount(self) -> None:
-        protected = Path(self.workspace.name) / "protected"
-        protected.mkdir()
-        target = protected / "data.txt"
-        target.write_text("original", encoding="utf-8")
-        sandbox = Sandbox(
-            self.workspace.name,
-            network="host",
-            ro_permissions=[protected],
-        )
-
-        code, stdout, _ = sandbox.run(
-            f"cat {target}; printf changed > {target}"
-        )
-
-        self.assertNotEqual(code, 0)
-        self.assertEqual(stdout, "original")
-        self.assertEqual(target.read_text(encoding="utf-8"), "original")
-
-    def test_writable_mount_precedes_read_only_mount(self) -> None:
-        protected = Path(self.workspace.name) / "protected"
-        protected.mkdir()
-        sandbox = Sandbox(
-            self.workspace.name,
-            ro_permissions=[protected],
-        )
-
-        argv = sandbox._build_bwrap_command("true")
-        writable = argv.index("--bind")
-        protected_mount = argv.index(str(protected.resolve()))
-
-        self.assertLess(writable, protected_mount)
-
-    def test_network_is_unavailable(self) -> None:
-        code, _, _ = self.sandbox.run(
-            "python3 -c 'import socket; socket.create_connection((\"1.1.1.1\", 80), 1)'"
-        )
-
-        self.assertNotEqual(code, 0)
-
-    def test_host_network_does_not_unshare_network_namespace(self) -> None:
-        sandbox = Sandbox(cwd=self.workspace.name, network="host")
-
-        argv = sandbox._build_bwrap_command("true")
-
-        self.assertNotIn("--unshare-net", argv)
-
-    def test_default_network_unshares_network_namespace(self) -> None:
-        argv = self.sandbox._build_bwrap_command("true")
-
-        self.assertIn("--unshare-net", argv)
-
-    def test_sensitive_host_environment_is_not_inherited(self) -> None:
-        with patch.dict(os.environ, {"ENKIBALL_TEST_SECRET": "not-for-child"}):
-            code, stdout, _ = self.sandbox.run(
-                "printf %s \"${ENKIBALL_TEST_SECRET-unset}\""
-            )
-
-        self.assertEqual(code, 0)
-        self.assertEqual(stdout, "unset")
-
-    def test_environment_can_be_explicitly_set_and_inherited(self) -> None:
-        with patch.dict(os.environ, {"ENKIBALL_INHERITED": "host"}):
-            sandbox = Sandbox(
-                cwd=self.workspace.name,
-                env={"ENKIBALL_EXPLICIT": "configured"},
-                inherit_env=["ENKIBALL_INHERITED"],
-            )
-            child_env = sandbox._sandbox_environment()
-
-        self.assertEqual(child_env["ENKIBALL_EXPLICIT"], "configured")
-        self.assertEqual(child_env["ENKIBALL_INHERITED"], "host")
-
-    def test_missing_inherited_environment_is_rejected(self) -> None:
-        sandbox = Sandbox(
-            cwd=self.workspace.name,
-            inherit_env=["ENKIBALL_MISSING_ENV"],
-        )
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(ValueError, "is not set"):
-                sandbox._sandbox_environment()
-
-    def test_output_is_bounded(self) -> None:
-        _, stdout, _ = self.sandbox.run(
-            f"python3 -c 'import sys; sys.stdout.write(\"x\" * {MAX_OUTPUT_BYTES + 100})'"
-        )
-
-        self.assertLessEqual(len(stdout), MAX_OUTPUT_BYTES + len("\n...[truncated]"))
-        self.assertTrue(stdout.endswith("...[truncated]"))
-
-    def test_timeout_raises(self) -> None:
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.sandbox.run("sleep 5", timeout_sec=1)
-
-    def test_missing_backend_fails_closed(self) -> None:
-        with patch("enkiball.sandbox.shutil.which", return_value=None):
-            with self.assertRaises(SandboxUnavailableError):
-                self.sandbox.run("true")
-
-
 class HostExecTests(unittest.TestCase):
     def setUp(self) -> None:
         self.workspace = tempfile.TemporaryDirectory()
@@ -467,7 +345,7 @@ class HostExecTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"ENKIBALL_HOST_TEST": "inherited"}):
             with patch(
-                "enkiball.sandbox.Sandbox._build_bwrap_command",
+                "enkiball.sandbox.EnkiSandbox._rpc",
                 side_effect=AssertionError("bubblewrap must not be used"),
             ):
                 code, stdout, stderr = sandbox.run(

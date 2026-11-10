@@ -630,11 +630,14 @@ class ChatEngine:
                     + ". Directory lists describe sandbox mounts; when execution_mode "
                     "is host, command access follows host OS permissions."
                 )
-                if not self.sandbox.enabled:
+                if context["execution_mode"] == "host":
                     schema["function"]["description"] += (
                         " Sandboxing is disabled: commands already run on the host; "
                         "privilleged=true is unnecessary."
                     )
+                elif self.sandbox._binding is not None:
+                    schema["function"]["parameters"]["properties"].pop("privilleged", None)
+                    schema["function"]["description"] += " Policy is fixed for this sandbox instance."
                 elif not context["privileged_approval_available"]:
                     schema["function"]["description"] += (
                         " Host execution approval is unavailable: privilleged=true "

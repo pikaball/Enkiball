@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: enkiball
-Version: 0.1.8
+Version: 0.1.9
 Summary: A Python LLM foundation with a CLI and Python API
 License-Expression: GPL-3.0-only
 Keywords: agent,cli,llm,mcp,python
@@ -55,7 +55,7 @@ pip install -e .
 
 安装后 `enkiball` 命令全局可用，可在任意目录下启动。
 
-运行环境要求：Linux、Python `>=3.10`。默认命令沙箱需要系统安装 `bubblewrap`（Debian/Ubuntu：`sudo apt install bubblewrap`）。Python 依赖由 pip 自动安装。
+运行环境要求：Linux、Python `>=3.10`。沙箱运行时独立安装，见 [sandbox/README.md](sandbox/README.md)。Python 依赖由 pip 自动安装；缺少沙箱 client 时工具命令按当前宿主用户执行，实际模式可通过 `agent.sandbox_context` 检查。
 
 ## 配置
 
@@ -425,10 +425,32 @@ agent = Enkiball(
 - `dir_permissions` — 内置工具可以额外读写的目录列表；相对路径以 `cwd` 为基准。
 - `ro_permissions` — 内置工具只能读取的额外目录列表；相对路径以 `cwd` 为基准。
 - `approval` — 是否允许交互前端处理越界目录审批。API 没有绑定交互前端时仍会静默拒绝；CLI 提供 `once`、`always`、`deny` 三选项。
-- `sandbox` — 是否启用命令沙箱，默认 `True`；设为 `False` 时 `run_command` 直接继承宿主环境执行。
-- `sandbox_network` — 沙箱命令的网络模式：`"none"`（默认，隔离网络）或 `"host"`（共享宿主网络，包括 localhost、LAN 和互联网）。
-- `sandbox_env` — 显式传给沙箱命令的环境变量映射。
-- `sandbox_inherit_env` — 允许从宿主继承的环境变量名称列表；名称不存在时拒绝执行。
+- `sandbox` — 推荐传入共享的 `EnkiSandbox` 对象；`True` 保留旧版 cwd/目录配置适配，`False` 显式宿主执行。
+- `sandbox_network`、`sandbox_policy` — 旧版配置入口；新接口通过 `EnkiSandbox` 持有全部策略。
+- `sandbox_env`、`sandbox_inherit_env` — 每条任务的显式环境和继承变量，不修改共享实例策略。
+
+```python
+from enkiball import EnkiSandbox
+
+with EnkiSandbox(
+    filesystem=[{"path": "/work", "access": "write"}],
+    network={"outbound": []},
+    resources={"memory_bytes": 8 * 1024**3, "cpu_count": 4},
+) as sandbox:
+    agents = [Enkiball(sandbox=sandbox, cwd="/work") for _ in range(20)]
+    print(sandbox.execution_mode, sandbox.sandbox_id, sandbox.effective_policy)
+    for agent in agents:
+        agent.shutdown()
+```
+
+所有 Agent 的命令及后代共享实例预算。`agent.sandbox = other` 切换后续任务；旧任务继续使用原实例。`EnkiSandbox.attach(id)` 跨进程连接，关闭只 detach；创建对象的上下文退出销毁实例。单个 Agent 关闭不销毁外部传入的实例。`EnkiSandbox.host()` 显式宿主执行。
+
+策略创建后固定。相对路径以 `base_dir`（默认构造时当前目录）解析；新接口不自动授权 cwd。路径支持 read/write/deny，设备支持读写方向，网络支持 CIDR 与出口网卡配对，资源支持实例总内存和逻辑 CPU 数量，另有用户命名空间 capability 和 seccomp。完整语义、安装、授权、协议和测试见 [独立运行时文档](sandbox/README.md)。
+
+client 缺失时 `execution_mode="host"`、`effective_policy={}`，请求限制失效；client 已存在但连接、授权或策略失败时抛异常。文件工具在 sandbox 模式下进入 backend 执行，不绕过隔离。
+
+旧版 `configure_sandbox(...)` 仅用于 bool 构造的兼容 adapter：更改配置会创建新实例，旧实例保留到 Agent 关闭。传入 `EnkiSandbox` 后不接受原地配置或逐条宿主提权；请创建并切换实例。旧版目录授权仍作为文件工具的额外前置检查；新接口及缺少 client 的宿主回退遵循实际生效策略。
+
 - `state_path` — active provider/model 的持久化状态文件；`persist=True` 且未指定时使用默认路径，`persist=False` 时只留在内存。已启动实例始终独立；不同 harness 可传不同路径，进一步隔离下次启动的默认选择。
 - `skill_dirs` — 包含 skill 子目录的目录列表。默认扫描 `~/.config/enkiball/skills`；传入空列表可禁用 skills。
 - `model` — 构造时的模型覆盖，不写入 state。
@@ -874,7 +896,7 @@ agent.chat("Use $code-review to inspect the current changes")
 - `agent.load_skill(name, resource=None)` — 加载正文或相对资源。
 - `agent.reload_skills()` — 重新扫描并更新 `skill` 工具。
 
-skill 目录以只读方式加入 sandbox。`allowed-tools` 会被解析并保留，但不会授予工具权限；skill 中的脚本仍通过现有 `run_command`、sandbox 和审批规则执行。资源路径不得逃出所属 skill 目录，正文和单个 UTF-8 资源上限均为 64 KiB。
+旧版 bool 构造时 skill 目录以只读方式加入 sandbox；显式共享 EnkiSandbox 需要在创建策略中授权脚本和资源目录。`allowed-tools` 会被解析并保留，但不会授予工具权限；skill 中的脚本仍通过现有 `run_command`、sandbox 和审批规则执行。资源路径不得逃出所属 skill 目录，正文和单个 UTF-8 资源上限均为 64 KiB。
 
 ## CLI 嵌入和自定义命令
 
@@ -957,16 +979,14 @@ LLM 在对话中可以按需调用以下内置工具。这些工具是模型工�
 - `read_image` — 模型主动读取本地图片，参数为 `path`（绝对路径或相对 `cwd` 的路径），遵循文件读取权限。支持 PNG、JPEG、GIF、WebP，单图最大 20 MiB；图片内容会附加到下一次模型请求，需要模型及端点支持视觉输入，无需手动 `/image add`。会话保存读取时的图片快照，删除或修改原文件不影响回放，但会增加会话文件大小。
 - `write_file` — 写入或追加 UTF-8 文本文件。
 - `edit` — 精确替换现有 UTF-8 文本文件中的唯一匹配，支持 `replace_all`。
-- `run_command` — 执行 shell 命令并返回 exit code、stdout、stderr；默认使用 Linux bubblewrap 沙箱。可用 `privilleged=true` 请求一次性宿主执行审批。
+- `run_command` — 执行 shell 命令并返回 exit code、stdout、stderr；使用当前绑定的沙箱实例，并报告实际执行模式。
 - `skill` — 按需加载 skill 正文或其中的 UTF-8 资源；仅在发现到有效 skill 时注册。
 
-`run_command` 的工具说明会随请求更新当前执行模式、工作目录、网络模式、可写/只读挂载目录及特权审批是否可用。模型可在明确需要沙箱外访问时直接调用 `privilleged=true`，也可在诊断出沙箱限制后重试；该参数触发单次审批，以当前宿主用户执行，不代表 sudo/root 提权。审批不可用时会明确告知模型，禁用沙箱时也会注明命令已经在宿主执行。
+`run_command` 的说明包含实际执行模式、实例 ID、生效策略和工作目录。共享 `EnkiSandbox` 不进行逐条增量授权，`privilleged=true` 不能绕过实例；需要宿主执行时由开发者切换到 `EnkiSandbox.host()`。旧版 bool 构造保留一次性宿主审批兼容。
 
-文件工具只能访问 `cwd`、`dir_permissions` 和 `ro_permissions`；其中 `cwd` 与 `dir_permissions` 可写，`ro_permissions` 只读。命令工具使用相同挂载权限，其他宿主路径不可见，网络默认隔离，环境变量经过清理；可通过 `sandbox_network="host"` 共享宿主网络，通过 `sandbox_env` 或 `sandbox_inherit_env` 显式传入环境变量。裸 CLI 对应提供 `--sandbox-network {none,host}`、可重复的 `--sandbox-env NAME` 和 `--ro-permission DIR`。超时或 turn interrupt 会终止整个进程组。交互式 `read + always` 只授予只读目录并以 `--ro-bind` 挂载；write/edit 授权才允许写入。当前 exec 沙箱要求 Linux 和 `bubblewrap`；后端不可用时拒绝执行，不会自动退化为宿主 shell。`sandbox=False` 会显式关闭命令沙箱。沙箱启用时，`privilleged=true` 每次都只提供 `allow once` 或 `deny`，通过后该命令直接在宿主环境执行。
+read/write/edit/image 与命令使用同一个 backend、挂载和资源预算。任务取消或超时会回收对应 cgroup，包括脱离进程组的后代。缺少 client 时回退到宿主并明确报告实际模式；client 存在时的故障不会回退。CLI 保留 `--sandbox-network`、`--sandbox-env`、`--ro-permission` 和显式宿主模式 `--privilleged`。
 
-CLI 的 `--privilleged` 模式会显式关闭命令沙箱，并允许文件工具读写任意绝对路径。该模式是启动级授权，不再逐条审批命令。
-
-工具 schema 和分发逻辑位于 `src/enkiball/llm_tools.py`，文件实现位于 `src/enkiball/tools.py`，权限和命令沙箱位于 `src/enkiball/sandbox.py`。
+工具 schema 位于 `src/enkiball/llm_tools.py`，纯文件操作位于 `src/enkiball/tools.py`，SDK 对象及 client 适配位于 `src/enkiball/sandbox.py`；系统运行时位于独立目录 `sandbox/`。
 
 ## 项目结构
 
@@ -984,7 +1004,7 @@ src/enkiball/
 ├── mcp_client.py        MCP transport client
 ├── message_codec.py     消息、图片和 API payload 编解码
 ├── protocols.py         三种 provider 协议的请求转换与流式事件适配
-├── sandbox.py           目录权限和 Linux 命令沙箱
+├── sandbox.py           EnkiSandbox 对象和 client 适配
 ├── session_store.py     会话持久化和导出
 ├── skills.py            Agent Skills 发现、验证和按需加载
 ├── token_estimation.py  当前上下文的本地 token 估算

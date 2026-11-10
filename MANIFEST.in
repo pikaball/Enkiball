@@ -3,6 +3,9 @@ include scripts/build_release.py
 include scripts/test_bifrost_protocols.py
 recursive-include src/enkiball *.py
 recursive-include tests *.py
+recursive-include sandbox *.py *.c *.sh *.toml *.service *.md Makefile LICENSE
 prune build
 prune dist
+prune sandbox/build
+prune sandbox/enkisandbox_runtime.egg-info
 global-exclude *.py[cod] __pycache__ .env .env.* .pypirc *.key *.ipynb

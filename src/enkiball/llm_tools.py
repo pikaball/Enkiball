@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .sandbox import Sandbox, TurnInterrupted
-from .tools import DEFAULT_READ_END, edit_file, read_file, read_image, write_file
+from .tools import DEFAULT_READ_END
 
 BUILTIN_TOOL_NAMES = frozenset({"read_image", "read_file", "write_file", "edit", "run_command"})
 
@@ -382,20 +382,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "run_command",
             "description": (
-                "Run /bin/sh -c in the configured working directory and capture "
-                "exit_code/stdout/stderr. By default commands run inside a Linux "
-                "bubblewrap sandbox: only permitted directories and read-only system "
-                "runtime paths are visible; network is isolated unless configured "
-                "otherwise; environment variables are filtered, HOME is temporary, "
-                "and /tmp is private to each command unless explicitly mounted. "
-                "Writes to writable mounted directories persist. Missing host files, "
-                "credentials, network access or services can be sandbox restrictions. "
-                "When the task requires access blocked by isolation, request a single "
-                "host execution with privilleged=true if approval is available. You "
-                "may request this directly when the need is known, or retry after "
-                "diagnosing a sandbox-related failure; do not repeatedly retry the "
-                "same blocked command. A nonzero exit_code does not by itself prove "
-                "a sandbox issue. Respect a denied approval."
+                "Run a shell command with the current sandbox policy and return exit_code, stdout and stderr."
             ),
             "parameters": {
                 "type": "object",
@@ -411,15 +398,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "privilleged": {
                         "type": "boolean",
                         "description": (
-                            "Request one-time approval to run directly on the host "
-                            "without sandbox isolation, using the host environment "
-                            "and network as the current user (not sudo/root). Set true "
-                            "for required host-only files, services, credentials or "
-                            "network access unavailable in the sandbox, or when the "
-                            "sandbox backend is unavailable. This tool call triggers "
-                            "approval; a text-only request does not. Each host command "
-                            "requires fresh approval while sandboxing is enabled. "
-                            "The parameter name is spelled privilleged."
+                            "Request approval to execute this command as the host user."
                         ),
                         "default": False,
                     },
@@ -449,7 +428,7 @@ def dispatch_tool(
             if not path.strip():
                 raise ValueError("path must not be empty")
             target = sandbox.resolve_path(path, "read")
-            image_url = read_image(str(target))
+            image_url = sandbox.file_tool('read_image', {'path': str(target)}, cancel_event)
             return ImageToolResult(
                 json.dumps({"ok": True, "path": str(target)}, ensure_ascii=False),
                 image_url,
@@ -470,7 +449,7 @@ def dispatch_tool(
             if end < start:
                 raise ValueError("end must be greater than or equal to start")
             target = sandbox.resolve_path(path, "read")
-            content = read_file(str(target), start=start, end=end)
+            content = sandbox.file_tool('read_file', {'path': str(target), 'start': start, 'end': end}, cancel_event)
             return json.dumps({"ok": True, "content": content}, ensure_ascii=False)
 
         if name == "write_file":
@@ -484,11 +463,9 @@ def dispatch_tool(
             if not isinstance(append, bool):
                 raise TypeError("append must be a boolean")
             target_path = sandbox.resolve_path(path, "write")
-            target = write_file(
-                path=str(target_path),
-                content=content_arg,
-                append=append,
-            )
+            target = sandbox.file_tool('write_file', {
+                'path': str(target_path), 'content': content_arg, 'append': append,
+            }, cancel_event)
             return json.dumps({"ok": True, "path": target}, ensure_ascii=False)
 
         if name == "edit":
@@ -499,12 +476,10 @@ def dispatch_tool(
             if not isinstance(replace_all, bool):
                 raise TypeError("replace_all must be a boolean")
             target_path = sandbox.resolve_path(args["path"], "edit")
-            target, replacements = edit_file(
-                path=str(target_path),
-                old_text=args["old_text"],
-                new_text=args["new_text"],
-                replace_all=replace_all,
-            )
+            target, replacements = sandbox.file_tool('edit_file', {
+                'path': str(target_path), 'old_text': args['old_text'],
+                'new_text': args['new_text'], 'replace_all': replace_all,
+            }, cancel_event)
             return json.dumps(
                 {"ok": True, "path": target, "replacements": replacements},
                 ensure_ascii=False,
