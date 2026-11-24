@@ -274,10 +274,16 @@ def wrap_tool_callable(fn: Callable[..., Any]) -> tuple[Callable[[dict[str, Any]
 class ImageToolResult(str):
     """Keep binary content separate from textual callbacks and system notices."""
 
-    def __new__(cls, text: str, image_url: str) -> ImageToolResult:
+    image_urls: tuple[str, ...]
+
+    def __new__(cls, text: str, image_url: str, *more_urls: str) -> ImageToolResult:
         result = super().__new__(cls, text)
-        result.image_url = image_url
+        result.image_urls = (image_url, *more_urls)
         return result
+
+    @property
+    def image_url(self) -> str:
+        return self.image_urls[0]
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -392,7 +398,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": "Timeout in seconds.",
                         "minimum": 1,
-                        "maximum": 600,
                         "default": 120,
                     },
                     "privilleged": {

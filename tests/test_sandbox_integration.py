@@ -274,6 +274,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
     def test_timeout_and_destroy_cleanup(self):
         sandbox = self.sandbox()
+        self.assertEqual(sandbox.run("printf ok", cwd=self.root, timeout_sec=10**400), (0, "ok", ""))
         with self.assertRaises(subprocess.TimeoutExpired):
             sandbox.run("sleep 30", cwd=self.root, timeout_sec=1)
         group = Path(sandbox.inspect()["resources"]["cgroup"])

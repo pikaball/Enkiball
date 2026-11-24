@@ -292,38 +292,38 @@ class Enkiball:
         builtin_tools: bool | Iterable[str] | None = None,
         tool_hooks: list[ToolHook] | None = None,
     ) -> None:
-        inline = [config is not None, api_key is not None or base_url is not None]
-        if config_path is not None and any(inline):
-            raise ValueError("pass either config_path, config, or api_key/base_url — not several")
-        if config is not None and any((api_key is not None, base_url is not None, protocol is not None)):
-            raise ValueError("pass either config or api_key/base_url/protocol — not both")
+        shorthand = any(value is not None for value in (api_key, base_url, protocol, extra_config))
+        if config_path is not None and (config is not None or shorthand):
+            raise ValueError("pass one configuration source (path, mapping, or shorthand), not several")
+        if config is not None and shorthand:
+            raise ValueError("pass either config or shorthand arguments, not both")
+        if shorthand:
+            if protocol is not None:
+                validate_protocol(protocol)
+            config = self._builder_config(
+                api_key=api_key, base_url=base_url, protocol=protocol,
+                extra_config=extra_config, model=model,
+            )
 
         self._persist = bool(persist)
-        if self._persist:
-            self._config_path = Path(
-                config_path if config_path is not None else DEFAULT_CONFIG_PATH
-            ).expanduser()
-            self._state_path: Path | None = Path(
-                state_path if state_path is not None else DEFAULT_STATE_PATH
-            ).expanduser()
-        else:
-            self._config_path = (
-                Path(config_path).expanduser() if config_path is not None else None
-            )
-            self._state_path = (
-                Path(state_path).expanduser() if state_path is not None else None
-            )
+        self._config_path = Path(config_path).expanduser() if config_path is not None else None
+        if self._config_path is None and config is None and self._persist:
+            self._config_path = DEFAULT_CONFIG_PATH
+        if state_path is None and self._persist:
+            state_path = DEFAULT_STATE_PATH
+        self._state_path = Path(state_path).expanduser() if state_path is not None else None
         state = load_state(self._state_path) if self._state_path is not None else {}
-        self._config = self._load_config(
-            config_path=config_path,
-            config=config,
-            api_key=api_key,
-            base_url=base_url,
-            protocol=protocol,
-            extra_config=extra_config,
-            model=model,
-            state=state,
-        )
+        migration_path = self._state_path or DEFAULT_STATE_PATH
+        if self._config_path is None:
+            self._config = prepare_config(
+                DEFAULT_CONFIG if config is None else dict(config),
+                state_path=migration_path, state=state, persist=False,
+            )
+        else:
+            self._config = load_config(
+                self._config_path, migration_path, state=state,
+                persist=self._persist, create_if_missing=config_path is None,
+            )
 
         self._retired_sandbox_adapters = []
         self._sandbox = Sandbox(
@@ -421,50 +421,6 @@ class Enkiball:
         if extra_config:
             config.update(copy.deepcopy(dict(extra_config)))
         return config
-
-    def _load_config(
-        self,
-        *,
-        config_path: str | Path | None,
-        config: Mapping[str, Any] | None,
-        api_key: str | None,
-        base_url: str | None,
-        protocol: str | None,
-        extra_config: Mapping[str, Any] | None,
-        model: str | None,
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        state_path = self._state_path if self._state_path is not None else DEFAULT_STATE_PATH
-        if api_key is not None or base_url is not None:
-            if protocol is not None:
-                validate_protocol(protocol)
-            raw = self._builder_config(
-                api_key=api_key,
-                base_url=base_url,
-                protocol=protocol,
-                extra_config=extra_config,
-                model=model,
-            )
-            # Inline configs must not leave a partial state file behind; the
-            # migrated selection is handed to the engine through *state*.
-            return prepare_config(raw, state_path=state_path, state=state, persist=False)
-        if config is not None:
-            return prepare_config(
-                dict(config), state_path=state_path, state=state, persist=False
-            )
-        if self._config_path is None:
-            return prepare_config(
-                DEFAULT_CONFIG, state_path=state_path, state=state, persist=False
-            )
-        # An explicitly supplied path must exist; only the default path is
-        # auto-created so a typo cannot silently yield a default config.
-        return load_config(
-            self._config_path,
-            state_path,
-            state=state,
-            persist=self._persist,
-            create_if_missing=config_path is None,
-        )
 
     @property
     def dir_permissions(self) -> tuple[Path, ...]:
@@ -1353,19 +1309,21 @@ class Enkiball:
         name: str,
         config: MCPServerConfig | Mapping[str, Any],
         start: bool = False,
-        save: bool = False,
+        save: bool | str | Path = False,
     ) -> tuple[bool, str]:
         """Add an MCP server definition and optionally start it or persist to config."""
+        target = self._config_save_target(save)
         ok, msg = self._mcp.add_server(name, config, start=start)
-        if ok and save:
-            self._save_config()
+        if ok and target is not None:
+            save_config(self._config, target)
         return ok, msg
 
-    def remove_mcp_server(self, name: str, save: bool = False) -> bool:
+    def remove_mcp_server(self, name: str, save: bool | str | Path = False) -> bool:
         """Remove an MCP server definition and stop it."""
+        target = self._config_save_target(save)
         existed = self._mcp.remove_server(name)
-        if existed and save:
-            self._save_config()
+        if existed and target is not None:
+            save_config(self._config, target)
         return existed
 
     def register_mcp_client(
@@ -1377,8 +1335,9 @@ class Enkiball:
         """Directly register an existing MCPClient instance."""
         return self._mcp.register_client(name, client, start=start)
 
-    def mcp_enable(self, name: str, save: bool = False) -> bool:
+    def mcp_enable(self, name: str, save: bool | str | Path = False) -> bool:
         """Enable an MCP server in config and start it."""
+        target = self._config_save_target(save)
         ok = set_mcp_enabled(self._config, name, True)
         if not ok:
             return False
@@ -1386,26 +1345,29 @@ class Enkiball:
         if not started:
             set_mcp_enabled(self._config, name, False)
             return False
-        if save:
-            self._save_config()
+        if target is not None:
+            save_config(self._config, target)
         return True
 
-    def mcp_disable(self, name: str, save: bool = False) -> bool:
+    def mcp_disable(self, name: str, save: bool | str | Path = False) -> bool:
         """Disable an MCP server in config and stop it."""
+        target = self._config_save_target(save)
         ok = set_mcp_enabled(self._config, name, False)
         if not ok:
             return False
         self._mcp.stop(name)
-        if save:
-            self._save_config()
+        if target is not None:
+            save_config(self._config, target)
         return True
 
-    def _save_config(self) -> bool:
-        """Write the in-memory config back to its file, if there is one."""
-        if self._config_path is None:
-            return False
-        save_config(self._config, self._config_path)
-        return True
+    def _config_save_target(self, save: bool | str | Path) -> Path | None:
+        if save is False:
+            return None
+        if save is True:
+            if self._config_path is None:
+                raise ValueError("in-memory config needs an explicit destination: pass save=path")
+            return self._config_path
+        return Path(save).expanduser()
 
     # ========================================================================
     # Session management (optional – requires explicit init)
@@ -1446,16 +1408,24 @@ class Enkiball:
         with self._bg_lock:
             ex = self._bg_exec
             self._bg_exec = None
-        if ex is not None:
-            ex.shutdown(wait=True, cancel_futures=True)
-        errors = self._mcp.stop_all()
-        for adapter in [*self._retired_sandbox_adapters, self._sandbox]:
+        messages: list[str] = []
+        try:
+            if ex is not None:
+                ex.shutdown(wait=True, cancel_futures=True)
+        finally:
             try:
-                adapter.close()
-            except Exception as error:
-                errors.append(str(error))
-        self._retired_sandbox_adapters.clear()
-        return errors
+                messages.extend(self._mcp.stop_all())
+            finally:
+                retired = self._retired_sandbox_adapters
+                self._retired_sandbox_adapters = []
+                for adapter in [*retired, self._sandbox]:
+                    try:
+                        adapter.close()
+                    except Exception as error:
+                        messages.append(f"sandbox failed to close: {error}")
+                        if adapter is not self._sandbox:
+                            self._retired_sandbox_adapters.append(adapter)
+        return messages
 
     def __enter__(self) -> Enkiball:
         return self

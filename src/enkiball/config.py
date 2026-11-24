@@ -28,7 +28,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "active_provider": "openai",
     "active_model": "gpt-4o",
-    "mcp": {"servers": {}},
+    "mcp": {},
 }
 
 log = logging.getLogger(__name__)
@@ -67,6 +67,8 @@ def ensure_config(path: Path = DEFAULT_CONFIG_PATH) -> Path:
 
 def _migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
     """Migrate legacy config formats to current format."""
+    if "mcp" in raw:
+        raw["mcp"] = list_mcp_servers(raw)
     if "providers" not in raw:
         # Legacy single-provider format
         old_llm = raw.get("llm", {})
@@ -182,6 +184,8 @@ def load_config(
 
 
 def save_config(config: dict[str, Any], path: Path | str = DEFAULT_CONFIG_PATH) -> None:
+    if "mcp" in config:
+        config = {**config, "mcp": list_mcp_servers(config)}
     atomic_write_json(Path(path).expanduser(), config)
 
 
@@ -417,7 +421,14 @@ def get_provider_models(
 
 
 def list_mcp_servers(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return config.get("mcp", {}).get("servers", {})
+    mcp = config.get("mcp", {})
+    legacy = mcp.get("servers")
+    # A server can itself be named "servers". The old wrapper contains
+    # only server definitions, while a connection has a command or URL.
+    if isinstance(legacy, dict) and all(isinstance(item, dict) for item in legacy.values()):
+        direct = {name: item for name, item in mcp.items() if name != "servers"}
+        return {**legacy, **direct}
+    return mcp
 
 
 def set_mcp_enabled(config: dict[str, Any], name: str, enabled: bool) -> bool:

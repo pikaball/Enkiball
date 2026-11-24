@@ -4,6 +4,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from rich.console import Console
 
@@ -47,6 +48,36 @@ class SessionHistoryRestoreTests(unittest.TestCase):
         self.assertTrue(self.handler.pending_history_replay)
         self.assertEqual(self.store.current_session_id, record.session_id)
         self.assertEqual(self.engine.messages, messages)
+
+    def test_list_prints_latest_last_and_preserves_use_indices(self) -> None:
+        records = []
+        for day, name in enumerate(("oldest", "middle", "latest"), start=1):
+            with patch("enkiball.session_store._now_iso", return_value=f"2026-11-{day:02d}"):
+                records.append(self.store.create(name))
+        output = io.StringIO()
+        self.handler.console = Console(file=output, width=240, color_system=None)
+
+        self.handler._session_action("list", [])
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual([line.strip().split(".")[0] for line in lines], ["3", "2", "1"])
+        for line, record in zip(lines, records):
+            self.assertIn(record.session_id, line)
+        self.handler._session_action("use", ["1"])
+        self.assertEqual(self.store.current_session_id, records[-1].session_id)
+
+    def test_unsaved_current_session_is_printed_at_bottom(self) -> None:
+        saved = self.store.create("saved")
+        current = self.store.begin_new()
+        output = io.StringIO()
+        self.handler.console = Console(file=output, width=240, color_system=None)
+
+        self.handler._session_action("list", [])
+
+        lines = output.getvalue().splitlines()
+        self.assertIn(saved.session_id, lines[0])
+        self.assertIn(current.session_id, lines[-1])
+        self.assertIn("(unsaved)", lines[-1])
 
 
 if __name__ == "__main__":

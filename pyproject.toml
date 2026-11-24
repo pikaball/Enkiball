@@ -1,6 +1,6 @@
 [project]
 name = "enkiball"
-version = "0.1.9"
+version = "0.1.10"
 description = "A Python LLM foundation with a CLI and Python API"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,11 +26,14 @@ dependencies = [
 ]
 
 [project.scripts]
-enkiball = "enkiball.cli:main"
+enkiball = "enkiball.system_cli.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 include-package-data = false
+
+[tool.setuptools.package-data]
+enkiball = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

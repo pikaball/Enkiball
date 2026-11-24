@@ -34,6 +34,7 @@ src/enkiball/mcp_client.py
 src/enkiball/message_codec.py
 src/enkiball/persistence.py
 src/enkiball/protocols.py
+src/enkiball/py.typed
 src/enkiball/sandbox.py
 src/enkiball/sandbox_policy.py
 src/enkiball/session_store.py
@@ -46,8 +47,19 @@ src/enkiball.egg-info/dependency_links.txt
 src/enkiball.egg-info/entry_points.txt
 src/enkiball.egg-info/requires.txt
 src/enkiball.egg-info/top_level.txt
+src/enkiball/system_cli/__init__.py
+src/enkiball/system_cli/__main__.py
+src/enkiball/system_cli/agent_display.py
+src/enkiball/system_cli/app.py
+src/enkiball/system_cli/orchestration.py
+src/enkiball/system_cli/orchestration_prompt.py
+src/enkiball/system_cli/orchestration_trace.py
+src/enkiball/system_cli/orchestration_worker.py
+src/enkiball/system_cli/sandbox_info.py
+src/enkiball/system_cli/session_title.py
 tests/test_capture.py
 tests/test_cli_renderer.py
+tests/test_cli_session_hooks.py
 tests/test_edit_tool.py
 tests/test_efficiency.py
 tests/test_enkisandbox.py

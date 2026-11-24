@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
+from .config import list_mcp_servers
 from .mcp_client import MCPClient, SSEMCPClient, StdioMCPClient, StreamableHTTPMCPClient
 
 
@@ -81,10 +82,13 @@ class StreamableHTTPMCPServer(MCPServerConfig):
 class MCPManager:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        if "mcp" in config:
+            config["mcp"] = list_mcp_servers(config)
         self.clients: dict[str, MCPClient] = {}
+        self._registered_clients: dict[str, MCPClient] = {}
 
     def _servers(self) -> dict[str, dict[str, Any]]:
-        return self.config.get("mcp", {}).get("servers", {})
+        return self.config.get("mcp", {})
 
     @staticmethod
     def _environment(item: dict[str, Any]) -> dict[str, str]:
@@ -124,7 +128,7 @@ class MCPManager:
         else:
             raise TypeError("config must be an MCPServerConfig or mapping")
 
-        servers = self.config.setdefault("mcp", {}).setdefault("servers", {})
+        servers = self.config.setdefault("mcp", {})
         servers[name] = cfg_dict
 
         if start:
@@ -134,8 +138,9 @@ class MCPManager:
     def remove_server(self, name: str) -> bool:
         """Stop and remove a server from configuration and active clients."""
         servers = self._servers()
-        existed = name in servers or name in self.clients
+        existed = name in servers or name in self.clients or name in self._registered_clients
         self.stop(name)
+        self._registered_clients.pop(name, None)
         servers.pop(name, None)
         return existed
 
@@ -152,17 +157,22 @@ class MCPManager:
         if not isinstance(client, MCPClient):
             raise TypeError(f"expected MCPClient instance, got {type(client).__name__}")
 
-        if name in self.clients:
-            old = self.clients[name]
-            if old is not client and old.running:
-                old.close()
-
-        if start and not client.running:
+        needs_start = start and not client.running
+        if needs_start:
             try:
                 client.start()
             except Exception as e:
                 return False, f"{name} failed to start: {e}"
 
+        old = self.clients.get(name)
+        if old is not None and old is not client and old.running:
+            try:
+                old.close()
+            except Exception:
+                if needs_start:
+                    client.close()
+                raise
+        self._registered_clients[name] = client
         self.clients[name] = client
 
         summary = []
@@ -176,6 +186,12 @@ class MCPManager:
         return True, f"{name} registered with {summary_str}"
 
     def start(self, name: str) -> tuple[bool, str]:
+        registered = self._registered_clients.get(name)
+        if registered is not None:
+            if registered.running:
+                self.clients[name] = registered
+                return True, f"{name} already running"
+            return self.register_client(name, registered)
         if name in self.clients:
             client = self.clients[name]
             if client.running:
@@ -245,8 +261,13 @@ class MCPManager:
 
     def stop_all(self) -> list[str]:
         messages: list[str] = []
-        for name in list(self.clients):
-            _, msg = self.stop(name)
+        for name in self.clients | self._registered_clients:
+            try:
+                _, msg = self.stop(name)
+            except Exception as error:
+                messages.append(f"{name} failed to stop: {error}")
+                continue
+            self._registered_clients.pop(name, None)
             messages.append(msg)
         return messages
 
@@ -260,19 +281,20 @@ class MCPManager:
                 out[name] = "STOPPED"
 
         # Check dynamic/remote servers not in config
-        for name, client in self.clients.items():
+        for name, client in (self._registered_clients | self.clients).items():
             if name not in out:
-                out[name] = (
-                    "RUNNING (Remote)"
-                    if isinstance(client, (SSEMCPClient, StreamableHTTPMCPClient))
-                    else "RUNNING"
-                )
+                if not client.running:
+                    out[name] = "STOPPED"
+                elif isinstance(client, (SSEMCPClient, StreamableHTTPMCPClient)):
+                    out[name] = "RUNNING (Remote)"
+                else:
+                    out[name] = "RUNNING"
 
         return out
 
     def get_tools(self) -> list[dict[str, Any]]:
         all_tools: list[dict[str, Any]] = []
-        for client in self.clients.values():
+        for name, client in self.clients.items():
             if not client.running:
                 continue
             for tool in client.tools:
@@ -285,7 +307,7 @@ class MCPManager:
 
                 # MCP uses `inputSchema`; OpenAI tools require `parameters`.
                 openai_fn = {
-                    "name": f"mcp__{client.name}__{tool_name}",
+                    "name": f"mcp__{name}__{tool_name}",
                     "description": tool.get("description", ""),
                     "parameters": schema,
                 }

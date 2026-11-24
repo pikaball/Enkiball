@@ -10,7 +10,7 @@ from enkiball.llm import ChatEngine
 
 
 def chunk(delta=None, usage=None):
-    return ChatCompletionChunk.model_validate({
+    return ChatCompletionChunk(**{
         "id": "test", "object": "chat.completion.chunk", "created": 0,
         "model": "test",
         "choices": [] if delta is None else [{"index": 0, "delta": delta}],

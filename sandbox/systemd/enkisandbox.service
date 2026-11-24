@@ -4,7 +4,7 @@ After=local-fs.target
 
 [Service]
 Type=exec
-ExecStart=/opt/enkisandbox/bin/enkisandbox-backend --authorization /etc/enkisandbox/authorization.json --socket-group ENKISANDBOX_GID
+ExecStart=/opt/enkisandbox/bin/enkisandbox-backend --authorization /etc/enkisandbox/authorization.json --socket-group ENKISANDBOX_GID --socket-users-file /etc/enkisandbox/socket-users
 Delegate=memory cpuset
 RuntimeDirectory=enkisandbox
 RuntimeDirectoryMode=0755

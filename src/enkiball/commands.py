@@ -96,7 +96,7 @@ Slash commands:
   /image list                Show staged images
   /image remove <index>      Remove one staged image
   /image clear               Clear all staged images
-  /session list              List sessions
+  /session list              List sessions (latest at bottom)
   /session current           Show current session
   /session new [name]        Create and switch to a new unsaved session
   /session use <id|index>    Switch session (restores dialogue on screen)
@@ -159,6 +159,7 @@ class CommandHandler:
         self.session_store = agent.session_store
         self.debug_scope = debug_scope if debug_scope is not None else {}
         self.btw_context = btw_context
+        self.help_footer: str = ""
         self.completions = list(SLASH_COMPLETIONS)
         self.pending_input: str | None = None
         self.pending_history_replay: bool = False
@@ -258,6 +259,8 @@ class CommandHandler:
                 self.console.print("Custom commands:", style="bold")
                 for k, (_, ht) in self._custom_commands.items():
                     self.console.print(f"  {k:26} {ht}")
+            if self.help_footer:
+                self.console.print(self.help_footer, markup=False)
             return True
         if cmd == "/exit":
             return False
@@ -662,10 +665,11 @@ class CommandHandler:
             self.console.print(f"{i:2d}. {name:16} enabled={enabled} runtime={run}")
 
     def _set_mcp_enabled(self, target: str, enabled: bool) -> None:
+        save = self.agent.persist and self.agent.config_path is not None
         if enabled:
-            ok = self.agent.mcp_enable(target, save=True)
+            ok = self.agent.mcp_enable(target, save=save)
         else:
-            ok = self.agent.mcp_disable(target, save=True)
+            ok = self.agent.mcp_disable(target, save=save)
         if not ok:
             self.console.print(f"failed to set MCP {target} enabled={enabled}", style="bold red")
             return
@@ -745,18 +749,18 @@ class CommandHandler:
     def _print_session_list(self) -> None:
         sessions = self.session_store.list_sessions()
         current = self.session_store.current_session_id
-        if current and not self.session_store.current_session_persisted:
-            name = self.session_store.current_session_name or "untitled"
-            self.console.print(f"* {current:30} name={name} (unsaved)")
-        if not sessions:
-            if not current or self.session_store.current_session_persisted:
-                self.console.print("no sessions", style="yellow")
-            return
-        for idx, item in enumerate(sessions, start=1):
+        # Keep the store's indices (/session use 1 is still the latest), but
+        # print in reverse so recent sessions remain close to the prompt.
+        for idx, item in reversed(list(enumerate(sessions, start=1))):
             mark = "*" if item.session_id == current else " "
             self.console.print(
                 f"{idx:2d}. {mark} {item.session_id:30} name={item.name} updated={item.updated_at}"
             )
+        if current and not self.session_store.current_session_persisted:
+            name = self.session_store.current_session_name or "untitled"
+            self.console.print(f"* {current:30} name={name} (unsaved)")
+        elif not sessions:
+            self.console.print("no sessions", style="yellow")
 
     def _save_current_session(self) -> None:
         self.session_store.save_current_messages(self.agent.messages)

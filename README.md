@@ -69,18 +69,16 @@ pip install -e .
     }
   },
   "mcp": {
-    "servers": {
-      "ssh-mcp": {
-        "enabled": false,
-        "command": "node",
-        "args": ["/path/to/ssh-mcp-server/dist/index.js"],
-        "transport": "jsonl"
-      },
-      "remote-mcp": {
-        "enabled": false,
-        "type": "streamable-http",
-        "url": "http://127.0.0.1:12306/mcp"
-      }
+    "ssh-mcp": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/path/to/ssh-mcp-server/dist/index.js"],
+      "transport": "jsonl"
+    },
+    "remote-mcp": {
+      "enabled": false,
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:12306/mcp"
     }
   }
 }
@@ -95,7 +93,7 @@ pip install -e .
 - 未在 config 中定义的模型也可使用（通过 `/v1/models` 端点自动发现），使用默认参数
 - 当前选中的 provider 和 model 保存在 `~/.config/enkiball/state.json`（运行时状态，与配置分离）
 - config 和 state 在每个实例启动时各读取一次。运行中使用实例内存快照；`/model`、`/provider switch` 的选择仍保存供后续启动使用，但不会影响其他已启动实例。共享文件以最后一次写入为准。
-- `mcp.servers` — MCP 服务器配置，支持 Stdio（jsonl/content-length）、SSE、Streamable HTTP 三种传输
+- `mcp` — 以服务器名为键的 MCP 配置，支持 Stdio（jsonl/content-length）、SSE、Streamable HTTP 三种传输
 
 所有持久化数据（会话历史、导出、命令历史）存储在 `~/.config/enkiball/` 下。
 
@@ -171,33 +169,31 @@ Responses 使用 `store=false` 并将原生输出保存到本地 session；重�
 
 ### MCP 服务器
 
-`mcp.servers` 支持三类传输：
+每台服务器直接写在 `mcp.<名称>` 下。旧的 `mcp.servers.<名称>` 仍可读取，保存配置时会写成新格式。两种写法并存时，同名服务器使用 `mcp.<名称>` 的整条配置。
 
 ```json
 {
   "mcp": {
-    "servers": {
-      "local-jsonl": {
-        "enabled": false,
-        "command": "node",
-        "args": ["/path/to/server.js"],
-        "environment": {
-          "NODE_ENV": "production",
-          "MCP_TOKEN": "replace-me"
-        },
-        "transport": "jsonl"
+    "local-jsonl": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/path/to/server.js"],
+      "environment": {
+        "NODE_ENV": "production",
+        "MCP_TOKEN": "replace-me"
       },
-      "local-content-length": {
-        "enabled": false,
-        "command": "python",
-        "args": ["/path/to/server.py"],
-        "transport": "content-length"
-      },
-      "remote-http": {
-        "enabled": false,
-        "type": "streamable-http",
-        "url": "http://127.0.0.1:12306/mcp"
-      }
+      "transport": "jsonl"
+    },
+    "local-content-length": {
+      "enabled": false,
+      "command": "python",
+      "args": ["/path/to/server.py"],
+      "transport": "content-length"
+    },
+    "remote-http": {
+      "enabled": false,
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:12306/mcp"
     }
   }
 }
@@ -213,7 +209,7 @@ Responses 使用 `store=false` 并将原生输出保存到本地 session；重�
 enkiball
 ```
 
-内置文件和命令工具默认只能访问启动目录及其子目录。可以指定工作目录和额外授权目录：
+系统 CLI 默认请求启用工具沙箱，授权工作目录读写、已发现的 skill 目录只读，并请求隔离网络。只有 `enkisandbox-client` 和 backend 正常工作时，命令才受到内核沙箱策略约束；client 缺失会回退为宿主执行，网络及宿主环境不再被这些沙箱参数限制，内置文件工具的 SDK 路径检查仍保留。可以指定工作目录和额外授权目录：
 
 ```bash
 enkiball --cwd /path/to/project --dir-permission /path/to/shared --ro-permission /path/to/reference
@@ -221,11 +217,45 @@ enkiball --cwd /path/to/project --dir-permission /path/to/shared --ro-permission
 
 CLI 默认在工具请求访问授权目录之外时提供 `once`、`always`、`deny` 三个选项。`once` 只放行当前请求，`always` 将目录授权到当前进程结束，`deny` 拒绝；按 `Esc` 会中断当前 LLM turn 并返回输入提示。使用 `--no-approval` 可改为静默拒绝。可重复传入 `--dir-permission` 授予读写权限，或用 `--ro-permission` 只授予读取权限。
 
+用 `enkiball --help` 查看启动参数，`enkiball --sandbox-info` 输出请求配置、client/socket 路径、实际模式和生效策略后退出，不启动 LLM 或 MCP，也不写入运行状态。交互中使用 `/sandbox` 查看同一信息，`/sandbox help` 查看沙箱参数说明。诊断只显示环境变量名称，不打印变量值。
+
+```bash
+enkiball --sandbox-info
+enkiball --sandbox-network host --sandbox-env HTTP_PROXY
+enkiball --privileged
+```
+
+`--sandbox-network` 的默认值是 `none`，`host` 请求共享宿主网络；`--sandbox-env NAME` 在沙箱最小环境中额外继承一个宿主变量，可重复。`--privileged` 显式选择宿主执行并授权文件工具访问 `/`，不提升用户身份；保留旧拼写 `--privilleged` 作为兼容别名。`--no-approval` 只拒绝新增交互授权，不会开启隔离或禁止缺失 client 时的回退。
+
+这些沙箱参数作用于内置文件/命令工具，不作用于 LLM API 请求、MCP 服务、`/debug` 或 `orchestrate` 的 Python 进程。子 Agent 的工具默认继承请求的沙箱配置，并关闭交互审批。CPU/内存、设备、capability、seccomp、CIDR 等高级策略当前通过 Python `EnkiSandbox` API 配置，尚无对应 CLI 参数。client 和 socket 可分别通过 `ENKISANDBOX_CLIENT`、`ENKISANDBOX_SOCKET` 指定，默认是 `enkisandbox-client` 与 `/run/enkisandbox/control.sock`。client 已存在但服务连接/授权/策略失败时会报错，不会回退宿主模式。
+
 普通输入直接发送给 LLM，支持流式输出。按 `Ctrl+J` 换行，`Enter` 发送。`Esc` 可中断请求发送后等待响应、流式数据等待、重试等待和 MCP 工具调用，也适用于 `/compact`；已收到的对话内容会保留，中断的压缩不会替换历史。
 
 内置 slash command 执行失败会显示错误并返回输入提示。CLI 退出（包括异常退出）时会尝试保存当前会话，并清理后台 executor 和 MCP 资源。
 
 使用 `/session use` 或 `/session fork` 恢复历史时，CLI 会按实时对话相同的样式重绘 user、assistant、Markdown 表格和工具调用；历史 tool result 不会整段回显。
+
+`/session list` 按更新时间从旧到新输出，最新会话在末尾；编号仍保持最新为 `1`，可直接用 `/session use 1` 切换。当前未保存的会话也显示在列表末尾。
+
+系统安装的 `enkiball` 命令会在新会话首轮结束后自动总结生成标题，包括 `Esc`、`Ctrl+C` 或工具审批中断的情况。标题使用当前 provider/model 的独立请求生成，不调用工具，也不修改对话历史及其用量统计；失败、超过 30 秒或再次中断时保留首条输入的简短备用标题。手动指定的会话名会保留。此功能由入口注册的 `SessionTitleHook` 提供，直接使用 `EnkiballCLI` 默认不会自动命名。
+
+系统 CLI 向主 agent 提供 `orchestrate(code, wait, title?, timeout_sec?)` 与 `cancel_run(run_id)`。编排是一段普通 Python 程序：模型决定工作怎样拆解、依赖怎样传递、何时分支或继续迭代；运行时负责执行、资源清理、记录和消息投递，不规定固定的角色组合或流程模板。
+
+串行、并行、分支、循环具有同等地位，可以混合使用。顺序依赖由普通调用/`await` 表达，独立工作可以用 `asyncio.gather` 或 `spawn` 并行，条件和迭代使用 Python 的 `if`、`for`、`while`。每个 `Agent` 都有独立会话历史；需要延续上下文时顺序复用，需要独立上下文或并发时创建不同对象。结果通过普通变量传给后续步骤，`respond(value)` 显式选择哪些信息交给主 agent。
+
+每次调用创建一个一次性 Python 进程，预置 `Agent`、`respond`、`asyncio` 和 `spawn`，支持顶层 `await`。直接使用这些名字，不要把工具名当成模块导入。`Agent` 是包装后的 `Enkiball`，默认沿用调用时主 agent 的 provider/model、配置、工作目录和工具权限；`Agent.chat()` / `await Agent.achat()` 返回 `ChatResult`，文本位于 `.content`。原有 `messages`、`history()`、`compact/acompact`、流式和后台 API 继续可用。子 agent 不自动获得主会话历史，也不继承主 agent 动态注册的 Python 工具或编排工具，需要由代码显式提供任务上下文。
+
+`wait` 是必填布尔参数：`true` 使这一条工具调用等待整段程序及其托管任务结束，中途 `respond` 只更新终端和缓冲结果；`false` 立即返回，后续显式响应自动通过 notice 或后台轮次送达。没有单独的等待工具，也没有让主 agent 定期轮询的时间片参数。Python 内部的 `await` 只负责代码中的依赖关系，与这个调用模式独立。
+
+`spawn(coroutine)` 注册的任务会在进程结束前自动等待；直接使用 `asyncio.create_task` 的任务应由代码自己等待。每次调用结束后销毁所有变量和对象，磁盘产物及执行记录保留。最多同时运行 4 个工作流、每个工作流最多同时执行 8 个 Agent 操作，超出的异步操作自动排队；没有累计创建 8 个 Agent 的限制。单个 Agent 仍只支持串行操作。默认整次执行超时 600 秒，`timeout_sec` 可设为 1–3600 秒。
+
+记录默认保存在 `~/.config/enkiball/runs/<run_id>/`：`code.py` 是执行代码，`manifest.json` 是运行及 Agent 索引，`events.jsonl` 是运行事件，`responses.jsonl` 保留所有显式响应，`stdout.log` 保留完整输出。每个 `agents/<id>/` 下有 `messages.json` 最新历史和 `events.jsonl` 完整增量记录，包含模型请求、回复片段、工具参数/结果、用量与异常。已写入的记录在失败、超时、取消和 CLI 退出后仍然保留；Agent 本身不写全局 provider/model 状态文件。
+
+工具返回 `run_id`、`status` 和记录路径；主 agent 自动获得记录目录的只读工具权限，可按需读取，不会默认把子 Agent 的完整对话灌回主上下文。返回预览有截断标记时，以磁盘记录为准。`respond` 决定回传内容，完整轨迹用于按需核实与排错，两者独立。
+
+终端显示任务标题、子 agent 名字、状态、近期工具动作和耗时；`title` 与 `Agent(name=...)` 只用于展示。`wait=true` 显示主 agent 等到工作流结束，后台模式则区分结果就绪、notice 实际送达与自动报告轮次，并保留未提交的输入草稿。已交付结果之后的正常进程收尾，不会另开一轮重复汇报。
+
+`/agents` 查看当前/最近任务，`/agents <id>` 查看结果；`/agents code|logs|trace|cancel <id>` 分别查看代码、输出、完整记录位置或取消执行。ID 支持唯一前缀；实时任务视图属于当前会话，磁盘记录可跨进程读取。用户中断、切换会话和退出会清理尚在执行的工作。编排 Python 以 CLI 用户身份运行，并非 Python 权限沙箱；子 Agent 的内置工具默认继承请求的沙箱设置，关闭交互审批。
 
 正文、列表、代码块和工具预览的长行由终端自然折行，CLI 不再按窗口宽度插入换行和补齐空格，方便鼠标选择复制。代码中的实际换行和缩进仍保留，工具侧边标记、行号只出现在原始行的开头。表格和有高度限制的 thinking 预览仍按终端尺寸排版。实时回复和历史回放使用相同规则。
 
@@ -235,6 +265,9 @@ Markdown 标题与相邻内容之间保留空行，流式输出分段提交时�
 
 ```
 /help                      帮助
+/sandbox [help]            系统 CLI：查看沙箱请求配置/实际模式，或参数说明
+/agents [id|help]          系统 CLI：查看子 agent 任务、状态与响应
+/agents code|logs|trace|cancel <id>  系统 CLI：查看代码、输出、记录或取消执行
 /exit                      退出
 /model [name]              查看或切换模型（无参数时显示可用模型列表，含远程发现）
 /provider                  查看当前 provider
@@ -253,7 +286,7 @@ Markdown 标题与相邻内容之间保留空行，流式输出分段提交时�
 /image list                查看已挂载图片
 /image remove <index>      移除一张图片
 /image clear               清空挂载图片
-/session list              列出所有会话
+/session list              列出所有会话（最新在末尾）
 /session current            当前会话信息
 /session new [name]        新建会话
 /session use <id|index>    切换会话（屏幕恢复历史）
@@ -391,7 +424,8 @@ agent = Enkiball(
 ```
 
 - `config_path` — 配置文件路径，默认 `~/.config/enkiball/enki.json`（首次使用时自动创建）。显式传入但不存在的路径会抛 `FileNotFoundError`，避免拼错目录名时静默得到一份默认配置。所有路径参数都会展开 `~`。
-- `config` / `api_key` / `base_url` / `protocol` / `extra_config` — 见上文；不能与 `config_path` 同时使用。
+- 配置来源三选一：文件路径 `config_path`、映射 `config`、快捷参数。单独传入 `protocol` 或 `extra_config` 也会创建快捷配置。映射和快捷配置的 `agent.config_path` 为 `None`，运行状态仍遵循 `persist`。
+- `builtin_tools` — 默认启用全部内置文件和命令工具。`False` 或空迭代对象关闭这些工具；可传单个工具名或名称迭代对象（包括生成器）选择子集，未知名称会在构造时抛出 `ValueError`。
 - `persist` — 是否把运行时状态和 session 写入磁盘，默认 `True`。
 - `system_prompt` — 覆盖配置文件中的 system prompt。
 - `auto_start_mcp` — 初始化时是否启动配置中 `enabled=true` 的 MCP server，默认 `False`；CLI 会显式启用。
@@ -648,12 +682,13 @@ agent.mcp_disable("ssh-mcp", save=True)
 ```
 
 - `mcp` — 直接访问 `MCPManager`。
-- `mcp_enable(name, save=False)` / `mcp_disable(name, save=False)` — 修改 server enabled 状态并启停；`save=True` 时写回配置文件。
+- `add_mcp_server`、`remove_mcp_server`、`mcp_enable` 和 `mcp_disable` 默认只修改实例配置。文件配置支持 `save=True` 写回原文件。使用内联配置时，传 `save=Path("app.json")` 将完整配置保存到指定位置。
+- `register_mcp_client("local", client, start=False)` 注册后可用 `agent.mcp.start("local")` 启动，工具名使用注册名。持久化实例将 MCP 图片保存到状态文件同目录的 `mcp_images/`；内存实例将图片作为多模态内容保留在会话中。
 
 `MCPManager` 还提供：
 
 - `start_enabled()` — 启动所有 enabled server。
-- `stop_all()` — 停止所有已启动 server。
+- `stop_all()` — 逐个关闭客户端并返回各自的结果。关闭失败的客户端保留供重试。
 - `get_tools()` — 将 MCP tools 转换为 OpenAI function tool schema。
 - `call_tool(unique_name, args, cancel_event=None)` — 调用 MCP tool，名称格式为 `mcp__<server>__<tool>`；可传入 `threading.Event`，置位后退出等待并抛出 `TurnInterrupted`。
 
@@ -925,21 +960,52 @@ cli.run()
 - `context.prompt_session` — prompt_toolkit `PromptSession`
 - 返回 `True` 继续运行，`False` 退出 CLI
 
-`pyproject.toml` 中的 `enkiball` 入口仍指向内置 `cli:main`，等价于 `EnkiballCLI().run()`。
+`pyproject.toml` 中的 `enkiball` 入口指向 `enkiball.system_cli.app:main`，也可用 `python -m enkiball.system_cli` 启动。系统应用与库提供的 CLI 类分层：
+
+```text
+src/enkiball/
+  cli.py                         通用 EnkiballCLI、CliTurnContext 和交互循环
+  system_cli/
+    app.py                       系统命令参数、agent 创建及专属功能注册
+    session_title.py             系统 CLI 的自动标题 hook
+    orchestration.py             Python 编排工具、事件投递和进程管理
+    orchestration_worker.py      一次性 Python 执行环境
+    orchestration_prompt.py      自由编排的设计哲学与 API 契约
+    orchestration_trace.py       完整执行记录与模型调用记录适配
+    sandbox_info.py              系统沙箱配置诊断和帮助
+    agent_display.py             子 agent 任务树、状态提示和详情命令
+    __main__.py                  python -m 启动入口
+```
+
+`system_cli` 通过组合 `EnkiballCLI` 并注册 hook、命令来增加功能。库层不导入系统应用；以后新增系统 CLI 专属功能放在 `system_cli/`，通用扩展接口保留在 `cli.py`。库用户仍通过 `from enkiball import EnkiballCLI` 使用通用类。
 
 `EnkiballCLI(...)` 构造参数：
 
 - `agent` — 已初始化的 `Enkiball`，省略时按默认配置创建。
 - `console` — Rich `Console`。
-- `history_path` — prompt_toolkit 输入历史文件路径。
+- `history_path` — 输入历史文件路径。内存实例默认将输入历史保存在内存中，显式传入路径可启用文件历史。
 - `banner` — CLI 启动提示文本。
 - `input_transform` — 输入转换回调，签名为 `(text, image_paths) -> text | (text, system_context)`。
 - `turn_lock` — 可选锁对象，用于外部协调单轮执行。
 - `on_session_change` — session 切换回调，签名为 `(session_id) -> None`。
+- `on_turn_end` — 可选 hook，签名为 `(context: CliTurnContext) -> None`；普通输入的轮次在保存历史、结束渲染及清理审批回调后触发，正常结束、中断和错误均触发，slash command 不触发。hook 异常会显示提示并返回输入。
+- `poll_background` — 可选非阻塞回调，返回待处理的后台上下文字符串或 `None`；CLI 在空闲输入期间轮询，有结果时保留输入草稿并串行启动后续轮次。默认不轮询，不改变嵌入式 CLI 的交互。
+- `on_background_turn` — 可选 `(context: str) -> None` 回调，后台输入被接收并即将提交给 agent 时触发；可用于显示唤醒来源和确认交接，异常不会阻止该轮执行。
+- `tool_renderers` — 可选映射 `{工具名: (args, cwd) -> Rich renderable}`，定制工具调用的显示；实时输出和历史回放共用，默认仍使用内置渲染。
 - `debug_scope` — `/debug` 使用的 Python scope 字典；CLI 直接使用该字典，并默认补入 `agent` 和 `cli`。
 - `btw_context` — 可选的临时对话上下文回调；其内容只注入 `/btw`，不会写入前台历史。
 
 自定义 LLM 工具通过 `cli.agent.register_tool(...)` 注册。
+
+`CliTurnContext` 可从 `enkiball` 导入，提供 `agent`、`console`、`session_store`、本轮的 `session_id`、原始 `text`、图片路径元组 `images`、`first_turn`、`interrupted`、`error`、`background` 以及 `should_stop()`。`background` 表示由后台输入触发的轮次，默认 `False`；这种轮次不视为首轮用户输入。`first_turn` 表示普通输入开始前没有用户消息；`should_stop()` 只响应 hook 执行期间的新中断，不继承刚结束的轮次的中断状态。
+
+嵌入式 CLI 如需启用同一命名策略，可显式安装：
+
+```python
+from enkiball.system_cli.session_title import SessionTitleHook
+
+cli = EnkiballCLI(agent, on_turn_end=SessionTitleHook())
+```
 
 `/btw <prompt...>` 使用当前 agent 的完整工具集和对话上下文执行一次临时问答，
 但不会把这次问答追加到当前 session 历史。工具本身产生的副作用会保留。
@@ -960,7 +1026,7 @@ LLM 在对话中可以按需调用以下内置工具。这些工具是模型工�
 
 `run_command` 的说明包含实际执行模式、实例 ID、生效策略和工作目录。共享 `EnkiSandbox` 不进行逐条增量授权，`privilleged=true` 不能绕过实例；需要宿主执行时由开发者切换到 `EnkiSandbox.host()`。旧版 bool 构造保留一次性宿主审批兼容。
 
-read/write/edit/image 与命令使用同一个 backend、挂载和资源预算。任务取消或超时会回收对应 cgroup，包括脱离进程组的后代。缺少 client 时回退到宿主并明确报告实际模式；client 存在时的故障不会回退。CLI 保留 `--sandbox-network`、`--sandbox-env`、`--ro-permission` 和显式宿主模式 `--privilleged`。
+read/write/edit/image 与命令使用同一个 backend、挂载和资源预算。任务取消或超时会回收对应 cgroup，包括脱离进程组的后代。缺少 client 时回退到宿主并明确报告实际模式；client 存在时的故障不会回退。CLI 提供 `--sandbox-network`、`--sandbox-env`、`--ro-permission`、`--sandbox-info` 和显式宿主模式 `--privileged`（兼容 `--privilleged`）。
 
 工具 schema 位于 `src/enkiball/llm_tools.py`，纯文件操作位于 `src/enkiball/tools.py`，SDK 对象及 client 适配位于 `src/enkiball/sandbox.py`；系统运行时位于独立目录 `sandbox/`。
 
@@ -970,7 +1036,7 @@ read/write/edit/image 与命令使用同一个 backend、挂载和资源预算�
 src/enkiball/
 ├── __init__.py          包根导出
 ├── agent.py             Enkiball 高层库 API
-├── cli.py               CLI runner 和入口
+├── cli.py               通用 CLI runner 和交互 hook
 ├── cli_renderer.py      Rich Markdown 和工具调用渲染
 ├── commands.py          slash command 处理
 ├── config.py            配置、provider/model、state 管理
@@ -995,6 +1061,7 @@ src/enkiball/
 
 ```bash
 python -m unittest discover -s tests -q
+uv run --isolated --no-project --with . --with 'openai==1.40.0' --with 'pydantic==1.10.26' --with 'httpx==0.27.0' python -m unittest discover -s tests -p test_protocols.py -q
 uv run --no-project --with build python scripts/build_release.py
 uvx twine check --strict dist/*
 ```

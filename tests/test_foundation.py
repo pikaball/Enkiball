@@ -276,7 +276,7 @@ class ProviderAndMcpTests(unittest.TestCase):
         with patch.object(agent._mcp, "start", return_value=(False, "failed")):
             self.assertFalse(agent.mcp_enable("broken"))
 
-        self.assertFalse(agent._config["mcp"]["servers"]["broken"]["enabled"])
+        self.assertFalse(agent._config["mcp"]["broken"]["enabled"])
 
 
 class CommandExtensionTests(unittest.TestCase):

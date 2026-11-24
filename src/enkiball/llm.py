@@ -10,6 +10,7 @@ import mimetypes
 import threading
 import time
 from dataclasses import dataclass, field
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, Literal
@@ -191,11 +192,15 @@ class ChatEngine:
         self.mcp_manager = mcp_manager
         self.sandbox = sandbox or Sandbox()
         self.agent = agent
-        self.builtin_tools = builtin_tools
-        if isinstance(builtin_tools, (list, tuple, set, frozenset)):
-            self._enabled_builtin_names: set[str] = set(builtin_tools)
+        self.builtin_tools: bool | frozenset[str] | None
+        if builtin_tools is None or isinstance(builtin_tools, bool):
+            self.builtin_tools = builtin_tools
         else:
-            self._enabled_builtin_names = set(BUILTIN_TOOL_NAMES)
+            names = frozenset([builtin_tools] if isinstance(builtin_tools, str) else builtin_tools)
+            unknown = names - BUILTIN_TOOL_NAMES
+            if unknown:
+                raise ValueError(f"unknown builtin tools: {', '.join(sorted(map(repr, unknown)))}")
+            self.builtin_tools = names
         self.tool_hooks: list[ToolHook] = list(tool_hooks) if tool_hooks else []
         # Use system prompt from config if set, otherwise use default
         prompt = get_system_prompt(config) or SYSTEM_PROMPT
@@ -611,7 +616,7 @@ class ChatEngine:
             return False
         if self.builtin_tools is True or self.builtin_tools is None:
             return True
-        return name in self._enabled_builtin_names
+        return name in self.builtin_tools
 
     def add_tool_hook(self, hook: ToolHook) -> None:
         self.tool_hooks.append(hook)
@@ -782,8 +787,7 @@ class ChatEngine:
         return copy.deepcopy(self.messages)
 
     @staticmethod
-    def _persist_mcp_image(base64_data: str, mime_type: str | None = None) -> str:
-        image_dir = Path.home() / ".config" / "enkiball" / "mcp_images"
+    def _persist_mcp_image(image_dir: Path, base64_data: str, mime_type: str | None) -> str:
         image_dir.mkdir(parents=True, exist_ok=True)
         mime = mime_type or "application/octet-stream"
         ext = mimetypes.guess_extension(mime) or ".bin"
@@ -867,10 +871,9 @@ class ChatEngine:
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
-    @staticmethod
-    def _flatten_mcp_content(mcp_res: Any) -> dict[str, Any]:
+    def _format_mcp_result(self, mcp_res: Any) -> str:
         if not isinstance(mcp_res, dict):
-            return {"ok": True, "result": mcp_res}
+            return json.dumps({"ok": True, "result": mcp_res}, ensure_ascii=False)
 
         is_error = bool(mcp_res.get("isError"))
         payload: dict[str, Any] = {"ok": not is_error}
@@ -881,6 +884,7 @@ class ChatEngine:
         content_list = mcp_res.get("content", [])
         texts: list[str] = []
         saved_images: list[str] = []
+        image_urls: list[str] = []
         other_content: list[Any] = []
         for item in content_list:
             if not isinstance(item, dict):
@@ -891,8 +895,12 @@ class ChatEngine:
                 data = item.get("data")
                 if isinstance(data, str) and data:
                     try:
-                        path = ChatEngine._persist_mcp_image(data, item.get("mimeType"))
-                        saved_images.append(path)
+                        mime = item.get("mimeType") or "application/octet-stream"
+                        if self._persist_state and self.state_path is not None:
+                            directory = self.state_path.parent / "mcp_images"
+                            saved_images.append(self._persist_mcp_image(directory, data, mime))
+                        else:
+                            image_urls.append(f"data:{mime};base64,{data}")
                         continue
                     except Exception:
                         pass
@@ -907,7 +915,10 @@ class ChatEngine:
             payload["images"] = saved_images
         if other_content:
             payload["content"] = other_content
-        return payload
+        text = json.dumps(payload, ensure_ascii=False)
+        if image_urls:
+            return ImageToolResult(text, *image_urls)
+        return text
 
     def _dispatch_tool(
         self,
@@ -929,11 +940,7 @@ class ChatEngine:
         raw_res: Any = None
         try:
             raw_res = self._dispatch_tool_raw(name, args, turn)
-            if isinstance(raw_res, ImageToolResult):
-                final_res = ImageToolResult(self._attach_sys_notices(raw_res), raw_res.image_url)
-            else:
-                final_res = self._attach_sys_notices(raw_res)
-            return final_res
+            return self._attach_sys_notices(raw_res)
         except Exception as exc:
             err = exc
             raise
@@ -1020,7 +1027,7 @@ class ChatEngine:
             mcp_res = self.mcp_manager.call_tool(
                 name, args, cancel_event=turn.cancel_event if turn is not None else None,
             )
-            return json.dumps(self._flatten_mcp_content(mcp_res), ensure_ascii=False)
+            return self._format_mcp_result(mcp_res)
         except TurnInterrupted:
             raise
         except Exception as e:  # noqa: BLE001
@@ -1043,7 +1050,10 @@ class ChatEngine:
         )
         if not tool_result:
             return notice_block
-        return f"{tool_result}\n\n{notice_block}"
+        text = f"{tool_result}\n\n{notice_block}"
+        if isinstance(tool_result, ImageToolResult):
+            return ImageToolResult(text, *tool_result.image_urls)
+        return text
 
     @staticmethod
     def _collect_stream_output(
@@ -1219,10 +1229,8 @@ class ChatEngine:
     def _append_tool_result(self, tool_call_id: str, result: str) -> None:
         content: Any = result
         if isinstance(result, ImageToolResult):
-            content = [
-                {"type": "text", "text": str(result)},
-                {"type": "image_url", "image_url": {"url": result.image_url}},
-            ]
+            content = [{"type": "text", "text": str(result)}]
+            content.extend({"type": "image_url", "image_url": {"url": url}} for url in result.image_urls)
         self.messages.append(
             {"role": "tool", "tool_call_id": tool_call_id, "content": content}
         )
@@ -1566,11 +1574,7 @@ class ChatEngine:
                         pass
                     raise
 
-            if isinstance(raw_res, ImageToolResult):
-                final_res = ImageToolResult(self._attach_sys_notices(raw_res), raw_res.image_url)
-            else:
-                final_res = self._attach_sys_notices(raw_res)
-            return final_res
+            return self._attach_sys_notices(raw_res)
         except Exception as exc:
             err = exc
             raise

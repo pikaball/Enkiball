@@ -4,7 +4,7 @@
 
 ## 安装、升级、卸载
 
-系统依赖：Python >= 3.10（含 venv/pip）、C 编译器、make、bubblewrap、systemd、Linux cgroup v2 和 `cgroup.kill`（Linux >= 5.14）。seccomp 需要 libseccomp；按网段/网卡过滤及设备规则需要 libbpf、支持 BPF target 的 clang，以及宿主 BPF 权限。
+系统依赖：Python >= 3.10（含 venv/pip）、C 编译器、make、bubblewrap、systemd、`setfacl`（通常由 acl 包提供）、Linux cgroup v2 和 `cgroup.kill`（Linux >= 5.14）。seccomp 需要 libseccomp；按网段/网卡过滤及设备规则需要 libbpf、支持 BPF target 的 clang，以及宿主 BPF 权限。
 
 ```sh
 git clone <repository-url>
@@ -14,7 +14,9 @@ sudo ./sandbox/install.sh
 
 安装器编译 `/usr/local/bin/enkisandbox-client`，在 `/opt/enkisandbox` 安装独立 backend，部署并启动 `enkisandbox.service`。服务以 root 完成挂载源准备、cgroup/BPF 操作，然后在独立启动子进程中进入任务 cgroup、设置调用者 UID/GID/组和 `no_new_privs`，最后运行 bubblewrap。SDK 与 harness 留在服务预算之外。
 
-`/etc/enkisandbox/authorization.json` 默认 `{}`，普通用户无权创建实例。将用户加入 `enkisandbox` 组，并由管理员按数字 UID 配置授权上限，例如：
+通过 `sudo` 安装时，安装器将调用者的数字 UID 写入 `/etc/enkisandbox/socket-users`。服务启动时为这些用户设置 socket ACL，现有会话即可连接，无需重新登录或切换组。该文件每行一个 UID；直接以 root 安装或需要授权其他用户时，可由管理员添加 UID 并重启服务。`enkisandbox` 组仍可用于按组授权。socket 访问权限与下面的策略上限是两回事。
+
+`/etc/enkisandbox/authorization.json` 默认 `{}`，不设置额外授权上限。管理员可选地按数字 UID 配置授权上限，例如：
 
 ```json
 {
@@ -29,9 +31,9 @@ sudo ./sandbox/install.sh
 }
 ```
 
-此处 `resources` 是必须声明的单实例预算上限；省略管理员上限表示不额外限制该项。多个实例预算可以累加。网络授权比较规范化后的完整策略；若允许共享宿主网络，在 `networks` 中显式加入 `"all"`。设备按路径和方向精确匹配。其他 UID 即使知道 sandbox ID 也不能 inspect、exec、cancel 或 destroy。
+未配置 UID 或某项上限时，该项不受管理员策略额外限制；显式配置空列表则禁止对应的授权。此处 `resources` 是必须声明的单实例预算上限；省略管理员上限表示不额外限制该项。多个实例预算可以累加。网络授权比较规范化后的完整策略；若允许共享宿主网络，在 `networks` 中显式加入 `"all"`。设备按路径和方向精确匹配。其他 UID 即使知道 sandbox ID 也不能 inspect、exec、cancel 或 destroy。
 
-修改授权后执行 `sudo systemctl restart enkisandbox`。升级再次运行安装器，然后 `sudo systemctl restart enkisandbox`。重启会终止旧任务并使旧 ID 失效。卸载：`sudo ./sandbox/uninstall.sh`；保留授权配置和系统组。
+修改授权或 socket 用户列表后执行 `sudo systemctl restart enkisandbox`。升级再次运行安装器即可。重启会终止旧任务并使旧 ID 失效。卸载：`sudo ./sandbox/uninstall.sh`；保留授权配置和系统组。
 
 无 root 时，可使用管理员部署的服务；也可在自己的 systemd 用户服务中运行 backend，前提是获得所需 cgroup 委派。相同 UID 的服务只拥有该 UID 的宿主权限。示例（在仓库根目录运行）：
 
@@ -46,6 +48,8 @@ export ENKISANDBOX_SOCKET="$XDG_RUNTIME_DIR/enkisandbox/control.sock"
 ```
 
 用户级服务通常没有 BPF 权限；上级未委派 cpuset 时不能请求 `cpu_count`。backend 不降低请求的限制。
+
+系统服务以创建实例的连接所持有的 UID、GID 和附加组运行任务；附加组通过内核 `SO_PEERGROUPS` 获取。用户级服务若无法切换到该身份，会拒绝创建实例。实例按 UID 而非进程或组授权，同 UID 的进程可以 attach 已有实例并使用其身份。沙箱策略不会绕过宿主文件的权限或 ACL。系统服务的 `UMask=0077` 也会作用于沙箱任务中新建的文件；需要组共享时可在命令中显式设置 umask 和目录权限。状态目录由服务用户持有且不可被其他用户写入，backend 会为该目录和实例目录设置必要的遍历权限；实例临时目录仍仅供调用者访问。自定义 `--state` 时，其所有上级目录也必须允许调用者遍历。更新 backend 后须重启服务，已有状态目录才会修复权限。
 
 ## SDK
 
@@ -80,7 +84,7 @@ client 缺失时构造得到 `execution_mode="host"`、`sandbox_id=None`、`effe
 - 已存在的文件和目录均可挂载。尚不存在的可写路径必须指定 `type="file"` 或 `"directory"`，backend 以调用者身份创建，失败则不创建实例。创建出的宿主路径属于用户数据，销毁不删除。
 - 根目录、`/proc`、`/dev`、`/sys`、`/tmp` 是运行时保留挂载点。文件策略不能挂载宿主 `/proc`、`/sys`、`/dev` 的子路径或 backend 状态/连接目录及其祖先；设备通过 devices 授权。可授权 `/tmp` 下的具体工作目录。实例 `/tmp` 与宿主 `/tmp` 不同；未授权的同名临时路径可以在私有 `/tmp` 中创建，不会修改宿主同名路径。
 - 路径在创建时解析符号链接，源使用 FD 固定；沙箱内符号链接只能访问可见挂载。存在硬链接的受保护文件、可见的冲突挂载别名会拒绝。每条任务启动前复查。宿主同 UID 的外部进程可以修改已授权内容及别名；它们属于可信管理边界。实例隔离不防御同 UID 的恶意宿主管理进程。
-- `/tmp` 跨任务共享。shell、cwd、env、PID/IPC/UTS 和隔离网络命名空间按任务创建。任务 shell 结束、超时或取消后，整个任务 cgroup 回收，包括 setsid/双 fork 后代；不保留跨任务后台服务。需要服务时保持该任务存活，最大单任务超时 600 秒。
+- `/tmp` 跨任务共享。shell、cwd、env、PID/IPC/UTS 和隔离网络命名空间按任务创建。任务 shell 结束、超时或取消后，整个任务 cgroup 回收，包括 setsid/双 fork 后代；不保留跨任务后台服务。单次命令默认超时 120 秒，可通过 `timeout_sec` 设置任意正整数秒数。
 - `network={"outbound": []}` 使用任务私有网络（其回环不是宿主回环）；`"all"` 共享宿主网络；非空 `outbound` 共享宿主网络并在实例 cgroup 安装 egress BPF。单条规则的 CIDR 和出口 interface 取交集，各规则取并集，IPv4/IPv6 默认拒绝。DNS 也需要授权其目标地址。不限制入站流量。
 - interface 按创建时宿主 ifindex 固定。每次执行及执行期间检查接口名到 ifindex 的关系，改变或消失则失败，需要新实例。路由改变后仍按数据包实际出口过滤。允许的本机代理可继续转发；Unix socket、已授权目录中的 IPC 不属于 IP egress 规则。
 - `devices`: `read` / `write` / `readwrite`；BPF 检查设备 major/minor/type 及方向，默认仅保留基础设备和显式设备，冲突别名拒绝。ioctl 仍由驱动检查。

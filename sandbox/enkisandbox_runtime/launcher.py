@@ -12,7 +12,7 @@ def identity(uid, gid, groups):
         os.setgroups(groups)
         os.setgid(gid)
         os.setuid(uid)
-    elif (os.getuid(), os.getgid()) != (uid, gid):
+    elif (os.getuid(), os.getgid()) != (uid, gid) or set(os.getgroups()) != set(groups):
         raise PermissionError("backend cannot assume the caller identity")
 
 

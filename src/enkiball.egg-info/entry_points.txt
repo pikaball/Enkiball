@@ -1,2 +1,2 @@
 [console_scripts]
-enkiball = enkiball.cli:main
+enkiball = enkiball.system_cli.app:main

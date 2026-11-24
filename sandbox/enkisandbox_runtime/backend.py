@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
 import fcntl
 import json
 import os
-import pwd
 import select
 import shutil
 import signal
@@ -30,6 +30,24 @@ from .resources import ResourceGroup, remove_group
 VERSION = 1
 MAX_REQUEST = 48 * 1024 * 1024
 MAX_OUTPUT = 1_000_000
+SO_PEERGROUPS = 59  # Linux: supplementary groups captured at connect time.
+
+
+def peer_groups(connection):
+    # Python's getsockopt buffer is limited to 1024 bytes, but Linux permits
+    # up to 65536 supplementary groups.
+    groups = (ctypes.c_uint * 65536)()
+    size = ctypes.c_uint(ctypes.sizeof(groups))
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.getsockopt(
+        connection.fileno(), socket.SOL_SOCKET, SO_PEERGROUPS,
+        ctypes.byref(groups), ctypes.byref(size),
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if size.value % ctypes.sizeof(ctypes.c_uint):
+        raise RuntimeError("Invalid peer supplementary groups")
+    return list(groups[: size.value // ctypes.sizeof(ctypes.c_uint)])
 
 
 def valid_id(value):
@@ -154,12 +172,12 @@ class Execution:
                     start_new_session=True,
                 )
             streams = {self.process.stdout: out, self.process.stderr: err}
-            deadline = time.monotonic() + self.timeout
+            started = time.monotonic_ns()
             while streams or self.process.poll() is None:
                 if self.cancelled.is_set():
                     reason = "cancelled"
                     break
-                if time.monotonic() >= deadline:
+                if time.monotonic_ns() - started >= self.timeout * 1_000_000_000:
                     reason = "timeout"
                     break
                 self.instance.check_interfaces()
@@ -207,14 +225,19 @@ class Execution:
 
 
 class Instance:
-    def __init__(self, backend, uid, gid, policy):
+    def __init__(self, backend, uid, gid, policy, groups):
         self.id = uuid.uuid4().hex
         self.uid, self.gid = uid, gid
-        account = pwd.getpwuid(uid)
-        self.groups = os.getgrouplist(account.pw_name, gid)
+        self.groups = list(groups)
+        if os.geteuid() != 0 and (
+            (os.getuid(), os.getgid()) != (uid, gid)
+            or set(os.getgroups()) != set(self.groups)
+        ):
+            raise PermissionError("backend cannot assume the caller identity")
         self.policy = policy
         self.directory = backend.state / self.id
         self.directory.mkdir(mode=0o711)
+        self.directory.chmod(0o711)
         self.group = self.mounts = self.filters = None
         self.tasks = {}
         self.lock = threading.RLock()
@@ -232,7 +255,9 @@ class Instance:
             )
             temporary = self.directory / "tmp"
             temporary.mkdir(mode=0o700)
-            (temporary / "enkiball-home").mkdir()
+            temporary.chmod(0o700)
+            (temporary / "enkiball-home").mkdir(mode=0o700)
+            (temporary / "enkiball-home").chmod(0o700)
             if os.geteuid() == 0:
                 os.chown(temporary, uid, gid)
                 os.chown(temporary / "enkiball-home", uid, gid)
@@ -292,8 +317,8 @@ class Instance:
             raise ValueError("command must be a non-empty string without NUL")
         if not isinstance(cwd, str) or not Path(cwd).is_absolute() or "\0" in cwd:
             raise ValueError("cwd must be an absolute path")
-        if type(timeout) is not int or not 1 <= timeout <= 600:
-            raise ValueError("timeout_sec must be between 1 and 600")
+        if type(timeout) is not int or timeout < 1:
+            raise ValueError("timeout_sec must be a positive integer")
         env = environment(request.get("env", {}))
         stdin = request.get("stdin")
         if stdin is not None and (
@@ -362,7 +387,14 @@ class Backend:
             raise PermissionError(
                 "Backend state directory must be owned by its service user and not writable by others"
             )
-        self.lockfile = (self.state / "backend.lock").open("a")
+        # mkdir is affected by the service umask; repair existing installations
+        # as well. Execute permits traversal without exposing directory listings.
+        self.state.chmod(0o711)
+        lock_fd = os.open(
+            self.state / "backend.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+        )
+        os.fchmod(lock_fd, 0o600)
+        self.lockfile = os.fdopen(lock_fd, "a")
         fcntl.flock(self.lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.instances = {}
         self.lock = threading.RLock()
@@ -379,15 +411,18 @@ class Backend:
         # An unprivileged service cannot grant more authority than its own identity.
         if uid == os.geteuid():
             return
-        limits = self.authorization.get(str(uid))
+        if str(uid) not in self.authorization:
+            return
+        limits = self.authorization[str(uid)]
         if not isinstance(limits, dict):
-            raise PermissionError("Caller is not authorized to create sandboxes")
+            raise ValueError("Authorization limits must be an object")
         for rule in policy["filesystem"]:
             if rule["access"] == "deny":
                 continue
-            roots = limits.get(
-                "write_paths" if rule["access"] == "write" else "read_paths", []
-            )
+            key = "write_paths" if rule["access"] == "write" else "read_paths"
+            if key not in limits:
+                continue
+            roots = limits[key]
             if rule["access"] == "read":
                 roots = [*roots, *limits.get("write_paths", [])]
             if not any(
@@ -395,12 +430,12 @@ class Backend:
             ):
                 raise PermissionError(f"Path is not authorized: {rule['path']}")
         for rule in policy["devices"]:
-            if rule not in limits.get("devices", []):
+            if "devices" in limits and rule not in limits["devices"]:
                 raise PermissionError("Device access is not authorized")
-        if set(policy["capabilities"]) - set(limits.get("capabilities", [])):
+        if "capabilities" in limits and set(policy["capabilities"]) - set(limits["capabilities"]):
             raise PermissionError("Capabilities are not authorized")
         # Administrators authorize complete paired network rules, never Cartesian products.
-        if policy["network"] != {"outbound": []} and policy[
+        if "networks" in limits and policy["network"] != {"outbound": []} and policy[
             "network"
         ] not in limits.get("networks", []):
             raise PermissionError("Network policy is not authorized")
@@ -414,7 +449,7 @@ class Backend:
             if key not in policy["resources"] or policy["resources"][key] > maximum:
                 raise PermissionError(f"Resource ceiling required: {key} <= {maximum}")
 
-    def request(self, uid, gid, request):
+    def request(self, uid, gid, request, groups=None):
         if (
             not isinstance(request, dict)
             or type(request.get("version")) is not int
@@ -443,6 +478,8 @@ class Backend:
             raise ValueError("Unknown operation")
         fields(request, {"version", "op"} | operations[op], "request")
         if op == "create":
+            if groups is None:
+                raise PermissionError("Caller supplementary groups are unavailable")
             raw = request.get("policy")
             if not isinstance(raw, dict):
                 raise TypeError("policy must be an object")
@@ -459,7 +496,7 @@ class Backend:
             with self.lock:
                 if len(self.instances) >= 128:
                     raise RuntimeError("Backend instance limit reached")
-                instance = Instance(self, uid, gid, policy)
+                instance = Instance(self, uid, gid, policy, groups)
                 self.instances[instance.id] = instance
             return instance.snapshot()
         identity = valid_id(request.get("sandbox_id"))
@@ -537,7 +574,7 @@ class Handler(socketserver.BaseRequestHandler):
         self.request.settimeout(10)
         try:
             _, uid, gid = struct.unpack(
-                "3i", self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+                "iII", self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
             )
             data = bytearray()
             while True:
@@ -548,7 +585,12 @@ class Handler(socketserver.BaseRequestHandler):
                 if len(data) > MAX_REQUEST:
                     raise ValueError("Request exceeds size limit")
             request = json.loads(data)
-            result = self.server.backend.request(uid, gid, request)
+            if isinstance(request, dict) and request.get("op") == "create":
+                result = self.server.backend.request(
+                    uid, gid, request, peer_groups(self.request)
+                )
+            else:
+                result = self.server.backend.request(uid, gid, request)
             response = {"version": VERSION, "ok": True, "result": result}
         except Exception as error:
             response = {
@@ -589,6 +631,30 @@ def prepare_cgroup(root):
     return root
 
 
+def configure_socket_permissions(path, socket_group, users_file):
+    users = []
+    if users_file:
+        config = Path(users_file)
+        info = config.stat()
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise PermissionError("Socket users file must be owned by the service user and not writable by others")
+        for line in config.read_text().splitlines():
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            if not value.isascii() or not value.isdecimal() or int(value) > 4294967294:
+                raise ValueError("Socket users file must contain numeric UIDs")
+            users.append(int(value))
+    if socket_group is not None:
+        os.chown(path, -1, socket_group)
+    os.chmod(path, 0o660 if socket_group is not None else 0o600)
+    if users:
+        subprocess.run(
+            ["setfacl", "-m", ",".join(f"u:{uid}:rw" for uid in sorted(set(users))), "--", str(path)],
+            check=True, capture_output=True, text=True,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", default="/run/enkisandbox/control.sock")
@@ -600,6 +666,7 @@ def main():
     parser.add_argument(
         "--socket-group", type=int, help="numeric group allowed to connect"
     )
+    parser.add_argument("--socket-users-file", help="file containing UIDs allowed to connect")
     args = parser.parse_args()
     authorization = None
     if args.authorization:
@@ -615,9 +682,7 @@ def main():
     if path.exists():
         path.unlink()
     server = Server(path, backend)
-    if args.socket_group is not None:
-        os.chown(path, -1, args.socket_group)
-    os.chmod(path, 0o660 if args.socket_group is not None else 0o600)
+    configure_socket_permissions(path, args.socket_group, args.socket_users_file)
 
     def stop(*_):
         threading.Thread(target=server.shutdown, daemon=True).start()

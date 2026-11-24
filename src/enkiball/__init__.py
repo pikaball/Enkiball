@@ -9,9 +9,10 @@ Public API::
         print(result)
 """
 
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
+
 from .agent import ChatResult, Enkiball
-from .cli import EnkiballCLI
-from .commands import CommandContext, CommandHandler
 from .llm import DEFAULT_COMPACT_PROMPT, LiveSnapshot, RetryEvent, TokenUsage
 from .llm_tools import (
     BUILTIN_TOOL_NAMES,
@@ -37,12 +38,37 @@ from .sandbox import EnkiSandbox, PermissionDeniedError, SandboxUnavailableError
 from .session_store import SessionRecord, SessionStore
 from .skills import Skill, SkillRegistry
 
+if TYPE_CHECKING:
+    from .cli import CliTurnContext, EnkiballCLI
+    from .commands import CommandContext, CommandHandler
+
+_CLI_EXPORTS = {
+    "CliTurnContext": ".cli",
+    "EnkiballCLI": ".cli",
+    "CommandContext": ".commands",
+    "CommandHandler": ".commands",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module = _CLI_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(globals().keys() | _CLI_EXPORTS.keys())
+
 __all__ = [
     "Enkiball",
     "EnkiSandbox",
     "PermissionDeniedError",
     "SandboxUnavailableError",
     "EnkiballCLI",
+    "CliTurnContext",
     "CommandHandler",
     "CommandContext",
     "ChatResult",

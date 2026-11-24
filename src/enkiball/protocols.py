@@ -195,7 +195,7 @@ class EventDecoder:
 
     def decode(self, data: dict[str, Any]) -> list[Any]:
         if self.protocol == "chat-completions":
-            return [ChatCompletionChunk.model_validate(data)]
+            return [ChatCompletionChunk(**data)]
         if data.get("type") == "error":
             raise RuntimeError(f"provider stream error: {data.get('error', data.get('message', 'unknown error'))}")
         return self._responses(data) if self.protocol == "responses" else self._anthropic(data)

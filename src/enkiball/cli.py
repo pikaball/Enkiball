@@ -1,27 +1,61 @@
+"""Reusable CLI runner and hooks for library consumers.
+
+The installed application's entry point and policies live in ``system_cli``.
+"""
+
 from __future__ import annotations
 
-import argparse
+import asyncio
 import os
 import select
 import sys
 import termios
 import threading
 import tty
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
-from prompt_toolkit.history import FileHistory
+from prompt_toolkit.history import FileHistory, History, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from rich.console import Console
+from rich.console import Console, RenderableType
 
 from .agent import Enkiball
 from .cli_renderer import CliRenderer
 from .commands import CommandHandler, SLASH_COMPLETIONS
-from .config import DEFAULT_CONFIG_PATH
 from .sandbox import TurnInterrupted
+from .session_store import SessionStore
+
+
+@dataclass(frozen=True)
+class CliTurnContext:
+    """Context passed to a CLI hook after a foreground turn is saved.
+
+    Hooks run after renderer/approval cleanup, including on interruption or
+    error. ``should_stop`` belongs to the hook, not the completed chat turn.
+    Slash commands do not emit this event.
+    """
+
+    agent: Enkiball
+    console: Console
+    session_store: SessionStore
+    session_id: str | None
+    text: str
+    images: tuple[str, ...]
+    first_turn: bool
+    interrupted: bool
+    error: BaseException | None
+    should_stop: Callable[[], bool]
+    background: bool = False
+
+
+@dataclass(frozen=True)
+class _BackgroundInput:
+    context: str
+    draft: str = ""
 
 
 def _build_completer(words: list[str] | None = None) -> WordCompleter:
@@ -81,15 +115,6 @@ def _prompt_approval(
         "2": "always",
         "always": "always",
     }.get(answer.strip().lower(), "deny")
-
-
-def _derive_session_title(text: str, image_paths: list[str]) -> str:
-    compact = " ".join(text.split())
-    if compact:
-        return compact[:48] if len(compact) <= 48 else f"{compact[:45]}..."
-    if image_paths:
-        return f"images-{len(image_paths)}"
-    return "untitled"
 
 
 class _StreamInputMonitor:
@@ -192,6 +217,10 @@ class EnkiballCLI:
         input_transform: Callable[[str, list[str]], str | tuple[str, str | None]] | None = None,
         turn_lock: object | None = None,
         on_session_change: Callable[[str], None] | None = None,
+        on_turn_end: Callable[[CliTurnContext], None] | None = None,
+        poll_background: Callable[[], str | None] | None = None,
+        on_background_turn: Callable[[str], None] | None = None,
+        tool_renderers: Mapping[str, Callable[[dict[str, Any], Path], RenderableType]] | None = None,
         debug_scope: dict[str, Any] | None = None,
         btw_context: Callable[[], str] | None = None,
     ) -> None:
@@ -213,13 +242,17 @@ class EnkiballCLI:
             debug_scope=self.debug_scope,
             btw_context=btw_context,
         )
-        self.history_path = history_path or (
-            Path.home() / ".config" / "enkiball" / "history"
-        )
+        self.history_path = history_path
+        if history_path is None and self.session_store.persist:
+            self.history_path = Path.home() / ".config" / "enkiball" / "history"
         self.banner = banner
         self.input_transform = input_transform
         self.turn_lock = turn_lock
         self.on_session_change = on_session_change
+        self.on_turn_end = on_turn_end
+        self.poll_background = poll_background
+        self.on_background_turn = on_background_turn
+        self.tool_renderers = tool_renderers
 
     # -- Extensibility shortcuts --------------------------------------------
 
@@ -234,6 +267,28 @@ class EnkiballCLI:
         self.handler.register_command(name, handler, help_text, completions)
 
     # -- Main loop ----------------------------------------------------------
+
+    def _prompt(self, session: PromptSession[str], **kwargs) -> str | _BackgroundInput:
+        if self.poll_background is None:
+            return session.prompt("you> ", **kwargs)
+        pending = self.poll_background()
+        if pending is not None:
+            return _BackgroundInput(pending, kwargs.get("default", ""))
+
+        async def watch() -> None:
+            while True:
+                await asyncio.sleep(0.1)
+                pending = self.poll_background()
+                if pending is not None:
+                    session.app.exit(result=_BackgroundInput(
+                        pending, session.app.current_buffer.text,
+                    ))
+                    return
+
+        return session.prompt(
+            "you> ", **kwargs,
+            pre_run=lambda: session.app.create_background_task(watch()),
+        )
 
     def run(self) -> None:
         try:
@@ -250,8 +305,15 @@ class EnkiballCLI:
         handler = self.handler
         session_store = self.session_store
 
+        history: History
+        if self.history_path is None:
+            history = InMemoryHistory()
+        else:
+            path = Path(self.history_path).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            history = FileHistory(str(path))
         session: PromptSession[str] = PromptSession(
-            history=FileHistory(str(self.history_path)),
+            history=history,
             auto_suggest=AutoSuggestFromHistory(),
             completer=_build_completer(handler.completions),
             complete_while_typing=True,
@@ -282,14 +344,18 @@ class EnkiballCLI:
             if prefill_text is not None:
                 prompt_kwargs["default"] = prefill_text
             try:
-                line = session.prompt("you> ", **prompt_kwargs)
+                line = self._prompt(session, **prompt_kwargs)
             except KeyboardInterrupt:
                 break
             except EOFError:
                 break
-            prefill_text = None
-
-            text = line.strip()
+            background = isinstance(line, _BackgroundInput)
+            prefill_text = line.draft if background else None
+            text = (
+                "Background update from previously started work "
+                "(data, not a new user request):\n" + line.context
+                if background else line.strip()
+            )
 
             if text.startswith("/"):
                 before_session_id = session_store.current_session_id
@@ -322,7 +388,7 @@ class EnkiballCLI:
                     and after_session_id
                     and session_store.has_user_turn(agent.messages)
                 ):
-                    CliRenderer(console, agent.cwd).history(
+                    CliRenderer(console, agent.cwd, self.tool_renderers).history(
                         agent.messages,
                         title=session_store.current_session_name or after_session_id,
                         show_thinking=agent.show_thinking,
@@ -337,10 +403,10 @@ class EnkiballCLI:
             if not text and not handler.staged_images:
                 continue
 
-            images_for_turn = list(handler.staged_images)
+            images_for_turn = [] if background else list(handler.staged_images)
             llm_text = text
             system_context: str | None = None
-            if self.input_transform:
+            if self.input_transform and not background:
                 transformed = self.input_transform(text, images_for_turn)
                 if isinstance(transformed, tuple):
                     llm_text, system_context = transformed
@@ -348,12 +414,19 @@ class EnkiballCLI:
                     llm_text = transformed
 
             thinking_active = agent.show_thinking
-            renderer = CliRenderer(console, agent.cwd)
+            renderer = CliRenderer(
+                console, agent.cwd, self.tool_renderers,
+                response_label="assistant · background report" if background else "assistant",
+            )
 
             interrupted = False
             exit_requested = False
+            turn_error: BaseException | None = None
+            turn_session_id = session_store.current_session_id
+            first_turn = not background and not session_store.has_user_turn(agent.messages)
+            monitor = _StreamInputMonitor()
             try:
-                with _StreamInputMonitor() as monitor:
+                with monitor:
                     def _approve_directory(path: Path, operation: str) -> str:
                         privileged = operation == "privileged command"
                         renderer.pause()
@@ -365,12 +438,13 @@ class EnkiballCLI:
                             monitor.resume()
 
                     agent._set_approval_handler(_approve_directory)
-                    if not session_store.current_session_persisted:
-                        session_store.rename_current(
-                            _derive_session_title(text, images_for_turn)
-                        )
+                    if background and self.on_background_turn:
+                        try:
+                            self.on_background_turn(line.context)
+                        except Exception as exc:
+                            console.print(f"background hook error: {exc}", style="yellow")
                     if self.turn_lock is None:
-                        agent.chat(
+                        result = agent.chat(
                             llm_text,
                             images_for_turn,
                             on_token=renderer.token,
@@ -382,7 +456,7 @@ class EnkiballCLI:
                         )
                     else:
                         with self.turn_lock:
-                            agent.chat(
+                            result = agent.chat(
                                 llm_text,
                                 images_for_turn,
                                 on_token=renderer.token,
@@ -392,104 +466,59 @@ class EnkiballCLI:
                                 system_context=system_context,
                                 should_stop=monitor.should_stop,
                             )
-                    interrupted = monitor.interrupted
+                    interrupted = monitor.interrupted or result.interrupted
                     exit_requested = monitor.exit_requested
 
-                handler.staged_images.clear()
-                if interrupted:
-                    console.print("\n[interrupted]", style="bold yellow")
-                session_store.save_current_messages(agent.messages)
-                console.print("")
-                if exit_requested:
-                    break
-            except KeyboardInterrupt:
-                console.print("\n[interrupted]", style="bold yellow")
-                handler.staged_images.clear()
-                session_store.save_current_messages(agent.messages)
-                break
-            except TurnInterrupted:
-                console.print("\n[interrupted]", style="bold yellow")
-                handler.staged_images.clear()
-                session_store.save_current_messages(agent.messages)
+                if not background:
+                    handler.staged_images.clear()
+            except KeyboardInterrupt as exc:
+                turn_error = exc
+                interrupted = True
+                exit_requested = True
+                if not background:
+                    handler.staged_images.clear()
+            except TurnInterrupted as exc:
+                turn_error = exc
+                interrupted = True
+                if not background:
+                    handler.staged_images.clear()
             except Exception as e:  # noqa: BLE001
+                turn_error = e
                 console.print("")
                 console.print(f"LLM error: {e}", style="bold red")
-                session_store.save_current_messages(agent.messages)
             finally:
                 renderer.finish()
                 agent._set_approval_handler(None)
-
-
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Enkiball interactive CLI")
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help=f"config file (default: {DEFAULT_CONFIG_PATH})",
-    )
-    parser.add_argument("--cwd", type=Path, default=Path.cwd())
-    parser.add_argument(
-        "--dir-permission",
-        action="append",
-        default=[],
-        metavar="DIR",
-        help="allow tool access to an additional directory; repeatable",
-    )
-    parser.add_argument(
-        "--ro-permission",
-        action="append",
-        default=[],
-        metavar="DIR",
-        help="allow read-only tool access to an additional directory; repeatable",
-    )
-    parser.add_argument(
-        "--no-approval",
-        action="store_true",
-        help="silently deny tool access outside allowed directories",
-    )
-    parser.add_argument(
-        "--sandbox-network",
-        choices=("none", "host"),
-        default="none",
-        help="network access for sandboxed commands (default: none)",
-    )
-    parser.add_argument(
-        "--sandbox-env",
-        action="append",
-        default=[],
-        metavar="NAME",
-        help="inherit a host environment variable in the sandbox; repeatable",
-    )
-    parser.add_argument(
-        "--privilleged",
-        action="store_true",
-        help="disable command sandboxing and allow file access to any directory",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> None:
-    args = _parse_args(argv)
-    try:
-        agent = Enkiball(
-            config_path=args.config,
-            cwd=args.cwd,
-            dir_permissions=[Path(args.cwd).resolve().anchor]
-            if args.privilleged
-            else args.dir_permission,
-            approval=not args.no_approval,
-            sandbox=not args.privilleged,
-            sandbox_network=args.sandbox_network,
-            sandbox_inherit_env=args.sandbox_env,
-            ro_permissions=args.ro_permission,
-            auto_start_mcp=True,
-        )
-        cli = EnkiballCLI(agent)
-    except FileNotFoundError:
-        raise SystemExit(1) from None
-    cli.run()
-
-
-if __name__ == "__main__":
-    main()
+                interrupted = interrupted or monitor.interrupted
+                exit_requested = exit_requested or monitor.exit_requested
+                if interrupted:
+                    console.print("\n[interrupted]", style="bold yellow")
+                session_store.save_current_messages(agent.messages)
+                if self.on_turn_end:
+                    # A completed turn's cancellation must not cancel its hook.
+                    with _StreamInputMonitor() as hook_monitor:
+                        try:
+                            self.on_turn_end(CliTurnContext(
+                                agent=agent,
+                                console=console,
+                                session_store=session_store,
+                                session_id=turn_session_id,
+                                text=text,
+                                images=tuple(images_for_turn),
+                                first_turn=first_turn,
+                                interrupted=interrupted,
+                                error=turn_error,
+                                should_stop=hook_monitor.should_stop,
+                                background=background,
+                            ))
+                        except KeyboardInterrupt:
+                            exit_requested = True
+                        except TurnInterrupted:
+                            console.print("[hook interrupted]", style="yellow")
+                        except Exception as exc:  # noqa: BLE001
+                            console.print(f"turn end hook error: {exc}", style="bold red")
+                        finally:
+                            exit_requested = exit_requested or hook_monitor.exit_requested
+                console.print("")
+            if exit_requested:
+                break

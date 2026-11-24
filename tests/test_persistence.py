@@ -381,6 +381,29 @@ class InlineConfigTests(unittest.TestCase):
             agent.providers["default"]["base_url"], "https://api.anthropic.com/v1"
         )
 
+    def test_shorthand_fields_select_a_config_source_even_when_passed_alone(self) -> None:
+        self.assertEqual(self.build(protocol="anthropic").protocol, "anthropic")
+        self.assertEqual(self.build(extra_config={"system_prompt": "example"}).system_prompt, "example")
+        for field in ({"protocol": "anthropic"}, {"extra_config": {}}):
+            for source in ({"config": {}}, {"config_path": self.root / "config.json"}):
+                with self.subTest(field=field, source=source), self.assertRaises(ValueError):
+                    self.build(**source, **field)
+
+    def test_inline_config_saves_only_to_explicit_destination(self) -> None:
+        default = self.root / "user.json"
+        default.write_text("original")
+        for source in ({"config": {}}, {"api_key": "inline"}):
+            with self.subTest(source=source), patch("enkiball.agent.DEFAULT_CONFIG_PATH", default):
+                agent = self.build(**source, persist=True, state_path=self.root / "state.json")
+                self.assertIsNone(agent.config_path)
+                with self.assertRaisesRegex(ValueError, "explicit destination"):
+                    agent.add_mcp_server("local", {"command": "example"}, save=True)
+                self.assertNotIn("local", agent.config.get("mcp", {}))
+                target = self.root / "exported.json"
+                self.assertTrue(agent.add_mcp_server("local", {"command": "example"}, save=target)[0])
+                self.assertEqual(json.loads(target.read_text()), agent.config)
+                self.assertEqual(default.read_text(), "original")
+
     def test_conflicting_config_sources_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "not several"):
             Enkiball(config_path=self.root / "enki.json", api_key="k")

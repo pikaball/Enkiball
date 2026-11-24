@@ -252,8 +252,8 @@ class EnkiSandbox:
         self._check_open()
         if not isinstance(command, str) or not command.strip() or "\0" in command:
             raise ValueError("command must be a non-empty string without NUL")
-        if type(timeout_sec) is not int or not 1 <= timeout_sec <= 600:
-            raise ValueError("timeout_sec must be between 1 and 600")
+        if type(timeout_sec) is not int or timeout_sec < 1:
+            raise ValueError("timeout_sec must be a positive integer")
         cwd = Path(cwd or self._base_dir).expanduser().absolute()
         if cancel_event is not None and cancel_event.is_set():
             raise TurnInterrupted
@@ -679,8 +679,8 @@ class Sandbox:
     ) -> tuple[int, str, str]:
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command must be a non-empty string")
-        if isinstance(timeout_sec, bool) or not 1 <= timeout_sec <= 600:
-            raise ValueError("timeout_sec must be between 1 and 600")
+        if type(timeout_sec) is not int or timeout_sec < 1:
+            raise ValueError("timeout_sec must be a positive integer")
         if not isinstance(privileged, bool):
             raise TypeError("privileged must be a boolean")
         if cancel_event is not None and cancel_event.is_set():
@@ -724,7 +724,7 @@ class Sandbox:
             stop_reading,
             getattr(self, "_output_limit", MAX_OUTPUT_BYTES),
         )
-        deadline = time.monotonic() + timeout_sec
+        started = time.monotonic_ns()
         try:
             # A shell may exit while its descendants still hold the pipes.
             # Keep enforcing cancellation/deadlines until output is drained.
@@ -737,8 +737,7 @@ class Sandbox:
                     and not stderr_thread.is_alive()
                 ):
                     break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if time.monotonic_ns() - started >= timeout_sec * 1_000_000_000:
                     raise subprocess.TimeoutExpired(
                         command,
                         timeout_sec,
@@ -752,9 +751,9 @@ class Sandbox:
                         ),
                     ) from None
                 if cancel_event is not None:
-                    cancel_event.wait(min(0.05, remaining))
+                    cancel_event.wait(0.05)
                 else:
-                    time.sleep(min(0.05, remaining))
+                    time.sleep(0.05)
         except BaseException:
             # Descendants can outlive the group leader; kill the owned group
             # even when the original shell has already been reaped.

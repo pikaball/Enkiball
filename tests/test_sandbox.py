@@ -17,10 +17,9 @@ from prompt_toolkit.output import DummyOutput
 
 from enkiball.cli import (
     _build_approval_key_bindings,
-    _parse_args,
     _prompt_approval,
-    main,
 )
+from enkiball.system_cli.app import _parse_args, main
 from enkiball.llm import ChatEngine
 from enkiball.llm_tools import dispatch_tool
 from enkiball.sandbox import (
@@ -244,7 +243,7 @@ class CliPermissionTests(unittest.TestCase):
         args = _parse_args(["--cwd", "."])
 
         self.assertFalse(args.no_approval)
-        self.assertFalse(args.privilleged)
+        self.assertFalse(args.privileged)
         self.assertEqual(args.dir_permission, [])
         self.assertEqual(args.ro_permission, [])
         self.assertEqual(args.sandbox_network, "none")
@@ -282,11 +281,11 @@ class CliPermissionTests(unittest.TestCase):
     def test_cli_accepts_privilleged_mode(self) -> None:
         args = _parse_args(["--privilleged"])
 
-        self.assertTrue(args.privilleged)
+        self.assertTrue(args.privileged)
 
     def test_cli_privilleged_mode_disables_sandbox_and_allows_root(self) -> None:
-        with patch("enkiball.cli.Enkiball") as agent_class:
-            with patch("enkiball.cli.EnkiballCLI") as cli_class:
+        with patch("enkiball.system_cli.app.Enkiball") as agent_class:
+            with patch("enkiball.system_cli.app.EnkiballCLI") as cli_class:
                 main(["--cwd", ".", "--privilleged"])
 
         kwargs = agent_class.call_args.kwargs
@@ -338,6 +337,13 @@ class HostExecTests(unittest.TestCase):
         self.external = tempfile.TemporaryDirectory()
         self.addCleanup(self.workspace.cleanup)
         self.addCleanup(self.external.cleanup)
+
+    def test_command_timeout_accepts_large_positive_integers(self) -> None:
+        sandbox = Sandbox(cwd=self.workspace.name, sandbox=False)
+        self.assertEqual(sandbox.run("printf ok", timeout_sec=10**400), (0, "ok", ""))
+        for invalid in (0, -1, True, 1.5):
+            with self.subTest(timeout=invalid), self.assertRaises(ValueError):
+                sandbox.run("true", timeout_sec=invalid)
 
     def test_disabled_sandbox_runs_on_host_without_bubblewrap(self) -> None:
         sandbox = Sandbox(cwd=self.workspace.name, sandbox=False)

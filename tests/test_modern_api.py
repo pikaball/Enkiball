@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from enkiball import (
     BUILTIN_TOOL_NAMES,
@@ -120,7 +120,7 @@ class ModernAPITests(unittest.TestCase):
         ok, msg = agent.add_mcp_server("test_echo", server_cfg)
         self.assertTrue(ok)
         self.assertIn("added", msg)
-        self.assertIn("test_echo", agent.config["mcp"]["servers"])
+        self.assertIn("test_echo", agent.config["mcp"])
 
         # Status check
         status = agent.mcp.status()
@@ -129,7 +129,7 @@ class ModernAPITests(unittest.TestCase):
         # Remove
         removed = agent.remove_mcp_server("test_echo")
         self.assertTrue(removed)
-        self.assertNotIn("test_echo", agent.config.get("mcp", {}).get("servers", {}))
+        self.assertNotIn("test_echo", agent.config["mcp"])
 
     def test_agent_register_mcp_client(self) -> None:
         agent = self._create_agent()
@@ -151,6 +151,35 @@ class ModernAPITests(unittest.TestCase):
         # Direct tool call via manager
         res = agent.mcp.call_tool("mcp__inproc_service__dummy_tool", {"arg": "hello"})
         self.assertEqual(res, "called dummy_tool with {'arg': 'hello'}")
+
+    def test_deferred_mcp_client_uses_registration_name_across_restarts(self) -> None:
+        agent = self._create_agent()
+        client = DummyMCPClient("implementation")
+        self.assertTrue(agent.register_mcp_client("alias", client, start=False)[0])
+        self.assertEqual(agent.mcp.status()["alias"], "STOPPED")
+        for _ in range(2):
+            self.assertTrue(agent.mcp.start("alias")[0])
+            name = agent.mcp.get_tools()[0]["function"]["name"]
+            self.assertEqual(name, "mcp__alias__dummy_tool")
+            self.assertEqual(agent.mcp.call_tool(name, {}), "called dummy_tool with {}")
+            self.assertTrue(agent.mcp.stop("alias")[0])
+        self.assertTrue(agent.remove_mcp_server("alias"))
+        self.assertFalse(agent.mcp.start("alias")[0])
+
+    def test_shutdown_continues_after_client_close_failure_and_allows_retry(self) -> None:
+        agent = self._create_agent()
+        first, second = DummyMCPClient("first"), DummyMCPClient("second")
+        agent.register_mcp_client("first", first)
+        agent.register_mcp_client("second", second)
+        with patch.object(first, "close", side_effect=RuntimeError("busy")), patch.object(
+            agent._sandbox, "close", wraps=agent._sandbox.close
+        ) as close_sandbox:
+            messages = agent.shutdown()
+        self.assertIn("first failed to stop: busy", messages)
+        self.assertFalse(second.running)
+        close_sandbox.assert_called_once()
+        self.assertIn("first stopped", agent.shutdown())
+        self.assertFalse(first.running)
 
     # ------------------------------------------------------------------------
     # 2. Modern Tools API Tests (Schema Derivation, Unpacking, Async, Builtin Tools)
@@ -255,6 +284,21 @@ class ModernAPITests(unittest.TestCase):
         self.assertIn("read_file", sel_names)
         self.assertNotIn("write_file", sel_names)
         self.assertNotIn("run_command", sel_names)
+
+    def test_builtin_tools_consumes_the_allowlist_once(self) -> None:
+        for names, expected in (
+            (iter(["read_file"]), {"read_file"}),
+            ({"read_file": 1}.keys(), {"read_file"}),
+            ("read_file", {"read_file"}),
+            (iter(()), set()),
+        ):
+            agent = self._create_agent(builtin_tools=names)
+            for _ in range(2):
+                actual = {t["function"]["name"] for t in agent._engine._get_tools()}
+                self.assertEqual(actual, expected)
+                self.assertIn("not enabled", agent._engine._dispatch_tool("write_file", {}))
+        with self.assertRaisesRegex(ValueError, "unknown builtin"):
+            self._create_agent(builtin_tools=iter(["read_flie"]))
 
     # ------------------------------------------------------------------------
     # 3. Tool Lifecycle Hooks Tests

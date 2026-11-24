@@ -3,8 +3,9 @@ from __future__ import annotations
 import difflib
 import json
 from copy import copy
+from itertools import chain
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
@@ -66,10 +67,17 @@ def _prefixed_lines(
         overflow="ignore",
     )
     segments = console.render(renderable, render_options)
-    for index, (line, newline) in enumerate(Segment.split_lines_terminator(segments)):
+    # Mark the unterminated final line when using Rich 13's split_lines API.
+    end = Segment("")
+    for index, line in enumerate(Segment.split_lines(chain(segments, (end,)))):
+        terminated = not line or line[-1] is not end
+        if not terminated:
+            line.pop()
+            if not line:
+                break
         yield first if index == 0 else continuation
         yield from line
-        if newline:
+        if terminated:
             yield Segment.line()
 
 
@@ -357,9 +365,15 @@ def render_tool_event(event: str, cwd: Path) -> RenderableType:
 
 
 class CliRenderer:
-    def __init__(self, console: Console, cwd: Path) -> None:
+    def __init__(
+        self, console: Console, cwd: Path,
+        tool_renderers: Mapping[str, Callable[[dict[str, Any], Path], RenderableType]] | None = None,
+        *, response_label: str = "assistant",
+    ) -> None:
         self.console = console
         self.cwd = cwd
+        self.tool_renderers = tool_renderers or {}
+        self.response_label = response_label
         self._pending_content = ""
         self._thinking_parts: list[str] = []
         self._live: Live | None = None
@@ -372,7 +386,7 @@ class CliRenderer:
         if self._response_started:
             return
         marker = Text("● ", style="green")
-        marker.append("assistant", style="bold green")
+        marker.append(self.response_label, style="bold green")
         self.console.print(marker)
         self._response_started = True
         self._content_printed = False
@@ -399,7 +413,12 @@ class CliRenderer:
         self.console.print()
         self._mode = None
         self._response_started = False
-        self.console.print(render_tool_event(event, self.cwd), soft_wrap=True)
+        self.console.print(self._render_tool(event), soft_wrap=True)
+
+    def _render_tool(self, event: str) -> RenderableType:
+        name, args = parse_tool_event(event)
+        custom = self.tool_renderers.get(name)
+        return custom(args, self.cwd) if custom else render_tool_event(event, self.cwd)
 
     def retry(self, event: object) -> None:
         self._flush_current()
@@ -507,7 +526,7 @@ class CliRenderer:
             arguments = function.get("arguments", "{}")
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments, ensure_ascii=False, default=str)
-            self.console.print(render_tool_event(f"{name}({arguments})", self.cwd), soft_wrap=True)
+            self.console.print(self._render_tool(f"{name}({arguments})"), soft_wrap=True)
 
     @staticmethod
     def _history_user_content(content: object) -> tuple[str, list[str]]:
