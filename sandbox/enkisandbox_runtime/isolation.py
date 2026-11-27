@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from .policy import compile_seccomp
@@ -114,6 +115,8 @@ class Mounts:
         self.fds = []
         self.seccomp = None
         self.arguments = []
+        self.base_sources = []
+        self.pinned_rules = []
         self.bwrap = shutil.which("bwrap")
         if not self.bwrap:
             raise RuntimeError("Install bubblewrap on the backend host")
@@ -176,15 +179,21 @@ class Mounts:
                         f"Filesystem rules require regular files or directories: {p}"
                     )
             reject_unsafe_aliases(self.rules)
+            for rule in self.rules:
+                path = Path(rule["path"])
+                info = path.stat()
+                self.pinned_rules.append((path, info.st_dev, info.st_ino))
             # Explicit rules override the visible base policy at the same path.
+            self.base_filesystem = base_policy()
             combined = {
                 r["path"]: r
-                for r in base_policy()
+                for r in self.base_filesystem
                 if not any(
                     Path(r["path"]).is_relative_to(custom["path"])
                     for custom in self.rules
                 )
             }
+            base_paths = set(combined) - {r["path"] for r in self.rules}
             combined.update({r["path"]: r for r in self.rules})
             self.effective_filesystem = sorted(
                 combined.values(), key=lambda r: (len(Path(r["path"]).parts), r["path"])
@@ -212,9 +221,25 @@ class Mounts:
                         mask.touch(mode=0)
                         self.arguments += ["--ro-bind", self.pin(mask), path]
                 else:
+                    source = Path(path)
+                    if path in base_paths:
+                        # Runtime files are routinely replaced by package updates,
+                        # ldconfig, and network configuration managers. Keep the
+                        # destination fixed, but open a fresh source for each task.
+                        temporary_fds = []
+                        try:
+                            self.pin(source, temporary_fds)
+                            mode = stat.S_IFMT(os.fstat(temporary_fds[0]).st_mode)
+                        finally:
+                            for fd in temporary_fds:
+                                os.close(fd)
+                        self.base_sources.append((len(self.arguments) + 1, source, mode))
+                        mount_source = str(source)  # replaced before execution
+                    else:
+                        mount_source = self.pin_policy(source)
                     self.arguments += [
                         "--bind" if access == "write" else "--ro-bind",
-                        self.pin(Path(path)),
+                        mount_source,
                         path,
                     ]
             for alias in RUNTIME_PATHS:
@@ -227,9 +252,10 @@ class Mounts:
                 info = Path(rule["path"]).stat()
                 if not (stat.S_ISCHR(info.st_mode) or stat.S_ISBLK(info.st_mode)):
                     raise ValueError("Device rules require device nodes")
+                self.pinned_rules.append((Path(rule["path"]), info.st_dev, info.st_ino))
                 self.arguments += [
                     "--dev-bind",
-                    self.pin(Path(rule["path"])),
+                    self.pin_policy(Path(rule["path"])),
                     rule["path"],
                 ]
             if "seccomp" in policy:
@@ -242,19 +268,55 @@ class Mounts:
             self.close()
             raise
 
-    def pin(self, path):
+    def pin(self, path, fds=None):
+        if fds is None:
+            fds = self.fds
         fd = os.open(path, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
-        if stat.S_ISLNK(os.fstat(fd).st_mode):
+        try:
+            if stat.S_ISLNK(os.fstat(fd).st_mode):
+                raise ValueError(f"Mount source changed to a symlink: {path}")
+            if Path(os.readlink(f"/proc/self/fd/{fd}")) != path:
+                raise ValueError(f"Mount source changed during policy creation: {path}")
+        except BaseException:
             os.close(fd)
-            raise ValueError(f"Mount source changed to a symlink: {path}")
-        if Path(os.readlink(f"/proc/self/fd/{fd}")) != path:
-            os.close(fd)
-            raise ValueError(f"Mount source changed during policy creation: {path}")
-        self.fds.append(fd)
+            raise
+        fds.append(fd)
         return f"/proc/self/fd/{fd}"
 
-    def argv(self, command, cwd, temporary):
+    def pin_policy(self, path):
+        source = self.pin(path)
+        info = os.fstat(self.fds[-1])
+        if not any(
+            path == p and (info.st_dev, info.st_ino) == (device, inode)
+            for p, device, inode in self.pinned_rules
+        ):
+            raise ValueError(f"Policy path changed during sandbox creation: {path}")
+        return source
+
+    @contextmanager
+    def execution(self, command, cwd, temporary):
+        for path, device, inode in self.pinned_rules:
+            try:
+                info = path.stat()
+                unchanged = path.resolve() == path and (info.st_dev, info.st_ino) == (device, inode)
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                raise ValueError(f"Pinned policy path changed; recreate sandbox: {path}")
         reject_unsafe_aliases(self.rules)
+        fds = []
+        try:
+            arguments = self.arguments.copy()
+            for index, path, mode in self.base_sources:
+                arguments[index] = self.pin(path, fds)
+                if stat.S_IFMT(os.fstat(fds[-1]).st_mode) != mode:
+                    raise ValueError(f"Runtime mount source type changed: {path}")
+            yield self.argv(command, cwd, temporary, arguments), [*self.fds, *fds]
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    def argv(self, command, cwd, temporary, arguments):
         argv = [
             self.bwrap,
             "--die-with-parent",
@@ -280,7 +342,7 @@ class Mounts:
             str(temporary),
             "/tmp",
         ]
-        argv += self.arguments
+        argv += arguments
         for cap in self.capabilities:
             argv += ["--cap-add", "CAP_" + cap]
         return argv + [

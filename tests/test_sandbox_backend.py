@@ -11,12 +11,13 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sandbox"))
 from enkisandbox_runtime.backend import (
-    Backend, Instance, Server, configure_socket_permissions, peer_groups, valid_id,
+    Backend, Execution, Instance, Server, configure_socket_permissions, peer_groups, valid_id,
 )
 from enkisandbox_runtime.isolation import Mounts
 from enkisandbox_runtime.policy import validate_policy
@@ -266,3 +267,34 @@ class BackendTests(unittest.TestCase):
                     os.getgid(),
                     os.getgroups(),
                 )
+
+    def test_cleanup_and_oom_errors_still_complete_and_reap_the_process(self):
+        instance = Mock()
+        instance.group.path = self.cgroup
+        instance.group.task.return_value = self.cgroup / "task"
+        instance.directory = self.root
+        instance.uid, instance.gid, instance.groups = os.getuid(), os.getgid(), os.getgroups()
+        instance.mounts.execution.return_value = nullcontext((["bwrap"], []))
+        instance.mounts.seccomp = None
+        task = Execution(instance, "a" * 32, "true", "/", {}, 10, None, 100)
+        process = Mock(pid=12345, returncode=0)
+        process.poll.return_value = 0
+        process.stdout.fileno.return_value = 100
+        process.stderr.fileno.return_value = 101
+        with patch("enkisandbox_runtime.backend.subprocess.Popen", return_value=process), patch(
+            "enkisandbox_runtime.backend.select.select",
+            side_effect=lambda streams, *_: (streams, [], []),
+        ), patch("enkisandbox_runtime.backend.os.read", return_value=b""), patch(
+            "enkisandbox_runtime.backend.remove_group", side_effect=OSError("cgroup busy")
+        ), patch("enkisandbox_runtime.backend.os.killpg") as killpg, patch.object(
+            task, "oom_count", side_effect=OSError("events missing")
+        ):
+            task.run()
+        self.assertTrue(task.done.is_set())
+        self.assertEqual(task.state, "failed")
+        self.assertIn("cgroup busy", task.result["error"])
+        self.assertIn("events missing", task.result["error"])
+        killpg.assert_called_once()
+        process.wait.assert_called_once()
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()

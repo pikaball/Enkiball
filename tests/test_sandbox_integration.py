@@ -17,7 +17,7 @@ from pathlib import Path
 
 from enkiball import Enkiball, EnkiSandbox
 from enkiball.llm_tools import dispatch_tool
-from enkiball.sandbox import TurnInterrupted
+from enkiball.sandbox import SandboxUnavailableError, TurnInterrupted
 
 SOCKET = os.environ.get("ENKISANDBOX_TEST_SOCKET")
 CLIENT = os.environ.get("ENKISANDBOX_CLIENT")
@@ -99,6 +99,21 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(target.read_text(), "after")
         self.assertNotEqual(sandbox.run("cat private", cwd=self.root)[0], 0)
         self.assertEqual(secret.read_text(), "secret")
+
+    def test_replaced_explicit_mount_fails_closed_and_recovers(self):
+        target = self.root / "pinned"
+        target.write_text("original")
+        sandbox = self.sandbox(filesystem=[{"path": str(target), "access": "read"}])
+        command = "cat " + shlex.quote(str(target))
+        self.assertEqual(sandbox.run(command, cwd="/"), (0, "original", ""))
+        saved = self.root / "saved"
+        target.rename(saved)
+        target.write_text("replacement")
+        with self.assertRaisesRegex(SandboxUnavailableError, "Pinned policy path changed"):
+            sandbox.run(command, cwd="/")
+        target.unlink()
+        saved.rename(target)
+        self.assertEqual(sandbox.run(command, cwd="/"), (0, "original", ""))
 
     def test_nested_denial_and_read_exception(self):
         secret = self.root / "secret"

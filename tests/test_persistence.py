@@ -36,6 +36,8 @@ class SessionStorePathTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.store.load(session_id)
                 with self.assertRaises(ValueError):
+                    self.store.load(session_id, ignore_cwd=True)
+                with self.assertRaises(ValueError):
                     self.store.save_messages(session_id, [])
                 with self.assertRaises(ValueError):
                     self.store.export_session(session_id)
@@ -47,6 +49,8 @@ class SessionStorePathTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.store.load("linked")
+        with self.assertRaises(ValueError):
+            self.store.load("linked", ignore_cwd=True)
 
     def test_sessions_are_filtered_to_current_cwd_and_ancestors(self) -> None:
         sessions = self.root / "sessions"
@@ -76,6 +80,10 @@ class SessionStorePathTests(unittest.TestCase):
         self.assertEqual(child_store.resolve("1"), visible[0].session_id)
         with self.assertRaises(PermissionError):
             child_store.load(sibling_store.current_session_id or "")
+        self.assertEqual(
+            child_store.load(sibling_store.current_session_id, ignore_cwd=True).cwd,
+            str(sibling),
+        )
 
     def test_saving_ancestor_session_preserves_its_bound_cwd(self) -> None:
         sessions = self.root / "sessions"

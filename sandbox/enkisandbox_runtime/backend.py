@@ -23,7 +23,7 @@ import uuid
 from pathlib import Path
 
 from .bpf import CgroupPolicy
-from .isolation import Mounts, base_policy
+from .isolation import Mounts
 from .policy import fields, validate_policy
 from .resources import ResourceGroup, remove_group
 
@@ -126,23 +126,23 @@ class Execution:
         out, err = bytearray(), bytearray()
         reason = None
         try:
-            argv = self.instance.mounts.argv(
-                self.command, self.cwd, self.instance.directory / "tmp"
-            )
-            spec = {
-                "uid": self.instance.uid,
-                "gid": self.instance.gid,
-                "groups": self.instance.groups,
-                "cgroup": str(self.group),
-                "argv": argv,
-                "env": self.env,
-            }
             with (
+                self.instance.mounts.execution(
+                    self.command, self.cwd, self.instance.directory / "tmp"
+                ) as (argv, mount_fds),
                 tempfile.TemporaryFile() as data,
                 tempfile.TemporaryFile() as input_file,
                 tempfile.TemporaryFile() as seccomp_data,
             ):
-                fds = [*self.instance.mounts.fds, data.fileno()]
+                spec = {
+                    "uid": self.instance.uid,
+                    "gid": self.instance.gid,
+                    "groups": self.instance.groups,
+                    "cgroup": str(self.group),
+                    "argv": argv,
+                    "env": self.env,
+                }
+                fds = [*mount_fds, data.fileno()]
                 if self.instance.mounts.seccomp:
                     original = self.instance.mounts.seccomp.fileno()
                     seccomp_data.write(
@@ -194,32 +194,54 @@ class Execution:
             self.state = "failed"
             self.result = {"error": str(error)}
         finally:
+            cleanup_errors = []
             try:
                 # Reaps daemonized descendants as well as the shell.
                 remove_group(self.group)
-                if self.process:
-                    try:
-                        os.killpg(self.process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    self.process.wait()
-                    for stream in (self.process.stdout, self.process.stderr):
-                        stream.close()
             except Exception as error:
+                cleanup_errors.append(str(error))
+            if self.process:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as error:
+                    cleanup_errors.append(str(error))
+                try:
+                    self.process.wait()
+                except Exception as error:
+                    cleanup_errors.append(str(error))
+                for stream in (self.process.stdout, self.process.stderr):
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        cleanup_errors.append(str(error))
+            if cleanup_errors:
                 self.state = "failed"
-                self.result = {"error": f"Task cleanup failed: {error}"}
+                self.result = {"error": f"Task cleanup failed: {'; '.join(cleanup_errors)}"}
 
             def decode(content):
                 return content[: self.output_limit].decode(
                     "utf-8", errors="replace"
                 ) + ("\n...[truncated]" if len(content) > self.output_limit else "")
 
+            try:
+                oom_killed = self.oom_count() > self.oom_before
+            except Exception as error:
+                self.state = "failed"
+                previous_error = (self.result or {}).get("error")
+                message = f"Could not read OOM events: {error}"
+                self.result = {
+                    **(self.result or {}),
+                    "error": f"{previous_error}; {message}" if previous_error else message,
+                }
+                oom_killed = False
             self.result = {
                 **(self.result or {}),
                 "exit_code": self.process.returncode if self.process else None,
                 "stdout": decode(out),
                 "stderr": decode(err),
-                "oom_killed": self.oom_count() > self.oom_before,
+                "oom_killed": oom_killed,
             }
             self.done.set()
 
@@ -290,7 +312,7 @@ class Instance:
             "state": self.state,
             "execution_mode": "sandbox",
             "effective_policy": policy,
-            "base_filesystem": base_policy(),
+            "base_filesystem": copy.deepcopy(self.mounts.base_filesystem),
             "capability_scope": "sandbox user namespace",
             "temporary_directory": "instance",
             "runtime_mounts": [

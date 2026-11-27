@@ -233,6 +233,35 @@ Responses 使用 `store=false` 并将原生输出保存到本地 session；重�
 enkiball
 ```
 
+单次执行并输出结果，不进入交互：
+
+```bash
+enkiball exec "总结这个项目的结构"
+```
+
+`exec` 把整个参数作为一轮普通 prompt（包括以 `/` 开头的内容），保留流式输出并保存会话，然后退出。不读取终端输入、不弹出授权提示，也不额外请求生成会话标题；需要的目录权限可通过下面的授权参数预先指定。成功退出码为 `0`，执行失败为 `1`，中断为 `130`。
+
+按完整 session ID 恢复历史并直接进入对话，也可以与单次执行组合：
+
+```bash
+enkiball resume SESSION_ID
+enkiball exec "继续上次的任务" --session SESSION_ID
+```
+
+`resume`（以及 `exec --session`）使用目标 session 保存的 cwd，忽略启动目录和 `--cwd`。进程、agent、沙箱、MCP 启动及相对目录授权均使用这个 cwd；显式 `--config` 的相对路径仍按启动目录解析。恢复后继续写入原 session；交互模式会回放已有对话。session 不存在、未保存绝对 cwd 或该目录不可进入时会报错退出。`--sandbox-info` 不与子命令组合使用。通用选项（如 `--config`、`--cwd`、沙箱授权参数）可放在子命令之前或之后。
+
+搜索已保存的对话，无需模型配置，也不启动 agent 或 MCP：
+
+```bash
+enkiball search "关键词"
+enkiball search "关键词" --global --include-tool --include-thinking
+enkiball search "关键词" --cwd /path/to/project
+```
+
+默认只搜索保存的 cwd 与当前工作目录相同的会话（可通过 `--cwd` 指定），不包含父目录或子目录的会话；`--global` 搜索所有目录，包括没有 cwd 的旧会话。关键词按不区分大小写的字面子串匹配，不作为正则表达式。默认匹配标题及用户/助手正文；`--include-tool` 额外匹配工具名、调用参数和返回内容，`--include-thinking` 额外匹配保存的 reasoning。系统提示词及内部元数据不参与匹配。
+
+每个命中的会话只输出一次，按更新时间从新到旧排列，显示完整 session ID、标题、cwd、更新时间和首个命中片段；可以用该 ID 执行 `enkiball resume SESSION_ID`。没有匹配时输出提示并正常退出。
+
 系统 CLI 默认请求启用工具沙箱，授权工作目录读写、已发现的 skill 目录只读，并请求隔离网络。只有 `enkisandbox-client` 和 backend 正常工作时，命令才受到内核沙箱策略约束；client 缺失会回退为宿主执行，网络及宿主环境不再被这些沙箱参数限制，内置文件工具的 SDK 路径检查仍保留。可以指定工作目录和额外授权目录：
 
 ```bash
@@ -254,6 +283,8 @@ enkiball --privileged
 这些沙箱参数作用于内置文件/命令工具，不作用于 LLM API 请求、MCP 服务、`/debug` 或 `orchestrate` 的 Python 进程。子 Agent 的工具默认继承请求的沙箱配置，并关闭交互审批。CPU/内存、设备、capability、seccomp、CIDR 等高级策略当前通过 Python `EnkiSandbox` API 配置，尚无对应 CLI 参数。client 和 socket 可分别通过 `ENKISANDBOX_CLIENT`、`ENKISANDBOX_SOCKET` 指定，默认是 `enkisandbox-client` 与 `/run/enkisandbox/control.sock`。client 已存在但服务连接/授权/策略失败时会报错，不会回退宿主模式。
 
 普通输入直接发送给 LLM，支持流式输出。按 `Ctrl+J` 换行，`Enter` 发送。`Esc` 可中断请求发送后等待响应、流式数据等待、重试等待和 MCP 工具调用，也适用于 `/compact`；已收到的对话内容会保留，中断的压缩不会替换历史。
+
+输入时会以灰色显示匹配当前前缀的历史建议，在行尾按 `→` 可接受建议。`↑`/`↓` 按首次浏览时光标前的前缀筛选历史，跳过不匹配的输入，向下浏览到末尾会恢复原草稿；空输入时浏览全部历史。编辑内容后重新确定搜索前缀。多行输入内仍优先上下移动光标，`/` 补全菜单打开时仍优先选择候选项。
 
 内置 slash command 执行失败会显示错误并返回输入提示。CLI 退出（包括异常退出）时会尝试保存当前会话，并清理后台 executor 和 MCP 资源。
 

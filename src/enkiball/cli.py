@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.filters import to_filter
 from prompt_toolkit.history import FileHistory, History, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console, RenderableType
@@ -76,6 +77,23 @@ def _build_key_bindings() -> KeyBindings:
     return kb
 
 
+def _build_prompt_session(history: History, completions: list[str]) -> PromptSession[str]:
+    session = PromptSession(
+        history=history,
+        auto_suggest=AutoSuggestFromHistory(),
+        enable_history_search=True,
+        completer=_build_completer(completions),
+        complete_while_typing=True,
+        multiline=True,
+        key_bindings=_build_key_bindings(),
+    )
+    # PromptSession normally disables live completion during history search.
+    # Our slash menu can coexist: arrow keys select an open menu first, and
+    # otherwise navigate history using the prefix captured on the first arrow.
+    session.default_buffer.complete_while_typing = to_filter(True)
+    return session
+
+
 def _build_approval_key_bindings() -> KeyBindings:
     kb = KeyBindings()
 
@@ -118,7 +136,10 @@ def _prompt_approval(
 
 
 class _StreamInputMonitor:
-    def __init__(self) -> None:
+    _ESCAPE_TIMEOUT = 0.1
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self._enabled = enabled
         self._fd: int | None = None
         self._old_termios: list[object] | None = None
         self._thread: threading.Thread | None = None
@@ -139,7 +160,7 @@ class _StreamInputMonitor:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_termios)
 
     def resume(self) -> None:
-        if not sys.stdin.isatty():
+        if not self._enabled or not sys.stdin.isatty():
             return
         self._fd = sys.stdin.fileno()
         self._old_termios = termios.tcgetattr(self._fd)
@@ -153,20 +174,31 @@ class _StreamInputMonitor:
 
     def _loop(self) -> None:
         assert self._fd is not None
+        escape_pending = False
         while self._running.is_set():
             try:
-                ready, _, _ = select.select([self._fd], [], [], 0.05)
+                timeout = self._ESCAPE_TIMEOUT if escape_pending else 0.05
+                ready, _, _ = select.select([self._fd], [], [], timeout)
             except Exception:
                 return
+            if not self._running.is_set():
+                return
             if not ready:
+                if escape_pending:
+                    self._stop_event.set()
+                    escape_pending = False
                 continue
             try:
                 ch = os.read(self._fd, 1)
             except OSError:
                 return
-            if ch == b"\x1b":
-                self._stop_event.set()
-            elif ch == b"\x03":
+            if not ch:
+                return
+            # Navigation keys and Alt combinations also start with ESC. Only
+            # an ESC with no following byte within the timeout is a cancel;
+            # allow the continuation to arrive in a separate read/write.
+            escape_pending = ch == b"\x1b"
+            if ch == b"\x03":
                 self._stop_event.set()
                 self._exit_event.set()
 
@@ -290,53 +322,69 @@ class EnkiballCLI:
             pre_run=lambda: session.app.create_background_task(watch()),
         )
 
-    def run(self) -> None:
+    def run(
+        self, *, exec_prompt: str | None = None, resume_session_id: str | None = None,
+    ) -> int:
+        """Run the REPL, or one literal prompt without reading terminal input.
+
+        Resuming requires an agent already configured for the session's cwd.
+        Single-turn mode returns 0 on success, 1 on error, or 130 on interruption.
+        """
         try:
-            self._run()
+            return self._run(exec_prompt=exec_prompt, resume_session_id=resume_session_id)
         finally:
             try:
                 self.session_store.save_current_messages(self.agent.messages)
             finally:
                 self.agent.shutdown()
 
-    def _run(self) -> None:
+    def _run(
+        self, *, exec_prompt: str | None = None, resume_session_id: str | None = None,
+    ) -> int:
         agent = self.agent
         console = self.console
         handler = self.handler
         session_store = self.session_store
+        interactive = exec_prompt is None
+        if not interactive and not exec_prompt.strip():
+            raise ValueError("exec prompt must not be empty")
 
-        history: History
-        if self.history_path is None:
-            history = InMemoryHistory()
+        session: PromptSession[str] | None = None
+        if interactive:
+            history: History
+            if self.history_path is None:
+                history = InMemoryHistory()
+            else:
+                path = Path(self.history_path).expanduser()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                history = FileHistory(str(path))
+            session = _build_prompt_session(history, handler.completions)
+
+            console.print(
+                self.banner or "Enkiball CLI ready. Use /help for commands.",
+                style="green",
+            )
+            console.print(
+                f"Config: {agent.config_path or '(in-memory)'}  Provider: {agent.provider}"
+                f"  Model: {agent.model}"
+                f"  Thinking: {'on' if agent.show_thinking else 'off'}",
+                style="cyan",
+            )
+        if resume_session_id is not None:
+            current = agent.load_session(resume_session_id)
         else:
-            path = Path(self.history_path).expanduser()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            history = FileHistory(str(path))
-        session: PromptSession[str] = PromptSession(
-            history=history,
-            auto_suggest=AutoSuggestFromHistory(),
-            completer=_build_completer(handler.completions),
-            complete_while_typing=True,
-            multiline=True,
-            key_bindings=_build_key_bindings(),
-        )
-
-        console.print(
-            self.banner or "Enkiball CLI ready. Use /help for commands.",
-            style="green",
-        )
-        console.print(
-            f"Config: {agent.config_path or '(in-memory)'}  Provider: {agent.provider}"
-            f"  Model: {agent.model}"
-            f"  Thinking: {'on' if agent.show_thinking else 'off'}",
-            style="cyan",
-        )
-        current = session_store.begin_new(
-            initial_messages=agent.messages, persisted=False
-        )
+            current = session_store.begin_new(
+                initial_messages=agent.messages, persisted=False
+            )
         if self.on_session_change:
             self.on_session_change(current.session_id)
-        console.print(f"Session: {current.session_id} (unsaved)", style="cyan")
+        if interactive:
+            status = "saved" if session_store.current_session_persisted else "unsaved"
+            console.print(f"Session: {current.session_id} ({status})", style="cyan")
+            if resume_session_id is not None and session_store.has_user_turn(agent.messages):
+                CliRenderer(console, agent.cwd, self.tool_renderers).history(
+                    agent.messages, title=current.name, show_thinking=agent.show_thinking,
+                )
 
         prefill_text: str | None = None
         while True:
@@ -344,7 +392,7 @@ class EnkiballCLI:
             if prefill_text is not None:
                 prompt_kwargs["default"] = prefill_text
             try:
-                line = self._prompt(session, **prompt_kwargs)
+                line = self._prompt(session, **prompt_kwargs) if interactive else exec_prompt
             except KeyboardInterrupt:
                 break
             except EOFError:
@@ -354,10 +402,10 @@ class EnkiballCLI:
             text = (
                 "Background update from previously started work "
                 "(data, not a new user request):\n" + line.context
-                if background else line.strip()
+                if background else line.strip() if interactive else line
             )
 
-            if text.startswith("/"):
+            if interactive and text.startswith("/"):
                 before_session_id = session_store.current_session_id
                 command_exit_requested = False
                 # Slash commands may perform a synchronous model turn (for
@@ -424,10 +472,12 @@ class EnkiballCLI:
             turn_error: BaseException | None = None
             turn_session_id = session_store.current_session_id
             first_turn = not background and not session_store.has_user_turn(agent.messages)
-            monitor = _StreamInputMonitor()
+            monitor = _StreamInputMonitor(enabled=interactive)
             try:
                 with monitor:
                     def _approve_directory(path: Path, operation: str) -> str:
+                        if not interactive:
+                            return "deny"
                         privileged = operation == "privileged command"
                         renderer.pause()
                         monitor.pause()
@@ -496,7 +546,7 @@ class EnkiballCLI:
                 session_store.save_current_messages(agent.messages)
                 if self.on_turn_end:
                     # A completed turn's cancellation must not cancel its hook.
-                    with _StreamInputMonitor() as hook_monitor:
+                    with _StreamInputMonitor(enabled=interactive) as hook_monitor:
                         try:
                             self.on_turn_end(CliTurnContext(
                                 agent=agent,
@@ -520,5 +570,8 @@ class EnkiballCLI:
                         finally:
                             exit_requested = exit_requested or hook_monitor.exit_requested
                 console.print("")
+            if not interactive:
+                return 130 if interrupted or exit_requested else 1 if turn_error else 0
             if exit_requested:
                 break
+        return 0

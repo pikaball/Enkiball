@@ -56,10 +56,13 @@ src/enkiball/system_cli/orchestration_prompt.py
 src/enkiball/system_cli/orchestration_trace.py
 src/enkiball/system_cli/orchestration_worker.py
 src/enkiball/system_cli/sandbox_info.py
+src/enkiball/system_cli/session_search.py
 src/enkiball/system_cli/session_title.py
 tests/test_capture.py
+tests/test_cli_input.py
 tests/test_cli_renderer.py
 tests/test_cli_session_hooks.py
+tests/test_cli_stream_input.py
 tests/test_edit_tool.py
 tests/test_efficiency.py
 tests/test_enkisandbox.py
@@ -79,8 +82,11 @@ tests/test_request_retry.py
 tests/test_sandbox.py
 tests/test_sandbox_backend.py
 tests/test_sandbox_integration.py
+tests/test_sandbox_mount_lifecycle.py
 tests/test_sandbox_policy.py
 tests/test_session_history.py
+tests/test_session_search.py
 tests/test_skills.py
 tests/test_stream_usage.py
+tests/test_system_cli_modes.py
 tests/test_token_accounting.py

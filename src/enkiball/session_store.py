@@ -154,12 +154,12 @@ class SessionStore:
             raise ValueError(f"session path escapes session directory: {session_id!r}")
         return path
 
-    def list_sessions(self) -> list[SessionRecord]:
+    def list_sessions(self, *, ignore_cwd: bool = False) -> list[SessionRecord]:
         if not self.persist:
             out = [
                 copy.deepcopy(record)
                 for record in self._records.values()
-                if self._belongs_to_cwd_scope(record)
+                if ignore_cwd or self._belongs_to_cwd_scope(record)
             ]
             out.sort(key=lambda s: s.updated_at, reverse=True)
             return out
@@ -168,7 +168,7 @@ class SessionStore:
             try:
                 data = json.loads(fp.read_text(encoding="utf-8"))
                 record = SessionRecord.from_dict(data)
-                if self._belongs_to_cwd_scope(record):
+                if ignore_cwd or self._belongs_to_cwd_scope(record):
                     out.append(record)
             except Exception:
                 continue
@@ -189,13 +189,14 @@ class SessionStore:
             name=display_name, initial_messages=initial_messages, persisted=True
         )
 
-    def load(self, session_id: str) -> SessionRecord:
+    def load(self, session_id: str, *, ignore_cwd: bool = False) -> SessionRecord:
+        """Load an exact ID; startup may bypass scope before adopting its cwd."""
         if not self.persist:
             self._validate_id(session_id)
             record = self._records.get(session_id)
             if record is None:
                 raise FileNotFoundError(f"session not found: {session_id}")
-            if not self._belongs_to_cwd_scope(record):
+            if not ignore_cwd and not self._belongs_to_cwd_scope(record):
                 raise PermissionError(
                     f"session does not belong to cwd or an ancestor: {session_id}"
                 )
@@ -205,7 +206,7 @@ class SessionStore:
             raise FileNotFoundError(f"session not found: {session_id}")
         data = json.loads(fp.read_text(encoding="utf-8"))
         record = SessionRecord.from_dict(data)
-        if not self._belongs_to_cwd_scope(record):
+        if not ignore_cwd and not self._belongs_to_cwd_scope(record):
             raise PermissionError(
                 f"session does not belong to cwd or an ancestor: {session_id}"
             )
